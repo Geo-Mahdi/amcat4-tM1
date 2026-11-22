@@ -146,7 +146,8 @@ wait plus two statements); it is not a guarantee for longer requests (see Known 
 ## 7. Robustness under load, and other fixes
 
 **Separate pools and timeouts** (`AMCAT4_STATEMENT_TIMEOUT_MS`, default 30000, 0 = off; `AMCAT4_POOL_TIMEOUT_S`,
-default 5). The API pool has the tuned options and a statement timeout (HTTP 503 with advice to be more specific); a
+default 5). The API pool has the tuned options and a statement timeout (HTTP 503 with advice to be more specific; a statement
+cancelled for another reason, e.g. `pg_cancel_backend`, gets a 503 that does not mention a timeout); a
 second pool for background jobs, maintenance, CLI commands and long writes keeps the server's settings and has no
 timeout (`server_defaults`, `with_server_defaults`). An API request waits at most the pool timeout for a connection,
 then gets HTTP 503 with `Retry-After: 1` (the original: 30 s). `create_fields` was added to the long writes. Off:

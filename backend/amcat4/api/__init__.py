@@ -154,15 +154,20 @@ async def pool_timeout_handler(request: Request, exc: PoolTimeout) -> JSONRespon
 @app.exception_handler(QueryCanceled)
 async def query_canceled_handler(request: Request, exc: QueryCanceled) -> JSONResponse:
     """
-    A statement of an API request ran longer than statement_timeout_ms (AMCAT4_STATEMENT_TIMEOUT_MS, default 30 s; 0 =
-    no limit, as in the original) and was stopped, so that a runaway search does not hold a connection for minutes.
-    Background jobs and long writes run without this limit (connections.with_server_defaults)
+    A statement of an API request was cancelled on the database server. Usually because it ran longer than
+    statement_timeout_ms (AMCAT4_STATEMENT_TIMEOUT_MS, default 30 s; 0 = no limit, as in the original), so that a
+    runaway search does not hold a connection for minutes. Background jobs and long writes run without this limit
+    (connections.with_server_defaults). A statement can also be cancelled otherwise (pg_cancel_backend by an admin, a
+    server shutdown): postgres then says "due to user request" (or another reason) instead of "due to statement
+    timeout", and the answer must not claim a timeout (before, it did, also as "longer than 0 seconds" with the
+    timeout switched off)
     """
     seconds = get_settings().statement_timeout_ms / 1000
-    return JSONResponse(
-        status_code=503,
-        content={"detail": f"The query took longer than {seconds:g} seconds and was stopped; try a more specific query"},
-    )
+    if "statement timeout" in str(exc) and seconds > 0:
+        detail = f"The query took longer than {seconds:g} seconds and was stopped; try a more specific query"
+    else:
+        detail = "The query was cancelled on the database server; please try again"
+    return JSONResponse(status_code=503, content={"detail": detail})
 
 
 @app.exception_handler(ValueError)

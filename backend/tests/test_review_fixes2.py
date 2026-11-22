@@ -299,3 +299,52 @@ async def test_slot_not_added_to_started_job(slot_project, monkeypatch):
     await execute("""UPDATE jobs SET progress = '{"after_id": 1, "postponed": "moving"}' WHERE id = %s""", [job["id"]])
     await update_fields(p, {"k2": UpdateDocumentField(fast_sort=True)})
     assert len(await _jobs_of(p, "fill_sort_slot")) == 2
+
+
+###################### 9. The answer to a cancelled statement ######################
+
+
+@pytest.mark.anyio
+async def test_query_canceled_message(monkeypatch):
+    """
+    The answer said "took longer than N seconds" for every cancelled statement, also for pg_cancel_backend and with
+    the timeout switched off ("longer than 0 seconds")
+    """
+    import asyncio
+    import json
+
+    import psycopg
+
+    from amcat4.api import query_canceled_handler
+
+    async def cancelled(timeout: bool) -> psycopg.errors.QueryCanceled:
+        async with connection() as conn:
+            if timeout:
+                await conn.execute("SET statement_timeout = 10")
+            else:  # (another connection cancels it, as an admin with pg_cancel_backend)
+                pid = conn.info.backend_pid
+
+                async def cancel_soon():
+                    await asyncio.sleep(0.2)
+                    await execute("SELECT pg_cancel_backend(%s)", [pid])
+
+                task = asyncio.create_task(cancel_soon())
+            try:
+                with pytest.raises(psycopg.errors.QueryCanceled) as e:
+                    await conn.execute("SELECT pg_sleep(5)")
+            finally:
+                await conn.execute("RESET statement_timeout")
+            if not timeout:
+                await task
+            return e.value
+
+    async def detail(error) -> str:
+        response = await query_canceled_handler(None, error)  # type: ignore[arg-type]
+        assert response.status_code == 503
+        return json.loads(response.body)["detail"]
+
+    monkeypatch.setattr(get_settings(), "statement_timeout_ms", 30_000)
+    assert "took longer than 30 seconds" in await detail(await cancelled(timeout=True))
+    assert await detail(await cancelled(timeout=False)) == "The query was cancelled on the database server; please try again"
+    monkeypatch.setattr(get_settings(), "statement_timeout_ms", 0)
+    assert "longer than 0" not in await detail(await cancelled(timeout=True))
