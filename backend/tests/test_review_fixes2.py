@@ -261,7 +261,7 @@ async def test_slots_filled_in_one_pass(slot_project, monkeypatch):
     await update_fields(p, {"date2": UpdateDocumentField(fast_sort=True)})  # (a second request, before the job runs)
     [job] = await _jobs_of(p, "fill_sort_slot")
     infos = await field_infos(p)
-    slots = {infos[name].sort_slot: infos[name].pk for name in ("k1", "k2", "date2")}
+    slots = {str(infos[name].sort_slot): infos[name].pk for name in ("k1", "k2", "date2")}
     assert len(slots) == 3 and (await jobs.get_job(job["id"]))["params"]["slots"] == slots
 
     calls = []
@@ -318,6 +318,7 @@ async def test_query_canceled_message(monkeypatch):
     from amcat4.api import query_canceled_handler
 
     async def cancelled(timeout: bool) -> psycopg.errors.QueryCanceled:
+        task = None
         async with connection() as conn:
             if timeout:
                 await conn.execute("SET statement_timeout = 10")
@@ -334,14 +335,14 @@ async def test_query_canceled_message(monkeypatch):
                     await conn.execute("SELECT pg_sleep(5)")
             finally:
                 await conn.execute("RESET statement_timeout")
-            if not timeout:
+            if task is not None:
                 await task
             return e.value
 
     async def detail(error) -> str:
         response = await query_canceled_handler(None, error)  # type: ignore[arg-type]
         assert response.status_code == 503
-        return json.loads(response.body)["detail"]
+        return json.loads(bytes(response.body))["detail"]
 
     monkeypatch.setattr(get_settings(), "statement_timeout_ms", 30_000)
     assert "took longer than 30 seconds" in await detail(await cancelled(timeout=True))

@@ -270,13 +270,13 @@ async def _top_hits(fieldset: FieldSet, query: SearchQuery, axes: list[Axis], th
 
     async with connection() as conn:
         try:
-            cur = await conn.execute(statement(c), [*c.params, th.n])
+            cur = await conn.execute(statement(c), [*c.params, th.n])  # type: ignore[arg-type]
         except psycopg.Error as e:
             if not c.fast or must_not_fall_back(e):
                 raise
             logging.warning(f"Top hits on the partition table failed, using the original SQL: {e}")
             c = compile_search(fieldset, query)
-            cur = await conn.execute(statement(c), [*c.params, th.n])
+            cur = await conn.execute(statement(c), [*c.params, th.n])  # type: ignore[arg-type]
         rows = await cur.fetchall()
     storage_axes = [StorageAxis(ax.field, ax.interval) for ax in axes]
     hits: dict[tuple, list] = {}

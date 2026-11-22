@@ -412,7 +412,7 @@ async def _fill_sort_slot_job(job: Job) -> dict[str, Any]:
                     f"SELECT {FIELD_COLUMNS} FROM fields WHERE project_pk = %s AND sort_slot = ANY(%s)",  # type: ignore[arg-type]
                     [project, order],
                 )
-                owners = {row["sort_slot"]: row for row in await cur.fetchall()}  # type: ignore[index, call-overload]
+                owners: dict[str, dict] = {row["sort_slot"]: row for row in await cur.fetchall()}  # type: ignore[index, call-overload, misc]
                 active: dict[str, FieldInfo | None] = {}
                 for slot in order:
                     owner = owners.get(slot)
