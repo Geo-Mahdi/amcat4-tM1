@@ -96,6 +96,4 @@ def postprocess_value(value: Any, axis: Axis, ftype: str) -> Any:
 def sort_key(row: dict, axes: list[Axis]) -> tuple:
     # sort by axis values (None last), with values of mixed types compared as strings
     # (an empty string is a value, not "no value": `or 0` would compare 0 with strings and crash, e.g. on `section`)
-    return tuple(
-        (row[ax.name] is None, str(type(row[ax.name])), 0 if row[ax.name] is None else row[ax.name]) for ax in axes
-    )
+    return tuple((row[ax.name] is None, str(type(row[ax.name])), 0 if row[ax.name] is None else row[ax.name]) for ax in axes)

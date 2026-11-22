@@ -16,8 +16,12 @@ from amcat4.postgres.connection import connection
 from amcat4.postgres.documents import field_select
 from amcat4.postgres.fields import FieldSet, QueryError
 from amcat4.postgres.filters import field_sql
-from amcat4.postgres.search import SearchQuery, compile_search
+from amcat4.postgres.index_aggregate import index_aggregate
+from amcat4.postgres.search import SearchQuery, compile_search, count_at_most
 from amcat4.systemdata.fields import get_fieldset
+
+# Aggregations over at most this many hits use the plain SQL statement (faster for small results)
+SMALL_RESULT = 1_000
 
 # Maximum number of rows (buckets) that can be requested
 MAX_LIMIT = 10_000
@@ -162,23 +166,30 @@ async def _aggregate(
     group = sql.SQL("")
     if axes:
         group = sql.SQL("GROUP BY {}").format(sql.SQL(", ").join(sql.Literal(i + 1) for i in range(len(axes))))
+
     def statement(c) -> sql.Composable:
         return sql.SQL("SELECT {} FROM {} {} WHERE {} {}").format(
             sql.SQL(", ").join(selects), c.table, sql.SQL(" ").join(laterals), c.where, group
         )
 
     async with connection() as conn:
-        try:
-            cur = await conn.execute(statement(c), c.params)
-        except psycopg.Error as e:
-            if not c.fast:
-                raise
-            # The in-index aggregation has limits (e.g. at most paradedb.max_term_agg_buckets = 65,000 groups, an
-            # error rather than a silent cut). The original statement on the parent table has none of these.
-            logging.warning(f"In-index aggregation failed, using the original SQL: {e}")
+        if c.fast and await count_at_most(conn, c, SMALL_RESULT) <= SMALL_RESULT:
+            # In-index aggregation has a floor of 10-25 ms; for a few hundred hits the plain statement is faster
             c = compile_search(fieldset, query)
-            cur = await conn.execute(statement(c), c.params)
-        rows = await cur.fetchall()
+        # In-index aggregation with pdb.agg where possible (returns None for shapes it does not handle)
+        rows = await index_aggregate(conn, c.table, c.where, c.params, fieldset, axes, metrics) if c.fast else None
+        if rows is None:
+            try:
+                cur = await conn.execute(statement(c), c.params)
+            except psycopg.Error as e:
+                if not c.fast:
+                    raise
+                # The in-index GROUP BY has limits (e.g. at most paradedb.max_term_agg_buckets = 65,000 groups, an
+                # error rather than a silent cut). The original statement on the parent table has none of these.
+                logging.warning(f"In-index aggregation failed, using the original SQL: {e}")
+                c = compile_search(fieldset, query)
+                cur = await conn.execute(statement(c), c.params)
+            rows = await cur.fetchall()
 
     storage_axes = [StorageAxis(ax.field, ax.interval) for ax in axes]
     results = []

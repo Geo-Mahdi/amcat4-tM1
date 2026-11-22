@@ -98,9 +98,7 @@ def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False) -
     # partitions of these projects
     partitions = sorted({fieldset.partition(pk) for pk in fieldset.project_pks})
     filters = dict(query.filters or {})
-    use_partition_table = (
-        fast and get_settings().fast_path and len(partitions) == 1 and "_id" not in filters and not query.ids
-    )
+    use_partition_table = fast and get_settings().fast_path and len(partitions) == 1 and "_id" not in filters and not query.ids
     project_cond, project_param = _equals_any("documents.project_pk", list(fieldset.project_pks))
     if use_partition_table:
         # every row of documents_p<N> has partition_id N, so no partition condition is needed
@@ -172,16 +170,21 @@ def order_by(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "desc"]]] 
 COUNT_STEP = 1_000
 
 
+async def count_at_most(conn: AsyncConnection, c: CompiledSearch, limit: int) -> int:
+    """The number of hits, counted one by one up to limit + 1 (so a result above limit means 'more than limit')"""
+    cur = await conn.execute(
+        sql.SQL("SELECT count(*) AS n FROM (SELECT 1 FROM {} WHERE {} LIMIT {}) capped").format(
+            c.table, c.where, sql.Literal(limit + 1)
+        ),
+        c.params,
+    )
+    return (await cur.fetchone())["n"]  # type: ignore[index, call-overload]
+
+
 async def count(conn: AsyncConnection, fieldset: FieldSet, query: SearchQuery) -> int:
     c = compile_search(fieldset, query, fast=True)
     if c.fast:
-        cur = await conn.execute(
-            sql.SQL("SELECT count(*) AS n FROM (SELECT 1 FROM {} WHERE {} LIMIT {}) capped").format(
-                c.table, c.where, sql.Literal(COUNT_STEP + 1)
-            ),
-            c.params,
-        )
-        n = (await cur.fetchone())["n"]  # type: ignore[index, call-overload]
+        n = await count_at_most(conn, c, COUNT_STEP)
         if n <= COUNT_STEP:
             return n
     cur = await conn.execute(sql.SQL("SELECT count(*) AS n FROM {} WHERE {}").format(c.table, c.where), c.params)
