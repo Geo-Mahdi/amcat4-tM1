@@ -148,3 +148,40 @@ async def test_cursor_beyond_max_offset(two, monkeypatch):
         await query_documents(a, queries={"q": "word"}, page=2, per_page=2)
     with pytest.raises(ValueError, match='"sort": "_seq"'):
         await query_documents(a, sort=[{"_seq": SortSpec(order="asc")}], page=2, per_page=2)
+
+
+###################### 5. pdb.agg metrics of a bucket without values ######################
+
+
+@pytest.mark.anyio
+async def test_index_metrics_empty_bucket(two, monkeypatch):
+    """In-index metrics (pdb.agg) of buckets where no document has the field: null, the same as GROUP BY"""
+    from amcat4.postgres import search as search_module
+    from amcat4.projects import aggregate as aggregate_module
+    from amcat4.projects.aggregate import Aggregation, Axis, query_aggregate
+
+    monkeypatch.setattr(aggregate_module, "SMALL_RESULT", 0)
+    monkeypatch.setattr(search_module, "COUNT_STEP", 0)
+    used: list = []
+    original = aggregate_module.index_aggregate
+
+    async def spy(*args, **kwargs):
+        rows = await original(*args, **kwargs)
+        used.append(rows is not None)
+        return rows
+
+    monkeypatch.setattr(aggregate_module, "index_aggregate", spy)
+    a, _ = two
+    docs = [{"_id": f"d{i}", "pub": "AB"[i // 4], "cat": "xy"[i % 2], **({"n": i - 2} if i < 4 else {})} for i in range(8)]
+    await upload(a, docs, fields={"pub": "keyword", "cat": "keyword", "n": "integer"})
+    aggs = [Aggregation("n", f) for f in ("sum", "avg", "min", "max")]
+    for axes in ([Axis("pub")], [Axis("pub"), Axis("cat")]):
+        used.clear()
+        fast = sorted((await query_aggregate(a, axes, aggs)).data)
+        assert used == [True]  # pdb.agg was used, not the fallback
+        monkeypatch.setattr(get_settings(), "fast_path", False)
+        slow = sorted((await query_aggregate(a, axes, aggs)).data)
+        monkeypatch.setattr(get_settings(), "fast_path", True)
+        assert fast == slow
+        assert all(row[-4:] == (None, None, None, None) for row in fast if row[0] == "B")
+    assert ("A", 4, -2.0 + -1 + 0 + 1, -0.5, -2.0, 1.0) in sorted((await query_aggregate(a, [Axis("pub")], aggs)).data)

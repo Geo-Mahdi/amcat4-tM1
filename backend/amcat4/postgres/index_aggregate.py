@@ -10,7 +10,8 @@ This module handles the common shapes and returns None for everything else, so t
 - axes: keyword and tag fields, and date fields with an interval that is stored as a derived key (year, quarter,
   month, ...). Fields whose documents do not all have the quarter key yet (stored before migration 0002, until the
   backfill job is done) compute quarters from the month buckets. Nested axes become nested terms aggregations.
-- metrics: avg, min, max, sum of number and integer fields (not with a quarter axis computed from months).
+- metrics: avg, min, max, sum of number and integer fields (not with a quarter axis computed from months), from a
+  stats aggregation, so that a bucket without values gives null (as GROUP BY) for every function.
 - a single project per field (fields of several projects have different keys: GROUP BY handles that).
 The query must use the partition table (CompiledSearch.fast), because pdb.agg does not work on the parent.
 
@@ -91,7 +92,9 @@ def build_request(fieldset: FieldSet, axes: list, metrics: list) -> tuple[dict, 
         paths.append(path)
     if metrics and any(a.interval == "quarter" and not path.endswith("_quarter") for a, path in zip(axes, paths)):
         raise _NotSupported("metrics with a quarter axis computed from months")
-    leaf = {f"m{j}": {m.function: {"field": _metric_path(fieldset, m)}} for j, m in enumerate(metrics)}
+    # stats, not the function itself: its count says whether the bucket has values. sum alone gives 0.0 for a bucket
+    # without any value, where GROUP BY (and Elasticsearch's min/max/avg) give null
+    leaf = {f"m{j}": {"stats": {"field": _metric_path(fieldset, m)}} for j, m in enumerate(metrics)}
     if not axes:
         raise _NotSupported("no axes")  # a single count (with metrics): GROUP BY handles it
     # pdb.agg takes one (unnamed) aggregation at the top; nested aggregations are named a1, a2, ... and m0, m1, ...
@@ -123,10 +126,17 @@ def _rows(result: dict, axes: list, fields: list[FieldInfo], metrics: list, leve
         else:
             row = {f"a{i}": v for i, v in enumerate((*prefix, key))}
             row["n"] = bucket["doc_count"]
-            for j in range(len(metrics)):
-                row[f"m{j}"] = bucket.get(f"m{j}", {}).get("value")
+            for j, metric in enumerate(metrics):
+                row[f"m{j}"] = _metric_value(bucket.get(f"m{j}", {}), metric.function)
             rows.append(row)
     return rows
+
+
+def _metric_value(stats: dict, function: str) -> Any:
+    """The value of a metric from a stats result: None (like GROUP BY) if no document of the bucket has a value"""
+    if not stats.get("count"):
+        return None
+    return stats.get(function)
 
 
 def _merge_quarters(rows: list[dict], n_axes: int) -> list[dict]:
