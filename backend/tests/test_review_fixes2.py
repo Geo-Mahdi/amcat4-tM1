@@ -386,3 +386,30 @@ async def test_top_hits_fallback(two_projects, monkeypatch):  # noqa: F811
         with pytest.raises(type(error)):
             await top_hits()
         assert sum(c.failed for c in made) == 1
+
+
+###################### 11. The pool statistics that spare_connection reads ######################
+
+
+@pytest.mark.anyio
+async def test_spare_connection_pool_stats(monkeypatch):
+    """
+    spare_connection reads pool_available, pool_size and requests_waiting from psycopg_pool's get_stats(). If the pool
+    stops reporting one of them, the parallel count must not silently change behaviour: this test fails, and the
+    defaults then give no spare connection (before, a missing pool_size counted as "every connection free")
+    """
+    from amcat4.connections import db
+    from amcat4.postgres import connection as connection_module
+
+    stats = db().get_stats()
+    assert {"pool_available", "pool_size", "requests_waiting"} <= set(stats), sorted(stats)
+
+    class NoStats:  # (a pool that reports nothing)
+        max_size = 10
+
+        def get_stats(self):
+            return {}
+
+    monkeypatch.setattr(connection_module, "db", lambda: NoStats())
+    async with connection_module.spare_connection() as conn:
+        assert conn is None

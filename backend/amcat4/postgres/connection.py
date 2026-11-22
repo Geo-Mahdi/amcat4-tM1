@@ -33,9 +33,12 @@ async def spare_connection() -> AsyncGenerator[AsyncConnection | None, None]:
     Used for settings.parallel_count (a common word: 8.0 ms -> 4.9 ms per search, not measured under concurrent load).
     """
     pool = db()
+    # Keys of psycopg_pool's statistics (checked for psycopg_pool 3.3.3, the version in uv.lock; a test fails if one of
+    # them disappears): pool_available (idle connections), pool_size (open connections, idle or in use),
+    # requests_waiting (clients waiting for a connection). The defaults are safe: a missing key means no spare connection
     stats = pool.get_stats()
     # idle connections, plus the connections the pool may still open
-    free = stats.get("pool_available", 0) + pool.max_size - stats.get("pool_size", 0)
+    free = stats.get("pool_available", 0) + pool.max_size - stats.get("pool_size", pool.max_size)
     conn = None
     if free >= 2 and not stats.get("requests_waiting", 0):
         try:
