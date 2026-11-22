@@ -1,3 +1,4 @@
+import json
 import logging
 from datetime import UTC, datetime
 from typing import AsyncIterable
@@ -5,12 +6,13 @@ from typing import AsyncIterable
 from botocore.exceptions import BotoCoreError
 from psycopg import sql
 
+from amcat4.config import get_settings
 from amcat4.connections import s3_enabled
 from amcat4.errors import NotFoundError
 from amcat4.models import IndexId, ProjectSettings, RoleRule, Roles, User
 from amcat4.objectstorage.multimedia import delete_project_multimedia
 from amcat4.postgres.connection import connection, fetch_all, fetch_one
-from amcat4.postgres.layout import project_filter
+from amcat4.postgres.layout import partition_table, project_filter
 from amcat4.systemdata.roles import list_user_project_roles
 from amcat4.systemdata.settings import (
     _project_from_row,
@@ -126,11 +128,32 @@ async def list_user_project_indices(
         yield index, project_role_lookup[index.id]
 
 
+# Projects with more documents than this get an estimated size: the average size of SIZE_SAMPLE of their documents
+# times their number of documents. Summing the size of every document read the whole project (12 s for 10.7 million
+# documents), on every GET /index/{ix}.
+SIZE_SAMPLE = 20_000
+
+
 async def index_size_in_bytes(index_id: IndexId) -> int:
     """(Approximate) size of the documents of the project, as stored on disk (after compression)"""
-    project = await fetch_one("SELECT pk FROM projects WHERE id = %s", [index_id])
+    project = await fetch_one("SELECT pk, partition_id FROM projects WHERE id = %s", [index_id])
     if project is None:
         return 0
+    if get_settings().fast_path:
+        table = sql.Identifier(partition_table(project["partition_id"]))
+        query = sql.Literal(json.dumps({"term": {"field": "project_pk", "value": project["pk"]}}))
+        async with connection() as conn:
+            cur = await conn.execute(sql.SQL("SELECT count(*) AS n FROM {} d WHERE d.id @@@ {}::jsonb").format(table, query))
+            n = (await cur.fetchone())["n"]  # type: ignore[index, call-overload]
+            if n > SIZE_SAMPLE:
+                cur = await conn.execute(
+                    sql.SQL(
+                        "SELECT avg(pg_column_size(s.*)) AS size"
+                        " FROM (SELECT d.* FROM {} d WHERE d.id @@@ {}::jsonb LIMIT {}) s"
+                    ).format(table, query, sql.Literal(SIZE_SAMPLE))
+                )
+                size = (await cur.fetchone())["size"]  # type: ignore[index, call-overload]
+                return int(float(size or 0) * n)
     async with connection() as conn:
         cur = await conn.execute(
             sql.SQL("SELECT coalesce(sum(pg_column_size(documents.*)), 0) AS bytes FROM documents WHERE {}").format(

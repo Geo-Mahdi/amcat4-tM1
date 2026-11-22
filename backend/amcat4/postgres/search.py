@@ -163,6 +163,20 @@ def order_by(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "desc"]]] 
     return sql.SQL(", ").join(items)
 
 
+def _needs_late_fetch(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "desc"]]] | None) -> bool:
+    """Whether the sort uses a json field (so all hits are read to sort them), and gives the same order twice"""
+    names = [name for name, _ in sort or []]
+    if "?" in names:  # random order: the second statement would give another order
+        return False
+    for name in names:
+        if name in ("_score", "_id") or name not in fieldset.by_name:
+            continue
+        sort_columns = {f.sort_column for f in fieldset.by_name[name]}
+        if len(sort_columns) != 1 or None in sort_columns:
+            return True
+    return False
+
+
 # Counting in two steps (fast path): pg_search's in-index count (Aggregate Scan) has a floor of about 7-12 ms but
 # hardly grows with the number of hits; counting the hits one by one is 2-3 ms for a few hundred hits but grows with
 # them. So first count at most COUNT_STEP + 1 hits one by one, and only if there are more, count inside the index.
@@ -266,10 +280,24 @@ async def search(
     else:
         ordering = order_by(fieldset, sort, scored)
         offset = page * per_page if offset is None else offset
+    if get_settings().fast_path and not keyset and not similar and _needs_late_fetch(fieldset, sort):
+        # Late fetch: the sort is on a json field (not a sort slot), so pg_search cannot do a Top-K scan and every hit
+        # is read and sorted. Do that with only the internal id (no text, no snippets), then fetch the full rows of
+        # just this page with the same statement as below, restricted to these ids (same order, same columns).
+        cur = await conn.execute(
+            sql.SQL("SELECT documents.id FROM {} WHERE {} ORDER BY {} LIMIT %s OFFSET %s").format(c.table, where, ordering),
+            [*params, per_page, offset],
+        )
+        page_ids = [row["id"] for row in await cur.fetchall()]  # type: ignore[index, call-overload]
+        where = sql.SQL("{} AND documents.id = ANY(%s)").format(where)
+        params.append(page_ids)
+        query_offset = 0
+    else:
+        query_offset = offset
     stmt = sql.SQL("SELECT {} FROM {} {} WHERE {} ORDER BY {} LIMIT %s OFFSET %s").format(
         sql.SQL(", ").join(columns), c.table, join, where, ordering
     )
-    cur = await conn.execute(stmt, [*params, per_page, offset])
+    cur = await conn.execute(stmt, [*params, per_page, query_offset])
     rows = await cur.fetchall()
 
     # Patterns to find query matches for highlighting / snippets (combined with the positions reported by pg_search,
