@@ -200,6 +200,10 @@ async def upload_documents(
             await conn.execute(
                 sql.SQL("UPDATE staging_documents SET dedup_hash = {}").format(dedup_expression(unique, "staging_documents"))
             )
+        # The staging table is a fresh temporary table, so postgres has no statistics for it and guesses its size.
+        # With a wrong guess the duplicate lookups below can pick a plan that walks the whole project (the "unstable
+        # upload" of the night run: 626 of 632 s in one statement). Analysing a few thousand rows takes milliseconds.
+        await conn.execute("ANALYZE staging_documents")
 
         # Duplicates within the upload
         for key in ["doc_id", "dedup_hash"]:

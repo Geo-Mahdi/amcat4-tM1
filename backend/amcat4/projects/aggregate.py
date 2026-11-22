@@ -2,9 +2,11 @@
 Aggregate queries
 """
 
+import logging
 from datetime import UTC, datetime
 from typing import Any, Iterable, List, Literal, Sequence
 
+import psycopg
 from psycopg import sql
 
 from amcat4.models import FilterSpec, SortSpec
@@ -144,7 +146,7 @@ async def _aggregate(
     aggregations: list[Aggregation | TopHitsAggregation],
 ) -> list[tuple]:
     """Run an aggregation (without _query axis). Returns rows of (axis values..., count, aggregation values...)"""
-    c = compile_search(fieldset, query)
+    c = compile_search(fieldset, query, fast=True)
     selects: list[sql.Composable] = []
     laterals: list[sql.Composable] = []
     for i, axis in enumerate(axes):
@@ -160,11 +162,22 @@ async def _aggregate(
     group = sql.SQL("")
     if axes:
         group = sql.SQL("GROUP BY {}").format(sql.SQL(", ").join(sql.Literal(i + 1) for i in range(len(axes))))
-    stmt = sql.SQL("SELECT {} FROM documents {} WHERE {} {}").format(
-        sql.SQL(", ").join(selects), sql.SQL(" ").join(laterals), c.where, group
-    )
+    def statement(c) -> sql.Composable:
+        return sql.SQL("SELECT {} FROM {} {} WHERE {} {}").format(
+            sql.SQL(", ").join(selects), c.table, sql.SQL(" ").join(laterals), c.where, group
+        )
+
     async with connection() as conn:
-        cur = await conn.execute(stmt, c.params)
+        try:
+            cur = await conn.execute(statement(c), c.params)
+        except psycopg.Error as e:
+            if not c.fast:
+                raise
+            # The in-index aggregation has limits (e.g. at most paradedb.max_term_agg_buckets = 65,000 groups, an
+            # error rather than a silent cut). The original statement on the parent table has none of these.
+            logging.warning(f"In-index aggregation failed, using the original SQL: {e}")
+            c = compile_search(fieldset, query)
+            cur = await conn.execute(statement(c), c.params)
         rows = await cur.fetchall()
 
     storage_axes = [StorageAxis(ax.field, ax.interval) for ax in axes]
@@ -197,7 +210,7 @@ def _hashable(v):
 
 async def _top_hits(fieldset: FieldSet, query: SearchQuery, axes: list[Axis], th: TopHitsAggregation) -> dict[tuple, list]:
     """Get the top n documents per bucket using a window function"""
-    c = compile_search(fieldset, query)
+    c = compile_search(fieldset, query, fast=True)
     selects, laterals, partition = [], [], []
     for i, axis in enumerate(axes):
         expr, lateral = axis_expr(StorageAxis(axis.field, axis.interval), fieldset.resolve(axis.field), f"tag_{i}")
@@ -219,8 +232,8 @@ async def _top_hits(fieldset: FieldSet, query: SearchQuery, axes: list[Axis], th
     window = sql.SQL("row_number() OVER (PARTITION BY {} ORDER BY {}) AS rn").format(
         sql.SQL(", ").join(partition) if partition else sql.SQL("true"), sql.SQL(", ").join(order)
     )
-    stmt = sql.SQL("SELECT * FROM (SELECT {}, documents.project_pk, {} FROM documents {} WHERE {}) t WHERE rn <= %s").format(
-        sql.SQL(", ").join(selects), window, sql.SQL(" ").join(laterals), c.where
+    stmt = sql.SQL("SELECT * FROM (SELECT {}, documents.project_pk, {} FROM {} {} WHERE {}) t WHERE rn <= %s").format(
+        sql.SQL(", ").join(selects), window, c.table, sql.SQL(" ").join(laterals), c.where
     )
     async with connection() as conn:
         cur = await conn.execute(stmt, [*c.params, th.n])

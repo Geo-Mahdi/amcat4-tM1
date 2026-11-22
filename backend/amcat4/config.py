@@ -73,6 +73,26 @@ class Settings(BaseSettings):
         ),
     ] = 5
 
+    fast_path: Annotated[
+        bool,
+        Field(
+            description=(
+                "Use the faster read paths (counts and aggregations inside the BM25 index of a single partition). "
+                "Set to false to use the original SQL, e.g. to compare results (AMCAT4_FAST_PATH=false)"
+            ),
+        ),
+    ] = True
+
+    custom_plans: Annotated[
+        bool,
+        Field(
+            description=(
+                "Run API statements with plan_cache_mode=force_custom_plan, so prepared statements never switch to a "
+                "generic plan that ignores the project and query (which made counts 5-10x slower after 10 requests)"
+            ),
+        ),
+    ] = True
+
     auth: Annotated[AuthOptions, Field(description="Do we require authorization?")] = AuthOptions.no_auth
 
     cookie_secret: Annotated[

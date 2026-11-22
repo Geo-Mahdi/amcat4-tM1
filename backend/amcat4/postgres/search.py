@@ -13,9 +13,11 @@ from typing import Any, Literal
 from psycopg import AsyncConnection, sql
 from psycopg.types.json import Jsonb
 
+from amcat4.config import get_settings
 from amcat4.models import FilterSpec, SnippetParams
 from amcat4.postgres.fields import FieldInfo, FieldSet, QueryError
 from amcat4.postgres.filters import compile_filters, field_sql
+from amcat4.postgres.layout import partition_table
 from amcat4.postgres.querystring import highlight_patterns, match_positions, parse_query, query_string_to_json
 from amcat4.postgres.snippets import byte_to_char_positions, make_snippet
 from amcat4.postgres.snippets import highlight as highlight_text
@@ -35,6 +37,10 @@ class CompiledSearch:
     json_query: dict
     where: sql.Composable
     params: list[Any] = field(default_factory=list)
+    # The FROM item, always available under the name "documents": the partitioned table, or (fast read path) the
+    # table of the one partition that holds all projects of the query
+    table: sql.Composable = field(default_factory=lambda: sql.Identifier("documents"))
+    fast: bool = False
 
 
 def project_clause(project_pks: list[int]) -> dict:
@@ -61,7 +67,27 @@ def _id_filter_values(spec: FilterSpec) -> list[str]:
     return [str(v) for v in values]
 
 
-def compile_search(fieldset: FieldSet, query: SearchQuery) -> CompiledSearch:
+def _equals_any(column: str, values: list[int]) -> tuple[sql.Composable, Any]:
+    """
+    `column = value` for a single value, `column = ANY(values)` otherwise. pg_search turns `= ANY(...)` into a term
+    set that it evaluates over every row of the partition (about 14 ms at 13 million rows, growing with the
+    partition); a plain value is a single term.
+    """
+    if len(values) == 1:
+        return sql.SQL("{} = %s").format(sql.SQL(column)), values[0]
+    return sql.SQL("{} = ANY(%s)").format(sql.SQL(column)), list(values)
+
+
+def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False) -> CompiledSearch:
+    """
+    Compile a search into a json query for the BM25 index plus SQL conditions.
+
+    fast: (read-only statements only: count, search, aggregate) if all projects are in one partition and there is no
+    filter on document ids, query that partition's table directly (CompiledSearch.table). pg_search can then count
+    and aggregate inside its index (Aggregate Scan), which it cannot do through the partitioned parent table. The
+    SQL condition on project_pk is kept as a second guard next to the project clause in the json query.
+    Write statements (update/delete by query) must not use this.
+    """
     must: list[dict] = [project_clause(fieldset.project_pks)]
     if query.queries:
         qs = [_compile_query_string(label, q, fieldset) for label, q in query.queries.items()]
@@ -69,9 +95,21 @@ def compile_search(fieldset: FieldSet, query: SearchQuery) -> CompiledSearch:
     # The project condition is also in the json query, but postgres needs the partitions in SQL to only scan the
     # partitions of these projects
     partitions = sorted({fieldset.partition(pk) for pk in fieldset.project_pks})
-    sql_clauses: list[sql.Composable] = [sql.SQL("documents.partition_id = ANY(%s) AND documents.project_pk = ANY(%s)")]
-    params: list[Any] = [partitions, list(fieldset.project_pks)]
     filters = dict(query.filters or {})
+    use_partition_table = (
+        fast and get_settings().fast_path and len(partitions) == 1 and "_id" not in filters and not query.ids
+    )
+    project_cond, project_param = _equals_any("documents.project_pk", list(fieldset.project_pks))
+    if use_partition_table:
+        # every row of documents_p<N> has partition_id N, so no partition condition is needed
+        sql_clauses: list[sql.Composable] = [project_cond]
+        params: list[Any] = [project_param]
+        table: sql.Composable = sql.SQL("{} AS documents").format(sql.Identifier(partition_table(partitions[0])))
+    else:
+        partition_cond, partition_param = _equals_any("documents.partition_id", partitions)
+        sql_clauses = [partition_cond, project_cond]
+        params = [partition_param, project_param]
+        table = sql.Identifier("documents")
     if "_id" in filters:
         sql_clauses.append(sql.SQL("documents.doc_id = ANY(%s)"))
         params.append(_id_filter_values(filters.pop("_id")))
@@ -84,7 +122,7 @@ def compile_search(fieldset: FieldSet, query: SearchQuery) -> CompiledSearch:
         params.append(list(query.ids))
     json_query = must[0] if len(must) == 1 else {"boolean": {"must": must}}
     where = sql.SQL(" AND ").join([sql.SQL("documents.id @@@ %s::jsonb"), *sql_clauses])
-    return CompiledSearch(json_query, where, [Jsonb(json_query), *params])
+    return CompiledSearch(json_query, where, [Jsonb(json_query), *params], table=table, fast=use_partition_table)
 
 
 @dataclass
@@ -126,8 +164,8 @@ def order_by(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "desc"]]] 
 
 
 async def count(conn: AsyncConnection, fieldset: FieldSet, query: SearchQuery) -> int:
-    c = compile_search(fieldset, query)
-    cur = await conn.execute(sql.SQL("SELECT count(*) AS n FROM documents WHERE {}").format(c.where), c.params)
+    c = compile_search(fieldset, query, fast=True)
+    cur = await conn.execute(sql.SQL("SELECT count(*) AS n FROM {} WHERE {}").format(c.table, c.where), c.params)
     row = await cur.fetchone()
     return row["n"]  # type: ignore[index, call-overload]
 
@@ -160,7 +198,7 @@ async def search(
     """
     from amcat4.postgres.documents import field_select
 
-    c = compile_search(fieldset, query)
+    c = compile_search(fieldset, query, fast=not similar)
     scored = bool(query.queries)
     snippets = snippets or {}
 
@@ -206,8 +244,8 @@ async def search(
     else:
         ordering = order_by(fieldset, sort, scored)
         offset = page * per_page if offset is None else offset
-    stmt = sql.SQL("SELECT {} FROM documents {} WHERE {} ORDER BY {} LIMIT %s OFFSET %s").format(
-        sql.SQL(", ").join(columns), join, where, ordering
+    stmt = sql.SQL("SELECT {} FROM {} {} WHERE {} ORDER BY {} LIMIT %s OFFSET %s").format(
+        sql.SQL(", ").join(columns), c.table, join, where, ordering
     )
     cur = await conn.execute(stmt, [*params, per_page, offset])
     rows = await cur.fetchall()

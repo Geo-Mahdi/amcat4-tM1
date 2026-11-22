@@ -380,14 +380,25 @@ def _compile_text(node: Term | Phrase | Range, f: FieldInfo) -> dict:
         # pg_search has no phrase_prefix with slop, and regex_phrase does not work on json fields
         raise QueryError(f"Wildcards cannot be combined with proximity (~) in phrase {node.text!r}")
     if prefix:
-        return _boost({"phrase_prefix": {"field": path, "phrases": words}}, node.boost)
+        return _boost(
+            {"phrase_prefix": {"field": path, "phrases": words, "max_expansions": PHRASE_PREFIX_MAX_EXPANSIONS}}, node.boost
+        )
     if len(words) == 1:
         return _boost({"match": {"field": path, "value": words[0]}}, node.boost)
     return _boost({"phrase": {"field": path, "phrases": words, "slop": node.slop}}, node.boost)
 
 
+# pg_search (Tantivy) expands a prefix to only the first 50 terms (in dictionary order) of each index segment unless
+# told otherwise. Broad prefixes then silently missed most documents (pol* found 2% of them), and the result changed
+# when segments were merged. A single-word prefix is expanded fully: it costs about as much as a plain word with the
+# same number of hits. A prefix at the end of a phrase ("tweede ka*") is much more expensive per expansion (10,000
+# expansions took 5-20 s), so it keeps a (documented) bound.
+PREFIX_MAX_EXPANSIONS = 2**31 - 1
+PHRASE_PREFIX_MAX_EXPANSIONS = 1000
+
+
 def _prefix_query(path: str, prefix: str) -> dict:
-    return {"phrase_prefix": {"field": path, "phrases": [prefix]}}
+    return {"phrase_prefix": {"field": path, "phrases": [prefix], "max_expansions": PREFIX_MAX_EXPANSIONS}}
 
 
 def _compile_exact(node: Term | Phrase | Range, f: FieldInfo) -> dict:

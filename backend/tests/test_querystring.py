@@ -2,6 +2,8 @@ import pytest
 
 from amcat4.postgres.fields import FieldInfo, FieldSet, QueryError
 from amcat4.postgres.querystring import (
+    PHRASE_PREFIX_MAX_EXPANSIONS,
+    PREFIX_MAX_EXPANSIONS,
     Bool,
     Phrase,
     Range,
@@ -73,7 +75,9 @@ async def test_compile_default_fields_and_visibility():
 
 async def test_compile_leaves():
     fs = fieldset()
-    assert query_string_to_json("title:immigr*", fs) == {"phrase_prefix": {"field": "text_fields.f1", "phrases": ["immigr"]}}
+    assert query_string_to_json("title:immigr*", fs) == {
+        "phrase_prefix": {"field": "text_fields.f1", "phrases": ["immigr"], "max_expansions": PREFIX_MAX_EXPANSIONS}
+    }
     assert query_string_to_json('title:"Quick Fox"~1', fs) == {
         "phrase": {"field": "text_fields.f1", "phrases": ["quick", "fox"], "slop": 1}
     }
@@ -122,7 +126,11 @@ async def test_proximity_highlight():
 async def test_phrase_wildcards():
     fs = FieldSet({1: FIELDS})
     assert query_string_to_json('title:"quick fo*"', fs) == {
-        "phrase_prefix": {"field": "text_fields.f1", "phrases": ["quick", "fo"]}
+        "phrase_prefix": {
+            "field": "text_fields.f1",
+            "phrases": ["quick", "fo"],
+            "max_expansions": PHRASE_PREFIX_MAX_EXPANSIONS,
+        }
     }
     with pytest.raises(QueryError, match="proximity"):
         query_string_to_json('title:"quick fo*"~2', fs)

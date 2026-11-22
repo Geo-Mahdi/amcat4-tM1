@@ -129,14 +129,18 @@ async def query_documents(
             keyset=keyset,
             after_id=cursor.get("id"),
             similar=similar,
+            # The total of a scroll is counted once, on the first page, and carried in the cursor: counting again on
+            # every page was two thirds of the work of a download
+            with_total="total" not in cursor,
         )
+    total = cursor.get("total", result.total)
     next_cursor = None
     if len(result.results) == per_page:
         if keyset or (after is None and not sort_spec and not similar and not queries):
-            next_cursor = _encode_cursor({"id": result.last_id})
+            next_cursor = _encode_cursor({"id": result.last_id, "total": total})
         else:
-            next_cursor = _encode_cursor({"offset": offset + per_page})
-    return QueryResult(result.results, n=result.total, per_page=per_page, page=None if after else page, next=next_cursor)
+            next_cursor = _encode_cursor({"offset": offset + per_page, "total": total})
+    return QueryResult(result.results, n=total, per_page=per_page, page=None if after else page, next=next_cursor)
 
 
 async def update_tag_query(

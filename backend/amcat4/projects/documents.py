@@ -1,12 +1,13 @@
 from typing import Any, Literal, Mapping
 
 from psycopg import sql
+from psycopg.errors import UniqueViolation
 
 from amcat4.errors import NotFoundError
 from amcat4.models import CreateDocumentField, DocumentFieldDefinition, FieldType
 from amcat4.postgres import documents as storage
 from amcat4.postgres.connection import connection
-from amcat4.postgres.documents import OpType
+from amcat4.postgres.documents import OpType, UploadError
 from amcat4.postgres.layout import project_filter
 from amcat4.postgres.projects import project_pk
 from amcat4.systemdata.fields import create_fields, field_infos
@@ -40,8 +41,18 @@ async def create_or_update_documents(
 
     pk = await project_pk(index)
     infos = await field_infos(index)
-    async with connection() as conn:
-        return await storage.upload_documents(conn, pk, documents, infos, op_type)
+    try:
+        async with connection() as conn:
+            return await storage.upload_documents(conn, pk, documents, infos, op_type)
+    except UniqueViolation:
+        # Another upload of (some of) the same documents committed between our duplicate check and our insert.
+        # Retrying once sees those documents and updates (or, for op_type create, reports) them.
+        pass
+    try:
+        async with connection() as conn:
+            return await storage.upload_documents(conn, pk, documents, infos, op_type)
+    except UniqueViolation as e:
+        raise UploadError("The same documents are being uploaded concurrently; please try again") from e
 
 
 async def fetch_document(index: str, doc_id: str, _source: str | list[str] | None = None) -> dict:

@@ -108,12 +108,18 @@ def http() -> httpx.AsyncClient:
 async def _start_db():
     settings = get_settings()
     logging.debug(f"Connecting with postgres, schema {db_schema()}")
+    options = f"-c search_path={db_schema()},public"
+    if settings.custom_plans:
+        # psycopg prepares a statement after 5 uses on a connection, and postgres may then switch to a generic plan
+        # that does not know the project or query. For pg_search that plan is 5-10x slower (row estimate 1, no
+        # parallel workers). Planning each statement costs 1-3 ms, which is much less.
+        options += " -c plan_cache_mode=force_custom_plan"
     pool = AsyncConnectionPool(
         settings.postgres_url,
         min_size=1,
         max_size=20,
         open=False,
-        kwargs={"row_factory": dict_row, "autocommit": True, "options": f"-c search_path={db_schema()},public"},
+        kwargs={"row_factory": dict_row, "autocommit": True, "options": options},
     )
     try:
         await pool.open(wait=True, timeout=10)
