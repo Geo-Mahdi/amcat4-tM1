@@ -431,6 +431,8 @@ async def test_quarter_aggregation_same_results(quarter_project, monkeypatch, in
 @pytest.mark.anyio
 async def test_quarter_metrics_in_index(quarter_project):
     """With the quarter key, a quarter axis with metrics can be done inside the index (pdb.agg)"""
+    if not get_settings().quarter_key:
+        pytest.skip("quarter key switched off (AMCAT4_QUARTER_KEY=false)")
     fs = await get_fieldset([quarter_project])
     request, _ = index_aggregate.build_request(fs, [Axis("date", "quarter")], [Aggregation("n", "avg")])
     assert request["terms"]["field"].endswith("_quarter")
