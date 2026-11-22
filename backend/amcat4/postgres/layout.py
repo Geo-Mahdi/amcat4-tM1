@@ -284,13 +284,17 @@ async def partition_overview(conn: AsyncConnection) -> list[dict]:
     """
     The documents partitions with their sizes, and the projects in each partition with their number of documents.
     Counting documents reads the (document id) index of all partitions, so this takes a moment on large databases.
-    While a project is being moved, only its documents in projects.partition_id (the old partition) are counted.
+    While a project is being moved, it is listed in both partitions (projects.partition_id and moving_to) with the
+    number of its documents in each (before, only those in the old partition were counted, so the documents that had
+    been moved were missing from the overview).
     """
     cur = await conn.execute(
-        """SELECT p.partition_id, p.id AS project, coalesce(c.n, 0) AS documents
+        """SELECT pp.partition_id, p.id AS project, coalesce(c.n, 0) AS documents
            FROM projects p
+           CROSS JOIN LATERAL (VALUES (p.partition_id), (p.moving_to)) pp(partition_id)
            LEFT JOIN (SELECT partition_id, project_pk, count(*) AS n FROM documents GROUP BY 1, 2) c
-             ON c.partition_id = p.partition_id AND c.project_pk = p.pk
+             ON c.partition_id = pp.partition_id AND c.project_pk = p.pk
+           WHERE pp.partition_id IS NOT NULL
            ORDER BY documents DESC, project"""
     )
     projects: dict[int, list[dict]] = {}

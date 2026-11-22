@@ -139,27 +139,37 @@ SIZE_SAMPLE = 20_000
 
 async def index_size_in_bytes(index_id: IndexId) -> int:
     """(Approximate) size of the documents of the project, as stored on disk (after compression)"""
-    project = await fetch_one("SELECT pk, partition_id FROM projects WHERE id = %s", [index_id])
+    project = await fetch_one("SELECT pk, partition_id, moving_to FROM projects WHERE id = %s", [index_id])
     if project is None:
         return 0
     if get_settings().fast_path:
         # On the partition table, with only the project term in the json query: pg_search counts inside its index.
         # The sample is the first SIZE_SAMPLE documents the index returns, not a random sample, so the size is an
         # estimate. AMCAT4_FAST_PATH=false: always the exact sum below, as in the original.
-        table = sql.Identifier(partition_table(project["partition_id"]))
+        # While the project is being moved, its documents are in two partitions (partition_id and moving_to): both
+        # are counted and sampled (before, only partition_id was, so the size shrank during the move)
+        partitions = [project["partition_id"]] + ([project["moving_to"]] if project["moving_to"] is not None else [])
         query = sql.Literal(json.dumps({"term": {"field": "project_pk", "value": project["pk"]}}))
+        counts, total = [], 0.0
         async with connection() as conn:
-            cur = await conn.execute(sql.SQL("SELECT count(*) AS n FROM {} d WHERE d.id @@@ {}::jsonb").format(table, query))
-            n = (await cur.fetchone())["n"]  # type: ignore[index, call-overload]
-            if n > SIZE_SAMPLE:
+            for partition_id in partitions:
+                table = sql.Identifier(partition_table(partition_id))
                 cur = await conn.execute(
-                    sql.SQL(
-                        "SELECT avg(pg_column_size(s.*)) AS size"
-                        " FROM (SELECT d.* FROM {} d WHERE d.id @@@ {}::jsonb LIMIT {}) s"
-                    ).format(table, query, sql.Literal(SIZE_SAMPLE))
+                    sql.SQL("SELECT count(*) AS n FROM {} d WHERE d.id @@@ {}::jsonb").format(table, query)
                 )
-                size = (await cur.fetchone())["size"]  # type: ignore[index, call-overload]
-                return int(float(size or 0) * n)
+                counts.append((table, (await cur.fetchone())["n"]))  # type: ignore[index, call-overload]
+            if sum(n for _, n in counts) > SIZE_SAMPLE:
+                for table, n in counts:
+                    if n == 0:
+                        continue
+                    cur = await conn.execute(
+                        sql.SQL(
+                            "SELECT avg(pg_column_size(s.*)) AS size"
+                            " FROM (SELECT d.* FROM {} d WHERE d.id @@@ {}::jsonb LIMIT {}) s"
+                        ).format(table, query, sql.Literal(SIZE_SAMPLE))
+                    )
+                    total += float((await cur.fetchone())["size"] or 0) * n  # type: ignore[index, call-overload]
+                return int(total)
     async with connection() as conn:
         cur = await conn.execute(
             sql.SQL("SELECT coalesce(sum(pg_column_size(documents.*)), 0) AS bytes FROM documents WHERE {}").format(
