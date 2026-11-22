@@ -37,10 +37,10 @@ thirds of the work of a download; the exact share is from the commit message, no
 
 **No parallel workers, custom plans** (`AMCAT4_API_PARALLEL_WORKERS`, default 0; `AMCAT4_CUSTOM_PLANS`, default true).
 API connections run with `max_parallel_workers_per_gather = 0` (a count of a normal word: 10 ms with 4 workers, 3.7 ms
-without) and with `plan_cache_mode = force_custom_plan` (after 5 uses psycopg prepares a statement and postgres may
-use a generic plan that is 5-10x slower for pg_search: 84 ms for the first requests, 469 ms from the 11th on, for a very
-common word, in the benchmark of the original code on 2.68 M documents, pg_search 0.26.0, 15-16 Nov 2026). Off: empty value for the first (the server's setting), `false` for the second. Files: `connections.py`,
-`config.py`.
+without) and with `plan_cache_mode = force_custom_plan` (after 5 uses psycopg prepares a statement and postgres may use
+a generic plan that is 5-10x slower for pg_search: 84 ms for the first requests, 469 ms from the 11th on, for a very
+common word, in the benchmark of the original code on 2.68 M documents, pg_search 0.26.0, 15-16 Nov 2026). Off: empty
+value for the first (the server's setting), `false` for the second. Files: `connections.py`, `config.py`.
 
 **Listing without a query over a B-tree index** (`AMCAT4_BTREE_LISTING`, default true). A search without query string
 and without index filters, in id order, is plain SQL over the new index (partition_id, project_pk, id) of migration
@@ -61,12 +61,13 @@ end of a phrase keeps a bound of 1000 expansions (10,000 took 5-20 s). A correct
 ## 2. Paging and downloads
 
 **New sort key `_seq`, depth limit** (`AMCAT4_MAX_OFFSET`, default 10000, 0 = off). `"sort": "_seq"` orders by the
-internal id (the order of storage) with an "after this document" cursor that stays fast at any depth (download by
-offset 25,500 documents/s, by id 107,600, query with 58k hits, synthetic 156k document partition, an earlier version
-of this branch). `_id` keeps its original meaning (the document id). Offset pages deeper than the limit get HTTP 400
-with the advice to use `_seq`; cursors issued by the server are never limited. Cursors are not signed, so a hand-made
-offset cursor is not limited either: the limit is a performance guard, not a security boundary. Every cursor value is
-checked (known keys, non-negative integers), so a hand-made cursor gives HTTP 400, not a database error. Off: `AMCAT4_MAX_OFFSET=0`. Files: `postgres/search.py`, `projects/query.py`.
+internal id (the order of storage) with an "after this document" cursor that stays fast at any depth (download by offset
+25,500 documents/s, by id 107,600, query with 58k hits, synthetic 156k document partition, an earlier version of this
+branch). `_id` keeps its original meaning (the document id). Offset pages deeper than the limit get HTTP 400 with the
+advice to use `_seq`; cursors issued by the server are never limited. Cursors are not signed, so a hand-made offset
+cursor is not limited either: the limit is a performance guard, not a security boundary. Every cursor value is checked
+(known keys, non-negative integers), so a hand-made cursor gives HTTP 400, not a database error. Off:
+`AMCAT4_MAX_OFFSET=0`. Files: `postgres/search.py`, `projects/query.py`.
 
 ## 3. Aggregations
 
@@ -74,7 +75,8 @@ checked (known keys, non-negative integers), so a hand-made cursor gives HTTP 40
 instead of by GROUP BY, which pg_search pushes into the index only for some shapes (0.6-0.8 s per million documents
 for the others, 30-50 ms with `pdb.agg`). Small results use plain SQL. A bucket without values gives null for sum, as
 GROUP BY. If pg_search reports left-out buckets (more than 65,000 groups) or fails with a query error, the original
-GROUP BY runs. Off: `AMCAT4_FAST_PATH=false`. Files: `postgres/index_aggregate.py`, `projects/aggregate.py`.
+GROUP BY runs (top hits too: after a query error on the partition table, the original statement on the parent).
+Off: `AMCAT4_FAST_PATH=false`. Files: `postgres/index_aggregate.py`, `projects/aggregate.py`.
 
 **No slower fallback after a timeout or connection problem.** Before, every `psycopg.Error` led to a second, slower
 statement, also after a statement timeout. Now `must_not_fall_back` (cancelled statements, other OperationalError,
@@ -136,30 +138,32 @@ checks which parent an existing index belongs to. Files: `migrations/locking.py`
 **Move a project to a partition of its own** (migration 0003, `amcat4 move-project`). Done in batches of 10000
 documents, resumable; reads are never blocked (every read path looks in both partitions during the move); writes are
 refused with a conflict during the move. Setting `projects.partition_id` directly still moves everything in one
-statement, as in the original (the original test passes unchanged). Details of the fixes after the first version:
-the partition and the move target are read in one statement (before, a finishing move could give 0 documents); step 1
-is idempotent when a job stops halfway; fill, backfill and copy jobs wait for a move (`JobPostponed`, 30 s) instead
-of failing (a copy waits for a move of its source and of its destination). The number of moved documents in the
-job's progress and result is counted in the target partition when a job (re)starts, so it is right after an
-interruption. Between setting `moving_to` and the first batch the job waits `MOVE_GRACE_SECONDS` (60 s, a constant in
-`projects/partitions.py`): a request reads its projects' partitions once and then runs its statements, so a request
-that read them just before the move started would otherwise miss documents moved meanwhile. This covers requests
-whose statements run within 60 s of reading the partitions (with the default pool and statement timeouts, a pool
-wait plus two statements); it is not a guarantee for longer requests (see Known limits). Files: `projects/partitions.py`, `postgres/layout.py`, `projects/jobs.py`, `__main__.py`, migration 0003.
+statement, as in the original (the original test passes unchanged). Details of the fixes after the first version: the
+partition and the move target are read in one statement (before, a finishing move could give 0 documents); step 1 is
+idempotent when a job stops halfway; fill, backfill and copy jobs wait for a move (`JobPostponed`, 30 s) instead of
+failing (a copy waits for a move of its source and of its destination). The number of moved documents in the job's
+progress and result is counted in the target partition when a job (re)starts, so it is right after an interruption.
+Between setting `moving_to` and the first batch the job waits `MOVE_GRACE_SECONDS` (60 s, a constant in
+`projects/partitions.py`): a request reads its projects' partitions once and then runs its statements, so a request that
+read them just before the move started would otherwise miss documents moved meanwhile. This covers requests whose
+statements run within 60 s of reading the partitions (with the default pool and statement timeouts, a pool wait plus two
+statements); it is not a guarantee for longer requests (see Known limits). Files: `projects/partitions.py`,
+`postgres/layout.py`, `projects/jobs.py`, `__main__.py`, migration 0003.
 
 ## 7. Robustness under load, and other fixes
 
-**Separate pools and timeouts** (`AMCAT4_STATEMENT_TIMEOUT_MS`, default 30000, 0 = off; `AMCAT4_POOL_TIMEOUT_S`,
-default 5). The API pool has the tuned options and a statement timeout (HTTP 503 with advice to be more specific; a statement
-cancelled for another reason, e.g. `pg_cancel_backend`, gets a 503 that does not mention a timeout); a
-second pool for background jobs, maintenance, CLI commands and long writes keeps the server's settings and has no
-timeout (`server_defaults`, `with_server_defaults`). An API request waits at most the pool timeout for a connection,
-then gets HTTP 503 with `Retry-After: 1` (the original: 30 s). `create_fields` was added to the long writes. Off:
-set the timeout to 0, the pool timeout to 30. Files: `connections.py`, `api/__init__.py`.
+**Separate pools and timeouts** (`AMCAT4_STATEMENT_TIMEOUT_MS`, default 30000, 0 = off; `AMCAT4_POOL_TIMEOUT_S`, default
+5). The API pool has the tuned options and a statement timeout (HTTP 503 with advice to be more specific; a statement
+cancelled for another reason, e.g. `pg_cancel_backend`, gets a 503 that does not mention a timeout); a second pool for
+background jobs, maintenance, CLI commands and long writes keeps the server's settings and has no timeout
+(`server_defaults`, `with_server_defaults`). An API request waits at most the pool timeout for a connection, then gets
+HTTP 503 with `Retry-After: 1` (the original: 30 s). `create_fields` was added to the long writes. Off: set the timeout
+to 0, the pool timeout to 30. Files: `connections.py`, `api/__init__.py`.
 
-**Estimated project size** for projects over 20,000 documents: the average of a 20,000 document sample times the
-number of documents. Summing every document read the whole project (12 s for 10.7 M documents) on every
-`GET /index/{ix}`. Files: `projects/index.py`. Off: `AMCAT4_FAST_PATH=false` (the original sums every document).
+**Estimated project size** for projects over 20,000 documents: the average of a 20,000 document sample times the number
+of documents (during a move, per partition: both partitions are counted and sampled). Summing every document read the
+whole project (12 s for 10.7 M documents) on every `GET /index/{ix}`. Files: `projects/index.py`. Off:
+`AMCAT4_FAST_PATH=false` (the original sums every document).
 
 **Upload fixes.** ANALYZE of the staging table (the unstable upload of the night benchmark spent 626 of 632 s in one
 statement); a retry once after a concurrent duplicate upload (`UniqueViolation`), then a clear error instead of HTTP
@@ -170,8 +174,9 @@ statement); a retry once after a concurrent duplicate upload (`UniqueViolation`)
 
 New or changed: `tests/test_search_v2.py`, `test_phase_c.py`, `test_review_fixes.py`, `test_fast_path.py`,
 `test_migrations.py`, `test_maintenance.py`, `conftest.py`, `test_querystring.py`, `test_storage.py`,
-`test_review_fixes2.py`. They cover isolation in a shared partition, parity with the original SQL for 15 query shapes, the switches, migrations from a
-0001 schema, moves, jobs and maintenance. Each test says in its docstring which behaviour or bug it protects.
+`test_review_fixes2.py`. They cover isolation in a shared partition, parity with the original SQL for 15 query shapes,
+the switches, migrations from a 0001 schema, moves, jobs and maintenance. Each test says in its docstring which
+behaviour or bug it protects.
 
 ## Known limits
 
