@@ -148,16 +148,19 @@ async def cancel_job(job_id: str) -> None:
     )
 
 
-async def _claim_job() -> Job | None:
+async def _claim_job(job_id: str | None = None) -> Job | None:
+    """Claim the oldest job that can run now (or only this job, if job_id is given), or return None"""
     async with connection() as conn:
         async with conn.transaction():
             # (postponed jobs wait POSTPONE_FOR: otherwise run_pending_jobs would claim them again at once)
             cur = await conn.execute(
                 f"""SELECT id, type, params, progress FROM jobs
-                    WHERE (status = 'pending'
-                           AND NOT (progress ? 'postponed' AND updated_at > now() - interval '{POSTPONE_FOR}'))
-                       OR (status = 'running' AND updated_at < now() - interval '{STALE_AFTER}')
-                    ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED"""  # type: ignore[arg-type]
+                    WHERE ((status = 'pending'
+                            AND NOT (progress ? 'postponed' AND updated_at > now() - interval '{POSTPONE_FOR}'))
+                           OR (status = 'running' AND updated_at < now() - interval '{STALE_AFTER}'))
+                      AND (%(id)s::text IS NULL OR id = %(id)s)
+                    ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED""",  # type: ignore[arg-type]
+                {"id": job_id},
             )
             row = await cur.fetchone()
             if row is None:
@@ -213,6 +216,22 @@ async def run_pending_jobs() -> int:
         await run_job(job)
         n += 1
     return n
+
+
+async def run_job_now(job_id: str, poll_interval: float = 2.0) -> dict:
+    """
+    Run this one job here, until it is done, failed or cancelled, and return it (as get_job). If another process (the
+    server's job worker) claimed it first, or it was postponed, wait for it, and claim it again when it can run. Other
+    pending jobs are left to the job worker. Used by `amcat4 move-project --now`.
+    """
+    while True:
+        job = await _claim_job(job_id)
+        if job is not None:
+            await run_job(job)
+        row = await get_job(job_id)
+        if row["status"] in ("done", "failed", "cancelled"):
+            return row
+        await asyncio.sleep(poll_interval)
 
 
 @dataclass

@@ -224,19 +224,23 @@ async def optimize(args):
 async def move_project(args):
     """
     Move a project to a documents partition of its own, in batches (see amcat4.projects.partitions). Creates a job,
-    which the job worker of the server runs; with --now, it runs here (and waits until it is done). --now runs all
-    pending jobs (run_pending_jobs), and if the server's worker claims the move job first, this returns before the move
-    is done: then follow the job in the jobs table.
+    which the job worker of the server runs. With --now, this command runs that job itself (only that job: other
+    pending jobs are left to the server), or waits for it if the server's worker claimed it first, and reports the
+    result when the job is done (exit code 1 if it failed or was cancelled). Unlike before, when --now ran every
+    pending job (run_pending_jobs) and said "Done" even when the server's worker was still moving the project.
     """
-    from amcat4.projects.jobs import run_pending_jobs
+    from amcat4.projects.jobs import run_job_now
     from amcat4.projects.partitions import start_move
 
     async with amcat_connections():
         job = await start_move(args.project, created_by="cli")
         logging.info(f"Created job {job['id']} to move project {args.project} to a partition of its own")
         if args.now:
-            await run_pending_jobs()
-            logging.info("Done")
+            job = await run_job_now(job["id"])
+            if job["status"] != "done":
+                logging.error(f"The move of project {args.project} was {job['status']}: {job['error'] or 'no error message'}")
+                raise SystemExit(1)
+            logging.info(f"Done: {job['result']}")
 
 
 async def create_test_index(_args):
@@ -354,7 +358,11 @@ def main():
 
     p = subparsers.add_parser("move-project", help="Move a (big) project to a documents partition of its own, in batches")
     p.add_argument("--project", required=True, help="The project (index) id")
-    p.add_argument("--now", action="store_true", help="Run the job here, instead of leaving it to the server")
+    p.add_argument(
+        "--now",
+        action="store_true",
+        help="Run the move here (or wait for the server running it) until it is done, instead of leaving it to the server",
+    )
     p.set_defaults(func=move_project)
 
     p = subparsers.add_parser("create-test-index", help=f"Create the {SOTU_INDEX} test index")

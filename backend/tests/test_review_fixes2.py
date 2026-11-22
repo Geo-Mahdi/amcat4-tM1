@@ -7,7 +7,7 @@ import pytest
 
 from amcat4.config import get_settings
 from amcat4.postgres.connection import connection, execute, fetch_all, fetch_one
-from amcat4.projects import jobs
+from amcat4.projects import jobs, partitions
 from amcat4.projects.query import query_documents
 from tests.test_fast_path import two_projects  # noqa: F401
 from tests.test_review_fixes import _finish_job, _make_claimable, _stop_move_after_first_batch
@@ -111,3 +111,68 @@ async def test_copy_postponed_while_source_moves(moving_projects, monkeypatch):
     await jobs.run_pending_jobs()
     copy = await jobs.get_job(job["id"])
     assert copy["status"] == "done" and copy["result"]["copied"] == 40
+
+
+###################### 4. move-project --now runs (or waits for) this move job only ######################
+
+
+async def _cli_move(monkeypatch, project: str) -> None:
+    """Run `amcat4 move-project --project <project> --now` in the test process (with its connections)"""
+    import argparse
+    from contextlib import asynccontextmanager
+
+    from amcat4 import __main__ as cli
+
+    @asynccontextmanager
+    async def test_connections():  # (the tests have their connections already)
+        yield
+
+    monkeypatch.setattr(cli, "amcat_connections", test_connections)
+    await cli.move_project(argparse.Namespace(project=project, now=True))
+
+
+@pytest.mark.anyio
+async def test_move_now_runs_only_its_job(moving_projects, monkeypatch, caplog):
+    """--now ran every pending job (run_pending_jobs); now it runs the move job only, and reports its result"""
+    import logging
+
+    from tests.test_review_fixes import _jobs_of
+
+    a, b = moving_projects
+    other = await jobs.create_job("copy", b, None, {"source": b, "destination": b})  # (someone else's pending job)
+    with caplog.at_level(logging.INFO):
+        await _cli_move(monkeypatch, a)
+    [move] = await _jobs_of(a, "move_project")
+    assert move["status"] == "done" and move["result"]["moved"] == 40
+    assert (await jobs.get_job(other["id"]))["status"] == "pending"
+    assert "Done: " in caplog.text
+
+
+@pytest.mark.anyio
+async def test_move_now_waits_for_the_worker(moving_projects, monkeypatch):
+    """If the server's worker claimed the job first, run_job_now waits until it is done (it returned at once before)"""
+    import asyncio
+
+    a, _ = moving_projects
+    job = await partitions.start_move(a)
+    await execute("UPDATE jobs SET status = 'running', updated_at = now() WHERE id = %s", [job["id"]])  # (the worker)
+    waiting = asyncio.create_task(jobs.run_job_now(job["id"], poll_interval=0.05))
+    await asyncio.sleep(0.2)
+    assert not waiting.done()  # (not claimed: another process is running it)
+    await execute("UPDATE jobs SET status = 'done', result = '{}' WHERE id = %s", [job["id"]])
+    assert (await asyncio.wait_for(waiting, 5))["status"] == "done"
+    await execute("UPDATE projects SET moving_to = NULL WHERE id = %s", [a])
+
+
+@pytest.mark.anyio
+async def test_move_now_reports_failure(moving_projects, monkeypatch):
+    """A failed move: --now exits with code 1 (it said "Done" before)"""
+
+    async def fail(job):
+        raise RuntimeError("the disk is full")
+
+    monkeypatch.setitem(jobs.HANDLERS, "move_project", fail)
+    a, _ = moving_projects
+    with pytest.raises(SystemExit) as e:
+        await _cli_move(monkeypatch, a)
+    assert e.value.code == 1

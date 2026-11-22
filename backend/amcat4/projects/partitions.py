@@ -24,7 +24,8 @@ paths (which need a single partition) are not used. Afterwards the old partition
 which the automatic maintenance cleans up (a rebuild), and both partitions get a vacuum job.
 
 Start it with `amcat4 move-project --project <id>` (an admin command; the job worker of the server runs it, or with
---now the command itself). A move is refused while the project has unfinished jobs (start_move).
+--now the command itself, which then runs only this job, or waits for the server's worker, and reports its result).
+A move is refused while the project has unfinished jobs (start_move).
 """
 
 import logging
