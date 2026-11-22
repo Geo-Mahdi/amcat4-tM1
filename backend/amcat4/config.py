@@ -147,6 +147,17 @@ class Settings(BaseSettings):
         ),
     ] = True
 
+    quarter_key: Annotated[
+        bool,
+        Field(
+            description=(
+                "Aggregate date fields by quarter on the derived quarter key (migration 0002), inside the search index, "
+                "also with metrics. Fields whose older documents do not have the key yet keep the slower way until the "
+                "backfill job is done. false = always the slower way, as before (AMCAT4_QUARTER_KEY=false)"
+            ),
+        ),
+    ] = True
+
     sort_slot_job_rows: Annotated[
         int,
         Field(

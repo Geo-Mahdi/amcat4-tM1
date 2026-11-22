@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Callable, Literal
 
-from psycopg import AsyncConnection
+from psycopg import AsyncConnection, sql
 
 StorageColumn = Literal["text_fields", "exact_fields", "stored_fields", "vector"]
 SortSlot = Literal["date", "source", "sort_kw1", "sort_kw2", "sort_kw3", "sort_num1", "sort_date2"]
@@ -86,6 +86,8 @@ class FieldInfo:
     # False while a background job copies the values of the field into its (new) sort slot: writes already fill the
     # slot, but reading (sorting) must not use it yet
     sort_ready: bool = True
+    # False for date fields whose documents do not all have the derived quarter key yet (see DATE_DERIVED)
+    quarter_ready: bool = True
     subkey: str | None = None  # for sub-fields, e.g. the lat/lon of a geo_point
 
     @property
@@ -134,6 +136,9 @@ def _daypart(dt: datetime) -> str:
 DATE_DERIVED: dict[str, Callable[[datetime], str | int]] = {
     "year": lambda dt: f"{dt.year:04d}",
     "month": lambda dt: f"{dt.year:04d}-{dt.month:02d}",
+    # the first month of the quarter (2024-04 for April to June), so quarters sort and convert like months. Added in
+    # migration 0002: documents stored before it get the key from a background job (fields.quarter_ready)
+    "quarter": lambda dt: f"{dt.year:04d}-{(dt.month - 1) // 3 * 3 + 1:02d}",
     "week": lambda dt: (dt.date() - timedelta(days=dt.weekday())).isoformat(),
     "day": lambda dt: dt.date().isoformat(),
     "yearnr": lambda dt: dt.year,
@@ -225,7 +230,7 @@ def normalize_geo(value: Any) -> dict[str, float]:
     return {"lat": lat, "lon": lon}
 
 
-FIELD_COLUMNS = "pk, name, type, unique_field, sort_slot, sort_slot_ready"
+FIELD_COLUMNS = "pk, name, type, unique_field, sort_slot, sort_slot_ready, quarter_ready"
 
 
 def field_info_from_row(row: dict) -> FieldInfo:
@@ -236,7 +241,20 @@ def field_info_from_row(row: dict) -> FieldInfo:
         unique=row["unique_field"],
         sort_slot=row["sort_slot"],
         sort_ready=row.get("sort_slot_ready", True),
+        quarter_ready=row.get("quarter_ready", True),
     )
+
+
+def quarter_sql(value: sql.Composable) -> sql.Composable:
+    """SQL for the derived quarter key (as DATE_DERIVED["quarter"]) of a normalized date string, e.g. 2024-05-.. -> 2024-04"""
+    return sql.SQL("substr({v}, 1, 5) || lpad(((substr({v}, 6, 2)::int - 1) / 3 * 3 + 1)::text, 2, '0')").format(v=value)
+
+
+def use_quarter_key(fs: list[FieldInfo]) -> bool:
+    """Whether quarter aggregations on these fields can use the derived quarter key (all documents have it)"""
+    from amcat4.config import get_settings
+
+    return get_settings().quarter_key and all(f.quarter_ready for f in fs)
 
 
 async def list_field_infos(conn: AsyncConnection, project_pk: int) -> dict[str, FieldInfo]:

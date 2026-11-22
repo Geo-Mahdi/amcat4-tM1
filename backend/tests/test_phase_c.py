@@ -2,6 +2,7 @@
 Tests for the version 2 changes that come with migration 0002:
 - listing without a query over the B-tree index (AMCAT4_BTREE_LISTING)
 - the five extra sort slots, filling them in a job for large projects (AMCAT4_SORT_SLOT_JOB_ROWS), Top-K sorting
+- the derived quarter key of date fields, and its backfill job for older documents (AMCAT4_QUARTER_KEY)
 
 The fixtures come from test_fast_path.py: two projects in the same partition, with overlapping words and values.
 """
@@ -15,10 +16,15 @@ from psycopg import sql
 
 from amcat4.config import get_settings
 from amcat4.models import FilterSpec, ProjectSettings, SortSpec, UpdateDocumentField
+from amcat4.postgres import index_aggregate
+from amcat4.postgres import search as search_module
 from amcat4.postgres.connection import connection, fetch_all
+from amcat4.postgres.fields import normalize_date, quarter_sql
 from amcat4.postgres.projects import project_pk
 from amcat4.postgres.search import SearchQuery, compile_search, order_by
+from amcat4.projects import aggregate as aggregate_module
 from amcat4.projects import jobs
+from amcat4.projects.aggregate import Aggregation, Axis, query_aggregate
 from amcat4.projects.documents import create_or_update_documents
 from amcat4.projects.index import create_project_index, delete_project_index
 from amcat4.projects.query import query_documents
@@ -319,3 +325,131 @@ async def test_sort_slot_type_change(slot_project):
     await update_fields(p, {"n": UpdateDocumentField(type="keyword")})
     assert (await _slots(p))["n"] is None
     assert set((await _slot_values(p, "sort_num1")).values()) == {None}
+
+
+################ quarter key ################
+
+QUARTER_DATES = ["2018-01-01", "2018-03-31T23:59:59Z", "2018-04-01", "2018-06-15", "2018-12-31", "0999-11-05", "2020-07-04"]
+
+
+@pytest.fixture()
+async def quarter_project():
+    name = "amcat4_unittest_quarters"
+    await delete_project_index(name, ignore_missing=True)
+    await create_project_index(ProjectSettings(id=name))
+    docs = [{"_id": str(i), "date": d, "n": i, "cat": "ab"[i % 2]} for i, d in enumerate(QUARTER_DATES)]
+    await upload(
+        name, [*docs, {"_id": "nodate", "n": 100, "cat": "a"}], fields={"date": "date", "n": "integer", "cat": "keyword"}
+    )  # type: ignore[arg-type]
+    yield name
+    await delete_project_index(name, ignore_missing=True)
+
+
+async def _quarter_keys(index: str) -> dict[str, str | None]:
+    key = (await field_infos(index))["date"].derived_key("quarter")
+    rows = await fetch_all(
+        "SELECT doc_id, exact_fields->>%s AS q FROM documents WHERE project_pk = %s", [key, await project_pk(index)]
+    )
+    return {row["doc_id"]: row["q"] for row in rows}
+
+
+async def _quarter_aggs(index: str) -> list:
+    out = []
+    for axes, metrics in [
+        ([Axis("date", "quarter")], []),
+        ([Axis("date", "quarter"), Axis("cat")], []),
+        ([Axis("date", "quarter")], [Aggregation("n", "avg"), Aggregation("n", "max")]),
+    ]:
+        r = await query_aggregate(index, axes, metrics, limit=1000)  # type: ignore[arg-type]
+        out.append(sorted(map(str, r.data)))
+    return out
+
+
+async def _remove_quarter_keys(index: str) -> None:
+    """Make the project look like one from before migration 0002: no quarter keys, field not ready"""
+    f = (await field_infos(index))["date"]
+    pk = await project_pk(index)
+    await fetch_all(
+        "UPDATE documents SET exact_fields = exact_fields - %s WHERE project_pk = %s RETURNING id",
+        [f.derived_key("quarter"), pk],
+    )
+    await fetch_all("UPDATE fields SET quarter_ready = false WHERE pk = %s RETURNING pk", [f.pk])
+
+
+@pytest.mark.anyio
+async def test_quarter_key_at_upload(quarter_project):
+    keys = await _quarter_keys(quarter_project)
+    assert keys == {
+        "0": "2018-01",
+        "1": "2018-01",
+        "2": "2018-04",
+        "3": "2018-04",
+        "4": "2018-10",
+        "5": "0999-10",
+        "6": "2020-07",
+        "nodate": None,
+    }
+    # the SQL version (used by the backfill job) gives the same keys
+    rows = await fetch_all(
+        sql.SQL("SELECT {} AS q FROM unnest(%s::text[]) AS v").format(quarter_sql(sql.SQL("v"))),  # type: ignore[arg-type]
+        [[normalize_date(d) for d in QUARTER_DATES]],
+    )
+    assert [row["q"] for row in rows] == [keys[str(i)] for i in range(len(QUARTER_DATES))]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("index_paths_on", [False, True])
+async def test_quarter_aggregation_same_results(quarter_project, monkeypatch, index_paths_on):
+    """Quarter aggregations give the same results with the key, without it (switch off), and before the backfill"""
+    if index_paths_on:
+        monkeypatch.setattr(aggregate_module, "SMALL_RESULT", 0)
+        monkeypatch.setattr(search_module, "COUNT_STEP", 0)
+    p = quarter_project
+    with_key = await _quarter_aggs(p)
+    assert with_key[0] == [
+        "(None, 1)",
+        "(datetime.date(2018, 1, 1), 2)",
+        "(datetime.date(2018, 10, 1), 1)",
+        "(datetime.date(2018, 4, 1), 2)",
+        "(datetime.date(2020, 7, 1), 1)",
+        "(datetime.date(999, 10, 1), 1)",
+    ]
+    assert "(datetime.date(2018, 4, 1), 2, 2.5, 3.0)" in with_key[2]
+    monkeypatch.setattr(get_settings(), "quarter_key", False)
+    assert await _quarter_aggs(p) == with_key
+    monkeypatch.setattr(get_settings(), "quarter_key", True)
+    await _remove_quarter_keys(p)
+    assert not (await field_infos(p))["date"].quarter_ready
+    assert await _quarter_aggs(p) == with_key
+
+
+@pytest.mark.anyio
+async def test_quarter_metrics_in_index(quarter_project):
+    """With the quarter key, a quarter axis with metrics can be done inside the index (pdb.agg)"""
+    fs = await get_fieldset([quarter_project])
+    request, _ = index_aggregate.build_request(fs, [Axis("date", "quarter")], [Aggregation("n", "avg")])
+    assert request["terms"]["field"].endswith("_quarter")
+    await _remove_quarter_keys(quarter_project)
+    fs = await get_fieldset([quarter_project])
+    with pytest.raises(index_aggregate._NotSupported):
+        index_aggregate.build_request(fs, [Axis("date", "quarter")], [Aggregation("n", "avg")])
+
+
+@pytest.mark.anyio
+async def test_quarter_backfill(quarter_project, monkeypatch):
+    p = quarter_project
+    expected_keys, expected_aggs = await _quarter_keys(p), await _quarter_aggs(p)
+    await _remove_quarter_keys(p)
+    assert set((await _quarter_keys(p)).values()) == {None}
+    monkeypatch.setattr(jobs, "FILL_BATCH_SIZE", 3)
+    await jobs.schedule_quarter_backfill({})
+    await jobs.schedule_quarter_backfill({})  # (not twice)
+    pk = await project_pk(p)
+    assert len(await fetch_all("SELECT 1 FROM jobs WHERE type = 'backfill_quarter' AND project_pk = %s", [pk])) == 1
+    await jobs.run_pending_jobs()
+    [job] = await fetch_all("SELECT status, result FROM jobs WHERE type = 'backfill_quarter' AND project_pk = %s", [pk])
+    assert job["status"] == "done" and job["result"]["fields"] == ["date"]
+    assert await _quarter_keys(p) == expected_keys
+    assert (await field_infos(p))["date"].quarter_ready
+    assert await _quarter_aggs(p) == expected_aggs
+    await fetch_all("DELETE FROM jobs WHERE type = 'backfill_quarter' RETURNING id")

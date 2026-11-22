@@ -36,14 +36,19 @@ Documents:
 - BM25 scores (how rare a word is) are computed per partition, so other projects in the same partition affect the
   ranking (but not which documents match).
 - Standard metadata columns: date and source (e.g. publication date and outlet), which most communication data has.
-  pg_search cannot sort on json keys inside the index (Top-K), so each project can map one date field to the date
-  column and one keyword field to the source column (fields.sort_slot): real columns that are also in the index.
+  pg_search cannot sort on json keys inside the index (Top-K; also not in 0.27), so each project can map one date
+  field to the date column and one keyword field to the source column (fields.sort_slot): real columns that are
+  also in the index.
   Sorting on these fields is fast; sorting on other fields works but needs to read all matches. The first date
   field, and a keyword field called "source", are mapped automatically. Adding a standard column later means
   rebuilding the BM25 indexes.
 - copied_from records the original project and document of copied documents.
-- Date fields also get derived keys (f12_year, f12_month, f12_dayofweek, ...) in exact_fields, so date histograms
-  and date-part filters run inside the index.
+- Date fields also get derived keys (f12_year, f12_quarter, f12_month, f12_dayofweek, ...) in exact_fields, so date
+  histograms and date-part filters run inside the index. (The quarter key came with migration 0002: older documents
+  get it from a background job, see fields.quarter_ready.)
+- Sort slots: migration 0002 added five generic slot columns (sort_kw1..3, sort_num1, sort_date2) next to date and
+  source; fast_sort puts a field in a free slot of its kind (see amcat4.postgres.fields). A B-tree index on
+  (partition_id, project_pk, id) serves listings without a query in id order.
 
 TODO (later): read-only *reference* projects, that reference documents owned by other projects
 (project_references / document_references tables). Querying a reference project filters on the owner

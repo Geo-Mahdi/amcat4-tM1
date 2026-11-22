@@ -263,6 +263,14 @@ async def _copy_job(job: Job) -> dict[str, Any]:
         if new_fields:
             await create_fields(p["destination"], new_fields)
         source_infos = await field_infos(p["source"])
+        # date fields copied from fields whose documents do not all have the quarter key yet: the copies don't either
+        # (the backfill task fills them later)
+        not_ready = [d for s, d in field_map.items() if s in source_infos and not source_infos[s].quarter_ready]
+        if not_ready:
+            await execute(
+                "UPDATE fields SET quarter_ready = false WHERE project_pk = %s AND name = ANY(%s) AND type = 'date'",
+                [to_pk, not_ready],
+            )
         query = SearchQuery(
             queries=p.get("queries"), filters={k: FilterSpec(**v) for k, v in (p.get("filters") or {}).items()} or None
         )
@@ -332,12 +340,81 @@ async def _fill_sort_slot_job(job: Job) -> dict[str, Any]:
     return {"slot": slot, "field_pk": field_pk, "batches": job.progress.get("batches", 0)}
 
 
+async def _backfill_quarter_job(job: Job) -> dict[str, Any]:
+    """
+    Give the documents of a project that were stored before migration 0002 the derived quarter key of their date
+    fields, in batches (resumable), then mark the fields as ready (quarter aggregations then use the key).
+    params: project_pk. Only touches documents that have a date value but no quarter key.
+    """
+    from amcat4.postgres.fields import field_info_from_row, quarter_sql
+    from amcat4.postgres.layout import project_filter
+
+    project = job.params["project_pk"]
+    rows = await fetch_all(
+        f"SELECT {FIELD_COLUMNS} FROM fields WHERE project_pk = %s AND type = 'date' AND NOT quarter_ready",  # type: ignore[arg-type]
+        [project],
+    )
+    done = job.progress.get("fields", {})
+    for row in rows:
+        f = field_info_from_row(row)
+        after = done.get(str(f.pk), 0)
+        while after is not None:
+            async with connection() as conn:
+                where = await project_filter(conn, project)
+                cur = await conn.execute(
+                    sql.SQL("SELECT max(id) AS last FROM ({}) b").format(
+                        sql.SQL("SELECT id FROM documents WHERE {} AND id > %s ORDER BY id LIMIT %s").format(where)
+                    ),
+                    [after, FILL_BATCH_SIZE],
+                )
+                last = (await cur.fetchone())["last"]  # type: ignore[index]
+                if last is not None:
+                    value = sql.SQL("(documents.exact_fields->>{})").format(sql.Literal(f.key))
+                    await conn.execute(
+                        sql.SQL(
+                            """UPDATE documents SET exact_fields = exact_fields || jsonb_build_object({qkey}, {quarter})
+                               WHERE {where} AND documents.id > %s AND documents.id <= %s
+                                 AND exact_fields ? {key} AND NOT exact_fields ? {qkey}"""
+                        ).format(
+                            qkey=sql.Literal(f.derived_key("quarter")),
+                            quarter=quarter_sql(value),
+                            key=sql.Literal(f.key),
+                            where=where,
+                        ),
+                        [after, last],
+                    )
+            after = last
+            done[str(f.pk)] = last
+            await job.save_progress(fields=done)
+        await execute("UPDATE fields SET quarter_ready = true WHERE pk = %s", [f.pk])
+    return {"fields": [row["name"] for row in rows]}
+
+
+async def schedule_quarter_backfill(state: dict) -> dict:
+    """
+    Periodic task: a backfill_quarter job for every project with date fields that do not have their quarter keys
+    (after migration 0002, or a copy from such a project). Not again for a project whose job failed (that needs a
+    look; delete the failed job to try again).
+    """
+    rows = await fetch_all(
+        """SELECT DISTINCT f.project_pk FROM fields f WHERE f.type = 'date' AND NOT f.quarter_ready
+           AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.type = 'backfill_quarter' AND j.project_pk = f.project_pk
+                           AND j.status IN ('pending', 'running', 'failed'))"""
+    )
+    for row in rows:
+        async with connection() as conn:
+            await create_job_in_transaction(conn, "backfill_quarter", row["project_pk"], {"project_pk": row["project_pk"]})
+    return state
+
+
 HANDLERS: dict[str, Callable[[Job], Awaitable[dict[str, Any]]]] = {
     "copy": _copy_job,
     "fill_sort_slot": _fill_sort_slot_job,
+    "backfill_quarter": _backfill_quarter_job,
     "reindex": maintenance.reindex_job,
 }
 
 PERIODIC: dict[str, PeriodicTask] = {
     "partition_maintenance": PeriodicTask(interval=maintenance.CHECK_INTERVAL, run=maintenance.check_partitions),
+    "quarter_backfill": PeriodicTask(interval=timedelta(minutes=1), run=schedule_quarter_backfill),
 }

@@ -13,7 +13,7 @@ from typing import Any, Literal
 
 from psycopg import sql
 
-from amcat4.postgres.fields import DATE_DERIVED, FieldInfo, QueryError
+from amcat4.postgres.fields import DATE_DERIVED, FieldInfo, QueryError, use_quarter_key
 from amcat4.postgres.filters import DATE_TRUNC, field_sql
 
 MetricFunction = Literal["sum", "avg", "min", "max", "count"]
@@ -43,7 +43,8 @@ def axis_expr(axis: Axis, fs: list[FieldInfo], lateral_alias: str) -> tuple[sql.
         )
         return sql.SQL("{}.value").format(sql.Identifier(lateral_alias)), lateral
 
-    if (axis.interval is None and ftype in RAW_GROUP_TYPES) or (ftype == "date" and axis.interval in DATE_DERIVED):
+    derived = ftype == "date" and axis.interval in DATE_DERIVED and (axis.interval != "quarter" or use_quarter_key(fs))
+    if (axis.interval is None and ftype in RAW_GROUP_TYPES) or derived:
         # Group on the raw json value (or the derived date key, so no date expression is needed), and convert
         # the values to the right type afterwards. Postgres does the grouping: pg_search can only group inside
         # the index on indexed columns, not on json expressions like this.
@@ -78,7 +79,7 @@ def postprocess_value(value: Any, axis: Axis, ftype: str) -> Any:
     match axis.interval if ftype == "date" else ftype:
         case "year":
             return date(int(value), 1, 1)
-        case "month":
+        case "month" | "quarter":
             return date.fromisoformat(value + "-01")
         case "week" | "day":
             return date.fromisoformat(value)

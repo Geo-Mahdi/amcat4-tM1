@@ -51,7 +51,7 @@ from amcat4.postgres.layout import project_filter
 from amcat4.postgres.projects import project_partitions, project_pk, project_pks
 from amcat4.systemdata.roles import get_user_project_role, role_is_at_least
 
-_COLUMNS = "pk, name, type, unique_field, metareader, reader, client_settings, sort_slot, sort_slot_ready"
+_COLUMNS = "pk, name, type, unique_field, metareader, reader, client_settings, sort_slot, sort_slot_ready, quarter_ready"
 
 
 def _document_field(row: dict) -> DocumentField:

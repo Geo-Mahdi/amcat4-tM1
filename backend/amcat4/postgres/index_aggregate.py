@@ -7,9 +7,10 @@ only on a partition table. It falls back to fetching every matching row (and unp
 the columnar (fast) fields of the index directly for all of these: 30-50 ms per million documents.
 
 This module handles the common shapes and returns None for everything else, so the caller can use GROUP BY:
-- axes: keyword and tag fields, and date fields with an interval that is stored as a derived key (year, month, ...);
-  quarter is computed from the month buckets. Nested axes become nested terms aggregations.
-- metrics: avg, min, max, sum of number and integer fields (not with a quarter axis).
+- axes: keyword and tag fields, and date fields with an interval that is stored as a derived key (year, quarter,
+  month, ...). Fields whose documents do not all have the quarter key yet (stored before migration 0002, until the
+  backfill job is done) compute quarters from the month buckets. Nested axes become nested terms aggregations.
+- metrics: avg, min, max, sum of number and integer fields (not with a quarter axis computed from months).
 - a single project per field (fields of several projects have different keys: GROUP BY handles that).
 The query must use the partition table (CompiledSearch.fast), because pdb.agg does not work on the parent.
 
@@ -27,7 +28,7 @@ from typing import Any
 import psycopg
 from psycopg import AsyncConnection, sql
 
-from amcat4.postgres.fields import DATE_DERIVED, FieldInfo, FieldSet
+from amcat4.postgres.fields import DATE_DERIVED, FieldInfo, FieldSet, use_quarter_key
 
 MAX_BUCKETS = 65_000  # paradedb.max_term_agg_buckets
 METRICS = {"avg", "min", "max", "sum"}
@@ -47,10 +48,11 @@ def _axis_field(fieldset: FieldSet, axis) -> tuple[FieldInfo, str]:
         raise _NotSupported("sub-field")
     if f.type in ("keyword", "tag") and axis.interval is None:
         return f, f.path
-    if f.type == "date" and axis.interval in DATE_DERIVED:
+    if f.type == "date" and axis.interval in DATE_DERIVED and axis.interval != "quarter":
         return f, f.derived_path(axis.interval)
     if f.type == "date" and axis.interval == "quarter":
-        return f, f.derived_path("month")
+        # (the quarter key, or, for documents stored before it existed, the month buckets merged into quarters)
+        return f, f.derived_path("quarter" if use_quarter_key([f]) else "month")
     raise _NotSupported(f"{f.type} axis with interval {axis.interval}")
 
 
@@ -87,8 +89,8 @@ def build_request(fieldset: FieldSet, axes: list, metrics: list) -> tuple[dict, 
         f, path = _axis_field(fieldset, axis)
         fields.append(f)
         paths.append(path)
-    if any(a.interval == "quarter" for a in axes) and metrics:
-        raise _NotSupported("metrics with a quarter axis")
+    if metrics and any(a.interval == "quarter" and not path.endswith("_quarter") for a, path in zip(axes, paths)):
+        raise _NotSupported("metrics with a quarter axis computed from months")
     leaf = {f"m{j}": {m.function: {"field": _metric_path(fieldset, m)}} for j, m in enumerate(metrics)}
     if not axes:
         raise _NotSupported("no axes")  # a single count (with metrics): GROUP BY handles it
