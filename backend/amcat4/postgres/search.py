@@ -84,9 +84,11 @@ def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False) -
 
     fast: (read-only statements only: count, search, aggregate) if all projects are in one partition and there is no
     filter on document ids, query that partition's table directly (CompiledSearch.table). pg_search can then count
-    and aggregate inside its index (Aggregate Scan), which it cannot do through the partitioned parent table. The
-    SQL condition on project_pk is kept as a second guard next to the project clause in the json query.
-    Write statements (update/delete by query) must not use this.
+    and aggregate inside its index (Aggregate Scan), which it cannot do through the partitioned parent table.
+    On the partition table the projects are selected only by the project clause of the json query (the first `must`
+    clause, built here and never from user input, so a query string cannot escape it). A second SQL condition on
+    project_pk would be evaluated by pg_search as a second term inside the index and made large counts up to 2x
+    slower. Write statements (update/delete by query) must not use this: they keep both SQL conditions.
     """
     must: list[dict] = [project_clause(fieldset.project_pks)]
     if query.queries:
@@ -102,8 +104,8 @@ def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False) -
     project_cond, project_param = _equals_any("documents.project_pk", list(fieldset.project_pks))
     if use_partition_table:
         # every row of documents_p<N> has partition_id N, so no partition condition is needed
-        sql_clauses: list[sql.Composable] = [project_cond]
-        params: list[Any] = [project_param]
+        sql_clauses: list[sql.Composable] = []
+        params: list[Any] = []
         table: sql.Composable = sql.SQL("{} AS documents").format(sql.Identifier(partition_table(partitions[0])))
     else:
         partition_cond, partition_param = _equals_any("documents.partition_id", partitions)
@@ -163,8 +165,25 @@ def order_by(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "desc"]]] 
     return sql.SQL(", ").join(items)
 
 
+# Counting in two steps (fast path): pg_search's in-index count (Aggregate Scan) has a floor of about 7-12 ms but
+# hardly grows with the number of hits; counting the hits one by one is 2-3 ms for a few hundred hits but grows with
+# them. So first count at most COUNT_STEP + 1 hits one by one, and only if there are more, count inside the index.
+# The result is always exact.
+COUNT_STEP = 1_000
+
+
 async def count(conn: AsyncConnection, fieldset: FieldSet, query: SearchQuery) -> int:
     c = compile_search(fieldset, query, fast=True)
+    if c.fast:
+        cur = await conn.execute(
+            sql.SQL("SELECT count(*) AS n FROM (SELECT 1 FROM {} WHERE {} LIMIT {}) capped").format(
+                c.table, c.where, sql.Literal(COUNT_STEP + 1)
+            ),
+            c.params,
+        )
+        n = (await cur.fetchone())["n"]  # type: ignore[index, call-overload]
+        if n <= COUNT_STEP:
+            return n
     cur = await conn.execute(sql.SQL("SELECT count(*) AS n FROM {} WHERE {}").format(c.table, c.where), c.params)
     row = await cur.fetchone()
     return row["n"]  # type: ignore[index, call-overload]
@@ -282,7 +301,13 @@ async def search(
             doc["_similarity"] = row["_similarity"]  # type: ignore[index, call-overload]
         results.append(doc)
 
-    total = await count(conn, fieldset, query) if with_total else len(results)
+    if not with_total:
+        total = len(results)
+    elif offset == 0 and after_id is None and not similar and len(rows) < per_page:
+        # the first page is not full, so these are all the hits: no need to count
+        total = len(rows)
+    else:
+        total = await count(conn, fieldset, query)
     last_id = rows[-1]["_internal_id"] if rows else None  # type: ignore[index, call-overload]
     return SearchResult(total=total, results=results, last_id=last_id)
 
