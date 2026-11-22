@@ -43,6 +43,12 @@ class CompiledSearch:
     # table of the one partition that holds all projects of the query
     table: sql.Composable = field(default_factory=lambda: sql.Identifier("documents"))
     fast: bool = False
+    # If the search has no query string and no filters that need the search index (so only the projects, and maybe
+    # document ids, select): the same selection as plain SQL conditions, without the search index. Listing documents
+    # in id order then uses the B-tree index (partition_id, project_pk, id) of migration 0002, which reads only the
+    # rows of the page (the search index has to go through the ids of all projects in the partition)
+    plain_where: sql.Composable | None = None
+    plain_params: list[Any] = field(default_factory=list)
 
 
 def project_clause(project_pks: list[int]) -> dict:
@@ -119,26 +125,30 @@ def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False) -
     filters = dict(query.filters or {})
     use_partition_table = fast and get_settings().fast_path and len(partitions) == 1 and "_id" not in filters and not query.ids
     project_cond, project_param = _equals_any("documents.project_pk", list(fieldset.project_pks))
+    partition_cond, partition_param = _equals_any("documents.partition_id", partitions)
     if use_partition_table:
         # every row of documents_p<N> has partition_id N, so no partition condition is needed
-        sql_clauses: list[sql.Composable] = []
-        params: list[Any] = []
+        base_clauses: list[sql.Composable] = []
+        base_params: list[Any] = []
         table: sql.Composable = sql.SQL("{} AS documents").format(sql.Identifier(partition_table(partitions[0])))
     else:
-        partition_cond, partition_param = _equals_any("documents.partition_id", partitions)
-        sql_clauses = [partition_cond, project_cond]
-        params = [partition_param, project_param]
+        base_clauses = [partition_cond, project_cond]
+        base_params = [partition_param, project_param]
         table = sql.Identifier("documents")
+    # SQL conditions besides the project (document ids, and filters that cannot be done in the search index)
+    extra_clauses: list[sql.Composable] = []
+    extra_params: list[Any] = []
     if "_id" in filters:
-        sql_clauses.append(sql.SQL("documents.doc_id = ANY(%s)"))
-        params.append(_id_filter_values(filters.pop("_id")))
+        extra_clauses.append(sql.SQL("documents.doc_id = ANY(%s)"))
+        extra_params.append(_id_filter_values(filters.pop("_id")))
     if filters:
         compiled = compile_filters(filters, fieldset)
         selection.extend(compiled.json_clauses)
-        sql_clauses.extend(compiled.sql_clauses)
+        extra_clauses.extend(compiled.sql_clauses)
     if query.ids:
-        sql_clauses.append(sql.SQL("documents.doc_id = ANY(%s)"))
-        params.append(list(query.ids))
+        extra_clauses.append(sql.SQL("documents.doc_id = ANY(%s)"))
+        extra_params.append(list(query.ids))
+    sql_clauses, params = [*base_clauses, *extra_clauses], [*base_params, *extra_params]
     if get_settings().filter_clauses:
         # the project and the filters select without scoring; only the query string is scored
         must = [unscored(selection), *scored]
@@ -147,7 +157,21 @@ def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False) -
         must = [selection[0], *scored, *selection[1:]]
     json_query = must[0] if len(must) == 1 else {"boolean": {"must": must}}
     where = sql.SQL(" AND ").join([sql.SQL("documents.id @@@ %s::jsonb"), *sql_clauses])
-    return CompiledSearch(json_query, where, [Jsonb(json_query), *params], table=table, fast=use_partition_table)
+    plain_where, plain_params = None, []
+    if not scored and len(selection) == 1:
+        # only the project clause is in the json query. The partition condition is also needed on a partition table:
+        # it is the first column of the B-tree index
+        plain_where = sql.SQL(" AND ").join([partition_cond, project_cond, *extra_clauses])
+        plain_params = [partition_param, project_param, *extra_params]
+    return CompiledSearch(
+        json_query,
+        where,
+        [Jsonb(json_query), *params],
+        table=table,
+        fast=use_partition_table,
+        plain_where=plain_where,
+        plain_params=plain_params,
+    )
 
 
 @dataclass
@@ -311,6 +335,14 @@ async def search(
         ordering = order_by(fieldset, sort, scored)
         offset = page * per_page if offset is None else offset
     late_fetch = get_settings().fast_path and not keyset and not similar and _needs_late_fetch(fieldset, sort)
+    if get_settings().btree_listing and c.plain_where is not None and not similar and (keyset or not sort):
+        # No query string and no index filters, in id order: a plain SQL list over the B-tree index (partition_id,
+        # project_pk, id), which reads just the rows of the page (in SQL, first page of the 2.7M document project in a
+        # shared partition: 13.5 ms -> 0.14 ms, research notes of 22 Nov). The total is still counted in the index
+        where, params = c.plain_where, list(c.plain_params)
+        if keyset and after_id is not None:
+            where = sql.SQL("{} AND documents.id {} %s").format(where, sql.SQL("<" if descending else ">"))
+            params.append(after_id)
 
     async def page_rows() -> list[dict]:
         where_, params_, query_offset = where, list(params), offset

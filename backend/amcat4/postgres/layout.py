@@ -216,7 +216,9 @@ async def partition_overview(conn: AsyncConnection) -> list[dict]:
 
 async def create_partition(conn: AsyncConnection, partition_id: int, lock_timeout: str = "5s") -> None:
     """
-    Create a new (empty) documents partition. Postgres creates its BM25 and other indexes when it is attached.
+    Create a new (empty) documents partition. Postgres creates its BM25 and other indexes when it is attached, with
+    the definitions of the indexes of the partitioned table (so the same columns and options as the migrations gave
+    the existing partitions).
     CREATE TABLE ... PARTITION OF would need an exclusive lock on documents (waiting for, and blocking, all
     queries), so the table is created separately and then attached, which does not block queries or uploads.
     Raises LockNotAvailable if the lock cannot be acquired within lock_timeout.
@@ -224,7 +226,8 @@ async def create_partition(conn: AsyncConnection, partition_id: int, lock_timeou
     table = sql.Identifier(partition_table(partition_id))
     async with conn.transaction():
         await conn.execute(sql.SQL("SET LOCAL lock_timeout = {}").format(sql.Literal(lock_timeout)))
-        await conn.execute(sql.SQL("CREATE TABLE {} (LIKE documents INCLUDING DEFAULTS)").format(table))
+        # INCLUDING COMPRESSION: the compression of text_fields (lz4, see migration 0002) is set per partition
+        await conn.execute(sql.SQL("CREATE TABLE {} (LIKE documents INCLUDING DEFAULTS INCLUDING COMPRESSION)").format(table))
         await conn.execute(
             sql.SQL("ALTER TABLE documents ATTACH PARTITION {} FOR VALUES IN ({})").format(table, sql.Literal(partition_id))
         )

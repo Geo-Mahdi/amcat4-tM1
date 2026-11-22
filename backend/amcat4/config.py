@@ -125,6 +125,17 @@ class Settings(BaseSettings):
         ),
     ] = 10000
 
+    btree_listing: Annotated[
+        bool,
+        Field(
+            description=(
+                "List documents without a query string (and without filters that need the search index) in id order "
+                "with plain SQL over the B-tree index (partition_id, project_pk, id) of migration 0002, which reads only "
+                "the rows of the page. false = through the search index, as before (AMCAT4_BTREE_LISTING=false)"
+            ),
+        ),
+    ] = True
+
     custom_plans: Annotated[
         bool,
         Field(
