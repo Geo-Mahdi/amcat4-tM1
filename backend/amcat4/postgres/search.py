@@ -475,7 +475,9 @@ async def search(
         total = len(results)
     elif offset == 0 and after_id is None and not similar and len(rows) < per_page:
         # the first page is not full, so these are all the hits: no need to count (with the parallel count it has
-        # already run, cheaply as there are few hits; its result is not used)
+        # already run, cheaply as there are few hits; its result is not used). Left as is on purpose: whether the page
+        # is full is only known when it is fetched, and waiting for that is the time the parallel count saves; there
+        # is no cheap estimate of the number of hits to decide beforehand (see Known limits in POSTGRES_FAST_PATHS.md)
         total = len(rows)
     elif counted is not None:
         total = counted

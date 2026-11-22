@@ -169,6 +169,30 @@ statement); a retry once after a concurrent duplicate upload (`UniqueViolation`)
 ## 8. Tests
 
 New or changed: `tests/test_search_v2.py`, `test_phase_c.py`, `test_review_fixes.py`, `test_fast_path.py`,
-`test_migrations.py`, `test_maintenance.py`, `conftest.py`, `test_querystring.py`, `test_storage.py`. They cover
-isolation in a shared partition, parity with the original SQL for 15 query shapes, the switches, migrations from a
+`test_migrations.py`, `test_maintenance.py`, `conftest.py`, `test_querystring.py`, `test_storage.py`,
+`test_review_fixes2.py`. They cover isolation in a shared partition, parity with the original SQL for 15 query shapes, the switches, migrations from a
 0001 schema, moves, jobs and maintenance. Each test says in its docstring which behaviour or bug it protects.
+
+## Known limits
+
+Design limits of this version, not bugs; each is a choice, with its cost:
+
+- **One job at a time.** The job worker of a server process runs one job after the other (several server processes
+  run several). A long job (a move, a slot fill on a large project) delays the jobs behind it.
+- **Two extra statements per write.** Every write takes the move guard (`writing()`: a shared advisory lock and a
+  read of `projects.moving_to`). Small statements, but the cost is not measured.
+- **No `Retry-After` on a statement timeout.** The 503 after a statement timeout has none (retrying the same query
+  would time out again); the 503 for a busy pool has `Retry-After: 1`.
+- **The size sample is not random.** The estimated project size (projects over 20,000 documents) averages the first
+  20,000 rows the search index returns, not a random sample.
+- **BM25 statistics per partition.** How rare a word is, is computed per partition, so other projects in a shared
+  partition (and, during a move, the two partitions) affect the relevance order, not which documents match.
+- **The grace period of a move is not a guarantee.** A request that read its partitions just before a move started,
+  and runs statements more than `MOVE_GRACE_SECONDS` (60 s) later, can miss documents moved meanwhile (see 6).
+- **Cursors are not signed.** A hand-made offset cursor pages deeper than `AMCAT4_MAX_OFFSET`; the limit is a
+  performance guard, not a security boundary (cursor values are validated, see 2).
+- **The parallel count can be wasted.** On a first page that is not full, the count that ran next to the page is not
+  used (the page itself gives the total). Avoiding it would mean waiting for the page first, which is what the
+  parallel count saves; there is no cheap estimate to decide beforehand.
+- **Project creation waits for migrations.** Assigning a partition uses the same advisory lock key as the migrations
+  (as in the original), so creating a project waits while migrations run; kept on purpose (see `postgres/layout.py`).
