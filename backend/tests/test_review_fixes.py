@@ -574,3 +574,29 @@ async def test_fast_sort_restarts_unfinished_fill(two_projects, monkeypatch):  #
         assert (await field_infos(a))["pub"].sort_ready
     finally:
         await fetch_all("DELETE FROM jobs WHERE type IN ('fill_sort_slot', 'vacuum') RETURNING id")
+
+
+###################### 11. One vacuum job; the migrations' lock timeout and index attachment ######################
+
+
+@pytest.mark.anyio
+async def test_vacuum_soon_concurrent(two_projects, monkeypatch):  # noqa: F811
+    """Writes that finish at the same time schedule one vacuum job per partition, not one each"""
+    import asyncio
+
+    from amcat4.postgres.connection import connection, fetch_all
+    from amcat4.postgres.layout import partition_of
+    from amcat4.postgres.projects import project_pk
+    from amcat4.projects import maintenance
+
+    a, _ = two_projects
+    monkeypatch.setattr(get_settings(), "vacuum_after_rows", 10)
+    async with connection() as conn:
+        pid = await partition_of(conn, await project_pk(a))
+    await fetch_all("DELETE FROM jobs WHERE type = 'vacuum' RETURNING id")
+    try:
+        await asyncio.gather(*[maintenance.vacuum_soon([pid], 100) for _ in range(8)])
+        rows = await fetch_all("SELECT status FROM jobs WHERE type = 'vacuum' AND params->>'partition_id' = %s", [str(pid)])
+        assert [row["status"] for row in rows] == ["pending"]
+    finally:
+        await fetch_all("DELETE FROM jobs WHERE type = 'vacuum' RETURNING id")

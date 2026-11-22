@@ -142,6 +142,11 @@ async def reindex_job(job: "Job") -> dict:
 # job (VACUUM cannot run in a transaction, and takes a while on big partitions; requests do not wait for it).
 
 
+# Single-key advisory lock per partition (this plus the partition id) for scheduling its vacuum job. (Far from the
+# other single-key locks, 4_000_001 and 4_000_002; two-key locks are a separate key space)
+_VACUUM_LOCK = 4_100_000_000
+
+
 async def vacuum_soon(partition_ids: Iterable[int], changed_rows: int = 0) -> None:
     """
     After a write: create a vacuum job for each partition that changed a lot since its last vacuum (at least
@@ -151,7 +156,7 @@ async def vacuum_soon(partition_ids: Iterable[int], changed_rows: int = 0) -> No
     threshold = get_settings().vacuum_after_rows
     if threshold <= 0:
         return
-    from amcat4.projects.jobs import create_job
+    from amcat4.projects.jobs import create_job_in_transaction
 
     try:
         for pid in set(partition_ids):
@@ -163,13 +168,17 @@ async def vacuum_soon(partition_ids: Iterable[int], changed_rows: int = 0) -> No
                 )
                 if row is None or row["changed"] < threshold:
                     continue
-            if await fetch_one(
-                """SELECT 1 FROM jobs
-                   WHERE type = 'vacuum' AND status IN ('pending', 'running') AND params->>'partition_id' = %s""",
-                [str(pid)],
-            ):
-                continue
-            await create_job("vacuum", None, None, {"partition_id": pid})
+            async with connection() as conn, conn.transaction():
+                # check and insert under a lock per partition, so two writes that finish at the same time do not both
+                # create a job (the lock is released at commit, when the new job is visible to the next one)
+                await conn.execute("SELECT pg_advisory_xact_lock(%s)", [_VACUUM_LOCK + pid])
+                cur = await conn.execute(
+                    """SELECT 1 FROM jobs
+                       WHERE type = 'vacuum' AND status IN ('pending', 'running') AND params->>'partition_id' = %s""",
+                    [str(pid)],
+                )
+                if await cur.fetchone() is None:
+                    await create_job_in_transaction(conn, "vacuum", None, {"partition_id": pid})
     except Exception:
         logging.exception("Could not schedule a vacuum")
 
