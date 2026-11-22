@@ -102,7 +102,7 @@ async def test_sort_id_is_doc_id(two, monkeypatch, fast_path):
     a, _ = two
     await upload(a, [{"_id": i, "text": "x"} for i in ["b", "c1", "a9", "a10"]], fields={"text": "text"})
     for order, expected in (("asc", ID_ORDER), ("desc", ID_ORDER[::-1])):
-        sort = [{"_id": SortSpec(order=order)}]
+        sort = [{"_id": SortSpec(order=order)}]  # type: ignore[arg-type]
         assert await _ids(a, sort=sort) == expected
         p0 = await query_documents(a, sort=sort, page=0, per_page=2)
         p1 = await query_documents(a, sort=sort, page=1, per_page=2)
@@ -121,7 +121,7 @@ async def test_sort_seq(two):
     stored = ["b", "c1", "a9", "a10", "d", "e"]
     await upload(a, [{"_id": i, "text": "x"} for i in stored], fields={"text": "text"})
     for order, expected in (("asc", stored), ("desc", stored[::-1])):
-        sort = [{"_seq": SortSpec(order=order)}]
+        sort = [{"_seq": SortSpec(order=order)}]  # type: ignore[arg-type]
         r = await query_documents(a, sort=sort, per_page=2, queries={"q": "x"})
         assert r.next is not None and "id" in _decode_cursor(r.next)
         assert await _all_pages(a, sort=sort, queries={"q": "x"}) == expected
@@ -159,7 +159,7 @@ async def test_index_metrics_empty_bucket(two, monkeypatch):
     """In-index metrics (pdb.agg) of buckets where no document has the field: null, the same as GROUP BY"""
     from amcat4.postgres import search as search_module
     from amcat4.projects import aggregate as aggregate_module
-    from amcat4.projects.aggregate import Aggregation, Axis, query_aggregate
+    from amcat4.projects.aggregate import Aggregation, Axis, TopHitsAggregation, query_aggregate
 
     monkeypatch.setattr(aggregate_module, "SMALL_RESULT", 0)
     monkeypatch.setattr(search_module, "COUNT_STEP", 0)
@@ -175,7 +175,7 @@ async def test_index_metrics_empty_bucket(two, monkeypatch):
     a, _ = two
     docs = [{"_id": f"d{i}", "pub": "AB"[i // 4], "cat": "xy"[i % 2], **({"n": i - 2} if i < 4 else {})} for i in range(8)]
     await upload(a, docs, fields={"pub": "keyword", "cat": "keyword", "n": "integer"})
-    aggs = [Aggregation("n", f) for f in ("sum", "avg", "min", "max")]
+    aggs: list[Aggregation | TopHitsAggregation] = [Aggregation("n", f) for f in ("sum", "avg", "min", "max")]
     for axes in ([Axis("pub")], [Axis("pub"), Axis("cat")]):
         used.clear()
         fast = sorted((await query_aggregate(a, axes, aggs)).data)
