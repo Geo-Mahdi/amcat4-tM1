@@ -128,7 +128,13 @@ refused with a conflict during the move. Setting `projects.partition_id` directl
 statement, as in the original (the original test passes unchanged). Details of the fixes after the first version:
 the partition and the move target are read in one statement (before, a finishing move could give 0 documents); step 1
 is idempotent when a job stops halfway; fill, backfill and copy jobs wait for a move (`JobPostponed`, 30 s) instead
-of failing (a copy waits for a move of its source and of its destination). Files: `projects/partitions.py`, `postgres/layout.py`, `projects/jobs.py`, `__main__.py`, migration 0003.
+of failing (a copy waits for a move of its source and of its destination). The number of moved documents in the
+job's progress and result is counted in the target partition when a job (re)starts, so it is right after an
+interruption. Between setting `moving_to` and the first batch the job waits `MOVE_GRACE_SECONDS` (60 s, a constant in
+`projects/partitions.py`): a request reads its projects' partitions once and then runs its statements, so a request
+that read them just before the move started would otherwise miss documents moved meanwhile. This covers requests
+whose statements run within 60 s of reading the partitions (with the default pool and statement timeouts, a pool
+wait plus two statements); it is not a guarantee for longer requests (see Known limits). Files: `projects/partitions.py`, `postgres/layout.py`, `projects/jobs.py`, `__main__.py`, migration 0003.
 
 ## 7. Robustness under load, and other fixes
 

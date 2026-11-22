@@ -16,8 +16,9 @@ documents be in two partitions):
    for the writes to the project that are running; from then on writes are refused (ConflictError: uploads look up
    existing documents in one partition); reads look in both partitions and see every document exactly once (a
    document moves in one statement)
-2. move the documents in batches (UPDATE of partition_id: postgres moves each row, and its vectors, to the new
-   partition); resumable, as the documents that are left are exactly those still to move
+2. after a grace period (MOVE_GRACE_SECONDS: requests that read the partitions just before step 1 must not miss
+   moved documents), move the documents in batches (UPDATE of partition_id: postgres moves each row, and its
+   vectors, to the new partition); resumable, as the documents that are left are exactly those still to move
 3. set projects.partition_id to the new partition and clear moving_to (a short transaction)
 Reads are never blocked. During the move, the relevance scores mix the statistics of two indexes; the in-index fast
 paths (which need a single partition) are not used. Afterwards the old partition has deleted documents in its index,
@@ -28,6 +29,7 @@ Start it with `amcat4 move-project --project <id>` (an admin command; the job wo
 A move is refused while the project has unfinished jobs (start_move).
 """
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -41,6 +43,17 @@ if TYPE_CHECKING:
 
 # Documents per transaction in step 2: each batch is a short transaction (rows locked only until its commit)
 MOVE_BATCH_SIZE = 10_000
+# Seconds between step 1 (moving_to is set) and the first batch. A read request reads the partitions of its projects
+# once (get_fieldset), and then runs its statements with that list. A request that read them just before step 1
+# looks only in the old partition: if documents were moved before its statements ran, it would miss them. Waiting
+# before the first batch closes that window for every request whose statements run within MOVE_GRACE_SECONDS of
+# reading the partitions: the pool wait (AMCAT4_POOL_TIMEOUT_S, 5 s) plus two statements at the API statement
+# timeout (30 s each) stay below 60 s in the default settings. Not a guarantee for longer requests (more statements,
+# or no statement timeout, e.g. CLI commands); a read lock per request would be, but it would cost every read an extra
+# statement and could block a move for as long as reads keep coming. A move of a big project takes far longer than
+# this anyway; writes are refused from step 1 on, so also during the wait. New in this version (the original could
+# not move a project in batches)
+MOVE_GRACE_SECONDS = 60.0
 
 
 async def start_move(project: str, created_by: str | None = None) -> dict:
@@ -82,9 +95,10 @@ async def move_project_job(job: "Job") -> dict[str, Any]:
             source, target = row["partition_id"], row["moving_to"]  # type: ignore[index]
             if target is not None:
                 # Step 1 was done, but the job stopped before its progress was saved (a job of an older version, which
-                # saved it afterwards): continue with that partition, do not create a second one
+                # saved it afterwards): continue with that partition, do not create a second one ("moved" is counted
+                # below)
                 logging.info(f"Resuming the move of project {project} to partition {target}")
-                await job.save_progress(source=source, target=target, moved=0)
+                await job.save_progress(source=source, target=target)
             else:
                 await lock_writes(conn, project)  # wait for running writes; new ones wait until moving_to is set
                 try:
@@ -100,8 +114,12 @@ async def move_project_job(job: "Job") -> dict[str, Any]:
                         await conn.execute(
                             "UPDATE projects SET moving_to = %s, own_partition = true WHERE pk = %s", [target, project]
                         )
-                        # the progress in the same transaction: a job that stops here resumes with this partition
+                        # the progress in the same transaction: a job that stops here resumes with this partition.
+                        # first_batch: when the batches may start (now() + MOVE_GRACE_SECONDS, database time)
+                        cur = await conn.execute("SELECT (now() + make_interval(secs => %s))::text AS t", [MOVE_GRACE_SECONDS])
+                        first_batch = (await cur.fetchone())["t"]  # type: ignore[index]
                         progress = {**job.progress, "source": source, "target": target, "moved": 0}
+                        progress["first_batch"] = first_batch
                         await conn.execute(
                             "UPDATE jobs SET progress = %s, updated_at = now() WHERE id = %s", [Jsonb(progress), job.id]
                         )
@@ -110,6 +128,26 @@ async def move_project_job(job: "Job") -> dict[str, Any]:
                 job.progress.update(progress)
                 logging.info(f"Moving project {project} from partition {source} to new partition {target}")
     source, target = job.progress["source"], job.progress["target"]
+
+    async with connection() as conn:
+        # The documents moved so far, counted (over the B-tree index of migration 0002, only this project's rows in the
+        # target): a resumed job does not know how many it moved before it stopped, if it stopped between a batch and
+        # saving its progress, or before its target was saved. Before, the count then left out those documents
+        cur = await conn.execute(
+            "SELECT count(*) AS n FROM documents WHERE partition_id = %s AND project_pk = %s", [target, project]
+        )
+        moved = (await cur.fetchone())["n"]  # type: ignore[index]
+        # the grace period after step 1 (see MOVE_GRACE_SECONDS), also for a job that resumes within it
+        cur = await conn.execute(
+            "SELECT greatest(0, extract(epoch FROM (%s::timestamptz - clock_timestamp())))::float AS s",
+            [job.progress.get("first_batch")],
+        )
+        wait = (await cur.fetchone())["s"] or 0  # type: ignore[index]
+    if moved != job.progress.get("moved"):
+        await job.save_progress(moved=moved)
+    if wait > 0:
+        logging.info(f"Waiting {wait:.0f} s before moving the documents of project {project} (MOVE_GRACE_SECONDS)")
+        await asyncio.sleep(wait)
 
     while True:
         async with connection() as conn:

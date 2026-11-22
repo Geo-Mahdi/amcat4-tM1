@@ -176,3 +176,60 @@ async def test_move_now_reports_failure(moving_projects, monkeypatch):
     with pytest.raises(SystemExit) as e:
         await _cli_move(monkeypatch, a)
     assert e.value.code == 1
+
+
+###################### 5. The number of moved documents after an interruption ######################
+
+
+@pytest.mark.anyio
+async def test_move_count_after_interruption(moving_projects, monkeypatch):
+    """
+    A move job that stopped between a batch and saving its progress left that batch out of "moved" (and a job that
+    resumed without a saved target started from 0). Now the moved documents are counted in the target partition
+    """
+    a, _ = moving_projects
+    monkeypatch.setattr(partitions, "MOVE_BATCH_SIZE", 15)
+    original = jobs.Job.save_progress
+
+    async def stop_before_saving(self, **progress):  # (the server stopped right after the first batch)
+        if progress.get("moved"):
+            raise jobs.JobCancelled()
+        await original(self, **progress)
+
+    monkeypatch.setattr(jobs.Job, "save_progress", stop_before_saving)
+    job = await partitions.start_move(a)
+    await jobs.run_pending_jobs()
+    monkeypatch.setattr(jobs.Job, "save_progress", original)
+    assert (await jobs.get_job(job["id"]))["progress"]["moved"] == 0  # (15 were moved, but not saved)
+    done = await _finish_job(job["id"])
+    assert done["status"] == "done" and done["result"]["moved"] == 40  # (before: 25)
+
+
+###################### 6. A request that read the partitions just before a move started ######################
+
+
+@pytest.mark.anyio
+async def test_move_grace_period(moving_projects, monkeypatch):
+    """
+    A request reads the partitions of its projects once (get_fieldset). If a move started after that and moved
+    documents before the request's statement ran, the request missed them. The move now waits MOVE_GRACE_SECONDS
+    between setting moving_to and the first batch
+    """
+    import asyncio
+
+    from amcat4.postgres.search import SearchQuery, count
+    from amcat4.systemdata.fields import get_fieldset
+
+    a, _ = moving_projects
+    monkeypatch.setattr(partitions, "MOVE_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(partitions, "MOVE_BATCH_SIZE", 15)
+    fieldset = await get_fieldset([a])  # (read before the move starts)
+    job = await partitions.start_move(a)
+    running = asyncio.create_task(jobs.run_job_now(job["id"], poll_interval=0.05))
+    while not await fetch_one("SELECT 1 FROM projects WHERE id = %s AND moving_to IS NOT NULL", [a]):
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.1)  # (without the grace period, the batches run now)
+    async with connection() as conn:
+        assert await count(conn, fieldset, SearchQuery()) == 40
+    done = await asyncio.wait_for(running, 10)
+    assert done["status"] == "done" and done["result"]["moved"] == 40

@@ -410,7 +410,8 @@ async def test_move_step1_resume(moving_projects, monkeypatch):
     # a job of the older version saved the target after step 1: no target in the progress, but moving_to is set
     await execute("UPDATE jobs SET progress = '{}' WHERE id = %s", [job["id"]])
     done = await _finish_job(job["id"])
-    assert done["status"] == "done" and done["result"]["moved"] == 40 - 15  # (moved since the progress was lost)
+    # (all 40: the documents moved before the progress was lost are counted in the target; before, 40 - 15)
+    assert done["status"] == "done" and done["result"]["moved"] == 40
     assert len(await _partition_ids()) == len(before) + 1
     row = await fetch_one("SELECT partition_id, moving_to FROM projects WHERE pk = %s", [pk])
     assert row == {"partition_id": progress["target"], "moving_to": None}

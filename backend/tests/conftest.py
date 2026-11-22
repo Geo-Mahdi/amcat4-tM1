@@ -71,6 +71,14 @@ async def my_setup():
 
 
 @pytest.fixture(autouse=True)
+def no_move_grace(monkeypatch):
+    """Project moves start their batches at once (the grace period is tested in test_review_fixes2.py)"""
+    from amcat4.projects import partitions
+
+    monkeypatch.setattr(partitions, "MOVE_GRACE_SECONDS", 0.0)
+
+
+@pytest.fixture(autouse=True)
 def index_paths_everywhere(monkeypatch):
     """With AMCAT4_TEST_INDEX_PATHS=1, every count and aggregation uses the in-index paths (see test_fast_path.py)"""
     if os.environ.get("AMCAT4_TEST_INDEX_PATHS"):
