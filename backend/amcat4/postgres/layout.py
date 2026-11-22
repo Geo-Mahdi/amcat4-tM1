@@ -75,7 +75,6 @@ project ids inside the BM25 index and then joins on the referenced document ids.
 
 import functools
 import logging
-import re
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import AsyncGenerator, Callable
 
@@ -228,15 +227,6 @@ async def index_merging(conn: AsyncConnection, index: str) -> bool:
     """
     cur = await conn.execute("SELECT paradedb.is_merging(%s::regclass) AS merging", [index])
     return bool((await cur.fetchone())["merging"])  # type: ignore[index]
-
-
-async def pg_search_version(conn: AsyncConnection) -> tuple[int, ...]:
-    """The installed version of the pg_search extension (e.g. (0, 27, 0))"""
-    cur = await conn.execute("SELECT extversion FROM pg_extension WHERE extname = 'pg_search'")
-    row = await cur.fetchone()
-    if row is None:
-        return ()
-    return tuple(int(x) for x in re.findall(r"\d+", row["extversion"]))  # type: ignore[index, call-overload]
 
 
 async def partition_changes(conn: AsyncConnection) -> dict[str, int]:

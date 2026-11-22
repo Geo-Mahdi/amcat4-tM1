@@ -353,7 +353,11 @@ def main():
 
     p = subparsers.add_parser("optimize", help="Database maintenance (vacuum, and optionally rebuild the search index)")
     p.add_argument("--reindex", action="store_true", help="Also rebuild the full-text search index (online)")
-    p.add_argument("--project", help="Only optimize the partition (1/64th of the documents table) that contains this project")
+    p.add_argument(
+        "--project",
+        help="Only optimize the documents partition (and its search index) that contains this project; "
+        "other projects in that partition are optimized with it",
+    )
     p.set_defaults(func=optimize)
 
     p = subparsers.add_parser("move-project", help="Move a (big) project to a documents partition of its own, in batches")
