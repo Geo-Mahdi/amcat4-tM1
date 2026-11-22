@@ -25,6 +25,8 @@ from typing import Sequence
 from alembic import op
 from sqlalchemy import text
 
+from amcat4.migrations.locking import alter_with_lock_timeout
+
 revision: str = "0003"
 down_revision: str | Sequence[str] | None = "0002"
 branch_labels: str | Sequence[str] | None = None
@@ -85,11 +87,12 @@ def upgrade() -> None:
     )
     old = _fk_name("projects")
     if old:
-        op.execute(f"ALTER TABLE documents DROP CONSTRAINT {old}")
+        alter_with_lock_timeout(op.get_bind(), f"ALTER TABLE documents DROP CONSTRAINT {old}")
     if not _fk_name("project_partitions"):
-        op.execute(
+        alter_with_lock_timeout(
+            op.get_bind(),
             f"""ALTER TABLE documents ADD CONSTRAINT {NEW_FK} FOREIGN KEY (project_pk, partition_id)
-                REFERENCES project_partitions (project_pk, partition_id) ON DELETE CASCADE NOT VALID"""
+                REFERENCES project_partitions (project_pk, partition_id) ON DELETE CASCADE NOT VALID""",
         )
     # Validating reads all documents: outside the transaction that changed the table (and holds an exclusive lock)
     with op.get_context().autocommit_block():
@@ -101,10 +104,11 @@ def downgrade() -> None:
     if moving:
         raise RuntimeError("A project is being moved to another partition: finish or undo the move first")
     if _fk_name("project_partitions"):
-        op.execute(f"ALTER TABLE documents DROP CONSTRAINT {NEW_FK}")
-    op.execute(
+        alter_with_lock_timeout(op.get_bind(), f"ALTER TABLE documents DROP CONSTRAINT {NEW_FK}")
+    alter_with_lock_timeout(
+        op.get_bind(),
         f"""ALTER TABLE documents ADD CONSTRAINT {OLD_FK} FOREIGN KEY (project_pk, partition_id)
-            REFERENCES projects (pk, partition_id) ON UPDATE CASCADE ON DELETE CASCADE NOT VALID"""
+            REFERENCES projects (pk, partition_id) ON UPDATE CASCADE ON DELETE CASCADE NOT VALID""",
     )
     op.execute("DROP TRIGGER IF EXISTS projects_partition ON projects")
     op.execute("DROP FUNCTION IF EXISTS project_partition_sync()")

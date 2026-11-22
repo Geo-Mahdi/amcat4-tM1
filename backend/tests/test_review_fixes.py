@@ -600,3 +600,124 @@ async def test_vacuum_soon_concurrent(two_projects, monkeypatch):  # noqa: F811
         assert [row["status"] for row in rows] == ["pending"]
     finally:
         await fetch_all("DELETE FROM jobs WHERE type = 'vacuum' RETURNING id")
+
+
+LOCK_SCHEMA = "amcat_unittest_locking"
+
+
+@pytest.fixture()
+def scratch_schema():
+    """A sqlalchemy connection (autocommit) with its search path on a scratch schema, as the migrations use"""
+    from sqlalchemy import create_engine, text
+
+    # (as amcat4.migrations.env.sqlalchemy_url, which cannot be imported outside alembic: it runs the migrations)
+    engine = create_engine(get_settings().postgres_url.replace("postgresql://", "postgresql+psycopg://", 1))
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {LOCK_SCHEMA} CASCADE"))
+        conn.execute(text(f"CREATE SCHEMA {LOCK_SCHEMA}"))
+        conn.execute(text(f"SET search_path TO {LOCK_SCHEMA}, public"))
+        conn.execute(text("CREATE TABLE documents (id int, partition_id int) PARTITION BY LIST (partition_id)"))
+        conn.execute(text("CREATE TABLE documents_p1 PARTITION OF documents FOR VALUES IN (1)"))
+        try:
+            yield conn
+        finally:
+            conn.execute(text(f"DROP SCHEMA IF EXISTS {LOCK_SCHEMA} CASCADE"))
+    engine.dispose()
+
+
+def _columns_of(conn, table: str) -> set[str]:
+    from sqlalchemy import text
+
+    rows = conn.execute(
+        text("SELECT column_name FROM information_schema.columns WHERE table_schema = :s AND table_name = :t"),
+        {"s": LOCK_SCHEMA, "t": table},
+    )
+    return set(rows.scalars())
+
+
+@pytest.mark.anyio
+async def test_migration_alter_lock_timeout(scratch_schema):
+    """ALTER TABLE in a migration gives up after a lock timeout (with a clear error), and retries meanwhile"""
+    import asyncio
+
+    import psycopg
+
+    from amcat4.migrations.locking import TableBusyError, alter_with_lock_timeout
+
+    conn = scratch_schema
+
+    def alter(column: str, attempts: int) -> None:
+        from sqlalchemy import text
+
+        with conn.engine.connect() as migration, migration.begin():  # (the migrations run in a transaction)
+            migration.execute(text(f"SET LOCAL search_path TO {LOCK_SCHEMA}"))
+            alter_with_lock_timeout(migration, f"ALTER TABLE documents ADD COLUMN {column} int", "50ms", attempts)
+
+    async with await psycopg.AsyncConnection.connect(get_settings().postgres_url, autocommit=True) as other:
+        # a long query on a partition holds a lock until it is done
+        async with other.transaction():
+            await other.execute(f"LOCK TABLE {LOCK_SCHEMA}.documents_p1 IN ACCESS SHARE MODE")
+            with pytest.raises(TableBusyError, match="run the migration again"):
+                await asyncio.to_thread(alter, "a", 2)
+        assert "a" not in _columns_of(conn, "documents")
+
+        # the lock is released during the retries: the column is added
+        async def release_soon():
+            await asyncio.sleep(0.3)
+            await other.execute("COMMIT")
+
+        await other.execute("BEGIN")
+        await other.execute(f"LOCK TABLE {LOCK_SCHEMA}.documents_p1 IN ACCESS SHARE MODE")
+        await asyncio.gather(asyncio.to_thread(alter, "b", 3), release_soon())
+    assert "b" in _columns_of(conn, "documents") and "b" in _columns_of(conn, "documents_p1")
+
+
+@pytest.mark.anyio
+async def test_build_index_attached_elsewhere(scratch_schema, monkeypatch):
+    """
+    _build_index (migration 0002): a partition index with the expected name that is attached to another parent index
+    is not taken as the partition's index of the new parent
+    """
+    import importlib.util
+    import pathlib
+    from types import SimpleNamespace
+
+    from sqlalchemy import text
+
+    import amcat4.migrations
+
+    conn = scratch_schema
+    path = pathlib.Path(amcat4.migrations.__file__).parent / "versions" / "0002_sort_slots_and_indexes.py"
+    spec = importlib.util.spec_from_file_location("migration_0002", path)
+    assert spec and spec.loader
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    monkeypatch.setattr(migration, "op", SimpleNamespace(get_bind=lambda: conn))
+
+    # an interrupted earlier run: documents_p1_by_id belongs to the parent documents_other
+    conn.execute(text("CREATE INDEX documents_other ON ONLY documents (id)"))
+    conn.execute(text("CREATE INDEX documents_p1_by_id ON documents_p1 (id)"))
+    conn.execute(text("ALTER INDEX documents_other ATTACH PARTITION documents_p1_by_id"))
+    migration._build_index("documents_by_id", "(id)", ["documents_p1"])
+
+    def parent_valid(name: str) -> bool:
+        return conn.execute(
+            text("SELECT indisvalid FROM pg_index WHERE indexrelid = CAST(:n AS regclass)"), {"n": name}
+        ).scalar_one()
+
+    assert parent_valid("documents_by_id") and parent_valid("documents_other")
+    children = conn.execute(
+        text(
+            """SELECT c.relname, i.inhparent::regclass::text AS parent FROM pg_inherits i
+               JOIN pg_class c ON c.oid = i.inhrelid WHERE i.inhparent IN (CAST('documents_by_id' AS regclass),
+               CAST('documents_other' AS regclass)) ORDER BY 1"""
+        )
+    ).all()
+    assert [tuple(r) for r in children] == [
+        ("documents_p1_by_id", "documents_other"),
+        ("documents_p1_by_id_1", "documents_by_id"),
+    ]
+    # idempotent: a second run changes nothing
+    migration._build_index("documents_by_id", "(id)", ["documents_p1"])
+    count = text("SELECT count(*) FROM pg_inherits WHERE inhparent = CAST('documents_by_id' AS regclass)")
+    assert conn.execute(count).scalar_one() == 1

@@ -31,6 +31,8 @@ from typing import Sequence
 from alembic import op
 from sqlalchemy import text
 
+from amcat4.migrations.locking import alter_with_lock_timeout
+
 revision: str = "0002"
 down_revision: str | Sequence[str] | None = "0001"
 branch_labels: str | Sequence[str] | None = None
@@ -120,27 +122,38 @@ def _build_index(name: str, using: str, partitions: list[str]) -> None:
     Create an index on the partitioned documents table without blocking reads or writes: CREATE INDEX on a partitioned
     table cannot be CONCURRENTLY, so the parent index is created ON ONLY the parent (invalid until every partition
     has one), and each partition's index is built concurrently and attached. Must run in autocommit mode.
-    Idempotent: an invalid leftover of an interrupted build is dropped and rebuilt.
+    Idempotent: an invalid leftover of an interrupted build is dropped and rebuilt. A partition index with the name
+    that is attached to another parent index (e.g. after an interrupted run of _replace_bm25 renamed the parents) is
+    left alone, and the partition gets an index under a free name: attaching it would fail, and taking it as done
+    would leave the new parent without an index for the partition (and dropping the other parent drops that one).
     """
     bind = op.get_bind()
     bind.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON ONLY documents {using}"))
     for table in partitions:
-        child = f"{table}_{name.removeprefix('documents_')}"
-        state = bind.execute(
-            text(
-                """SELECT ix.indisvalid AS valid, EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = ix.indexrelid) AS attached
-                   FROM pg_index ix JOIN pg_class c ON c.oid = ix.indexrelid
-                   WHERE c.relname = :child AND c.relnamespace = current_schema()::regnamespace"""
-            ),
-            {"child": child},
-        ).one_or_none()
+        base = f"{table}_{name.removeprefix('documents_')}"
+        child, suffix = base, 0
+        while True:
+            state = bind.execute(
+                text(
+                    """SELECT ix.indisvalid AS valid,
+                              (SELECT i.inhparent = CAST(:parent AS regclass) FROM pg_inherits i
+                               WHERE i.inhrelid = ix.indexrelid) AS attached_here
+                       FROM pg_index ix JOIN pg_class c ON c.oid = ix.indexrelid
+                       WHERE c.relname = :child AND c.relnamespace = current_schema()::regnamespace"""
+                ),
+                {"child": child, "parent": name},
+            ).one_or_none()
+            if state is None or state.attached_here is not False:  # free, not attached, or attached to this parent
+                break
+            suffix += 1
+            child = f"{base}_{suffix}"
         if state is not None and not state.valid:
             bind.execute(text(f"DROP INDEX CONCURRENTLY {child}"))
             state = None
         if state is None:
             log.info(f"Building index {child}")
             bind.execute(text(f"CREATE INDEX CONCURRENTLY {child} ON {table} {using}"))
-        if state is None or not state.attached:
+        if state is None or not state.attached_here:
             bind.execute(text(f"ALTER INDEX {name} ATTACH PARTITION {child}"))
 
 
@@ -174,7 +187,8 @@ def _replace_bm25(columns: str) -> None:
 def upgrade() -> None:
     _update_pg_search()
     columns = ", ".join(f"ADD COLUMN IF NOT EXISTS {name} {definition}" for name, definition in SLOT_COLUMNS.items())
-    op.execute(f"ALTER TABLE documents {columns}")
+    # (with a lock timeout: waiting for the lock behind a long query would block every other query on documents)
+    alter_with_lock_timeout(op.get_bind(), f"ALTER TABLE documents {columns}")
     op.execute("ALTER TABLE fields ADD COLUMN IF NOT EXISTS sort_slot_ready boolean NOT NULL DEFAULT true")
     # existing date fields get their quarter keys from a background job (amcat4.projects.jobs, backfill_quarter)
     op.execute("ALTER TABLE fields ADD COLUMN IF NOT EXISTS quarter_ready boolean")
@@ -197,5 +211,7 @@ def downgrade() -> None:
     op.execute("UPDATE fields SET sort_slot = NULL WHERE sort_slot NOT IN ('date', 'source')")
     op.execute("UPDATE fields SET sort_slot = NULL WHERE NOT sort_slot_ready")
     op.execute("ALTER TABLE fields DROP COLUMN IF EXISTS sort_slot_ready, DROP COLUMN IF EXISTS quarter_ready")
-    op.execute(f"ALTER TABLE documents {', '.join(f'DROP COLUMN IF EXISTS {name}' for name in SLOT_COLUMNS)}")
+    alter_with_lock_timeout(
+        op.get_bind(), f"ALTER TABLE documents {', '.join(f'DROP COLUMN IF EXISTS {name}' for name in SLOT_COLUMNS)}"
+    )
     # (the derived quarter keys stay in exact_fields: 0001 ignores them)
