@@ -1,6 +1,7 @@
 import logging
-from contextlib import AsyncExitStack, asynccontextmanager
-from typing import Any, AsyncGenerator
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from contextvars import ContextVar
+from typing import Any, AsyncGenerator, Iterator
 
 import httpx
 from aiobotocore.config import AioConfig
@@ -14,6 +15,7 @@ from amcat4.config import get_settings
 
 class AmcatConnections:
     db: AsyncConnectionPool[Any] | None
+    db_work: AsyncConnectionPool[Any] | None
     s3_client: S3Client | None
     s3_context_stack: AsyncExitStack | None
     http_client: httpx.AsyncClient | None
@@ -21,12 +23,14 @@ class AmcatConnections:
     def __init__(
         self,
         db: AsyncConnectionPool[Any] | None = None,
+        db_work: AsyncConnectionPool[Any] | None = None,
         s3_client: S3Client | None = None,
         s3_proxy_client: S3Client | None = None,
         s3_context_stack: AsyncExitStack | None = None,
         http_client: httpx.AsyncClient | None = None,
     ):
         self.db = db
+        self.db_work = db_work
         self.s3_client = s3_client
         self.s3_proxy_client = s3_client
         self.s3_context_stack = s3_context_stack
@@ -56,13 +60,36 @@ async def amcat_connections() -> AsyncGenerator[None, None]:
         await _close_http()
 
 
+# Whether the current task does background or maintenance work (see server_defaults)
+_SERVER_DEFAULTS: ContextVar[bool] = ContextVar("amcat4_server_defaults", default=False)
+
+
+@contextmanager
+def server_defaults() -> Iterator[None]:
+    """
+    Run the database work inside this block with the server's own settings, on a separate connection pool.
+
+    The API's request connections are tuned for many short read queries (see _api_options). Background jobs,
+    index maintenance, CLI commands and long writes (uploads, update/delete by query) should not get those settings:
+    they keep the parallel workers and have no API statement timeout. The setting is a context variable, so it
+    holds for the current task and for tasks started from it (e.g. the job worker and its heartbeat).
+    """
+    token = _SERVER_DEFAULTS.set(True)
+    try:
+        yield
+    finally:
+        _SERVER_DEFAULTS.reset(token)
+
+
 def db() -> AsyncConnectionPool[Any]:
     """
     Access the postgres connection pool. Use amcat4.postgres.connection.connection() to get a connection.
+    Inside server_defaults() this is the pool for background and maintenance work, otherwise the API pool.
     """
-    if CONNECTIONS.db is None:
+    pool = CONNECTIONS.db_work if _SERVER_DEFAULTS.get() else CONNECTIONS.db
+    if pool is None:
         raise ConnectionError("Database connection not initialized")
-    return CONNECTIONS.db
+    return pool
 
 
 def db_schema() -> str:
@@ -105,10 +132,24 @@ def http() -> httpx.AsyncClient:
     return CONNECTIONS.http_client
 
 
-async def _start_db():
+def _api_options() -> str:
+    """
+    Settings for the API's request connections (startup options, so they hold for every statement on them).
+    """
     settings = get_settings()
-    logging.debug(f"Connecting with postgres, schema {db_schema()}")
-    options = f"-c search_path={db_schema()},public"
+    options = []
+    workers = settings.api_parallel_workers
+    if workers is not None:
+        # pg_search searches of the API take a few ms; starting parallel workers for them costs more than it saves
+        # (a count of a normal word: 10 ms with 4 workers, 3.7 ms without; and it also costs throughput under load).
+        # Only very common words get slower, which the filter form of the project clause (search.py) makes up for.
+        options.append(f"-c max_parallel_workers_per_gather={workers}")
+    return " ".join(options)
+
+
+async def _open_pool(name: str, options: str, min_size: int, max_size: int) -> AsyncConnectionPool[Any]:
+    settings = get_settings()
+    options = f"-c search_path={db_schema()},public {options}"
     if settings.custom_plans:
         # psycopg prepares a statement after 5 uses on a connection, and postgres may then switch to a generic plan
         # that does not know the project or query. For pg_search that plan is 5-10x slower (row estimate 1, no
@@ -116,23 +157,39 @@ async def _start_db():
         options += " -c plan_cache_mode=force_custom_plan"
     pool = AsyncConnectionPool(
         settings.postgres_url,
-        min_size=1,
-        max_size=20,
+        min_size=min_size,
+        max_size=max_size,
         open=False,
-        kwargs={"row_factory": dict_row, "autocommit": True, "options": options},
+        name=name,
+        kwargs={"row_factory": dict_row, "autocommit": True, "options": options.strip()},
     )
     try:
         await pool.open(wait=True, timeout=10)
     except Exception as e:
         await pool.close()
         raise ConnectionError(f"Cannot connect to postgres server: {e}") from e
-    CONNECTIONS.db = pool
+    return pool
+
+
+async def _start_db():
+    logging.debug(f"Connecting with postgres, schema {db_schema()}")
+    # Two pools: one for API requests (tuned for short queries), one with the server's defaults for background jobs,
+    # maintenance, CLI commands and long writes (see server_defaults). The second one opens connections only when needed.
+    CONNECTIONS.db = await _open_pool("amcat4-api", _api_options(), min_size=1, max_size=20)
+    try:
+        CONNECTIONS.db_work = await _open_pool("amcat4-work", "", min_size=0, max_size=10)
+    except Exception:
+        await _close_db()
+        raise
 
 
 async def _close_db() -> None:
     if CONNECTIONS.db is not None:
         await CONNECTIONS.db.close()
         CONNECTIONS.db = None
+    if CONNECTIONS.db_work is not None:
+        await CONNECTIONS.db_work.close()
+        CONNECTIONS.db_work = None
 
 
 async def _start_s3() -> None:

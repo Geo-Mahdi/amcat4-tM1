@@ -28,6 +28,7 @@ from typing import Any, Awaitable, Callable
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
+from amcat4.connections import server_defaults
 from amcat4.errors import NotFoundError
 from amcat4.models import CreateDocumentField, FieldType, FilterSpec
 from amcat4.postgres import documents as storage
@@ -187,6 +188,13 @@ async def run_periodic_tasks() -> list[str]:
 
 async def job_worker(poll_interval: float = 2.0) -> None:
     """Run periodic tasks and jobs forever (started as a background task by the API server)"""
+    # Jobs and maintenance use the server's own settings (parallel workers, no API timeouts), not the API's tuning.
+    # This task runs in its own context, so this holds for the worker (and the tasks it starts) only.
+    with server_defaults():
+        await _job_loop(poll_interval)
+
+
+async def _job_loop(poll_interval: float) -> None:
     while True:
         try:
             await run_periodic_tasks()

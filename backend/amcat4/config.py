@@ -15,7 +15,7 @@ from typing import Annotated
 import questionary
 from class_doc import extract_docs_from_cls_obj
 from dotenv import load_dotenv
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ENV_PREFIX = "amcat4_"
@@ -83,6 +83,18 @@ class Settings(BaseSettings):
         ),
     ] = True
 
+    filter_clauses: Annotated[
+        bool,
+        Field(
+            description=(
+                "Select the project and apply filters in the search index without scoring them (a const_score clause), "
+                "so only the query string is scored. Faster for common words; changes the relevance order once (to the "
+                "plain BM25 order of the query). Counts and hits are the same. false = the original form, in which "
+                "every clause is scored (AMCAT4_FILTER_CLAUSES=false)"
+            ),
+        ),
+    ] = True
+
     custom_plans: Annotated[
         bool,
         Field(
@@ -92,6 +104,17 @@ class Settings(BaseSettings):
             ),
         ),
     ] = True
+
+    api_parallel_workers: Annotated[
+        int | None,
+        Field(
+            description=(
+                "max_parallel_workers_per_gather for the connections of API requests. 0 (default) means no parallel "
+                "workers, which is faster for the short searches of the API. Empty or 'default' keeps the server's "
+                "setting. Background jobs, maintenance and CLI commands always keep the server's setting"
+            ),
+        ),
+    ] = 0
 
     auth: Annotated[AuthOptions, Field(description="Do we require authorization?")] = AuthOptions.no_auth
 
@@ -151,6 +174,14 @@ class Settings(BaseSettings):
     ] = False
 
     model_config = SettingsConfigDict(env_prefix=ENV_PREFIX)
+
+    @field_validator("api_parallel_workers", mode="before")
+    @classmethod
+    def _server_default(cls, value):
+        # an empty value or 'default' means: do not set it, keep the server's setting
+        if isinstance(value, str) and value.strip().lower() in ("", "default", "none"):
+            return None
+        return value
 
 
 def generate_interactive_settings(current: Settings, skip: list[str] = [], only: list[str] | None = None):

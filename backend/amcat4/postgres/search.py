@@ -48,6 +48,21 @@ def project_clause(project_pks: list[int]) -> dict:
     return terms[0] if len(terms) == 1 else {"boolean": {"should": terms}}
 
 
+def unscored(clauses: list[dict]) -> dict:
+    """
+    Clauses that select documents without adding to the relevance score (all must match).
+
+    pg_search has no 'filter' list in its json boolean query: an unknown key such as "filter" is silently ignored,
+    so {"boolean": {"must": [...], "filter": [project]}} would NOT select the project (tested on 0.26.0 and 0.27.0).
+    A const_score clause with score 0 inside 'must' does select, and adds nothing to the score. That is what makes the
+    filter form faster: the project term is not scored for every hit (top 10 of a very common word in a 156k test
+    partition: 5.8 ms -> 2.9 ms), and the relevance order becomes the plain BM25 order of the query (the scored
+    project term added a score that depended on the index segment). Counts and hits do not change.
+    """
+    query = clauses[0] if len(clauses) == 1 else {"boolean": {"must": clauses}}
+    return {"const_score": {"score": 0.0, "query": query}}
+
+
 def _compile_query_string(label: str, q: str, fieldset: FieldSet) -> dict:
     try:
         return query_string_to_json(q, fieldset)
@@ -85,15 +100,17 @@ def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False) -
     fast: (read-only statements only: count, search, aggregate) if all projects are in one partition and there is no
     filter on document ids, query that partition's table directly (CompiledSearch.table). pg_search can then count
     and aggregate inside its index (Aggregate Scan), which it cannot do through the partitioned parent table.
-    On the partition table the projects are selected only by the project clause of the json query (the first `must`
-    clause, built here and never from user input, so a query string cannot escape it). A second SQL condition on
+    On the partition table the projects are selected only by the project clause of the json query (inside the first
+    `must` clause, built here and never from user input, so a query string cannot escape it). A second SQL condition on
     project_pk would be evaluated by pg_search as a second term inside the index and made large counts up to 2x
     slower. Write statements (update/delete by query) must not use this: they keep both SQL conditions.
     """
-    must: list[dict] = [project_clause(fieldset.project_pks)]
+    # selection: the project clause first (built here, never from user input), then the user's filters
+    selection: list[dict] = [project_clause(fieldset.project_pks)]
+    scored: list[dict] = []
     if query.queries:
         qs = [_compile_query_string(label, q, fieldset) for label, q in query.queries.items()]
-        must.append(qs[0] if len(qs) == 1 else {"boolean": {"should": qs}})
+        scored.append(qs[0] if len(qs) == 1 else {"boolean": {"should": qs}})
     # The project condition is also in the json query, but postgres needs the partitions in SQL to only scan the
     # partitions of these projects
     partitions = sorted({fieldset.partition(pk) for pk in fieldset.project_pks})
@@ -115,11 +132,17 @@ def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False) -
         params.append(_id_filter_values(filters.pop("_id")))
     if filters:
         compiled = compile_filters(filters, fieldset)
-        must.extend(compiled.json_clauses)
+        selection.extend(compiled.json_clauses)
         sql_clauses.extend(compiled.sql_clauses)
     if query.ids:
         sql_clauses.append(sql.SQL("documents.doc_id = ANY(%s)"))
         params.append(list(query.ids))
+    if get_settings().filter_clauses:
+        # the project and the filters select without scoring; only the query string is scored
+        must = [unscored(selection), *scored]
+    else:
+        # original form: everything is a scored must clause (same hits and counts, other scores)
+        must = [selection[0], *scored, *selection[1:]]
     json_query = must[0] if len(must) == 1 else {"boolean": {"must": must}}
     where = sql.SQL(" AND ").join([sql.SQL("documents.id @@@ %s::jsonb"), *sql_clauses])
     return CompiledSearch(json_query, where, [Jsonb(json_query), *params], table=table, fast=use_partition_table)

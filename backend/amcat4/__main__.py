@@ -21,7 +21,7 @@ from pydantic.fields import FieldInfo
 from uvicorn.config import LOGGING_CONFIG
 
 from amcat4.config import AuthOptions, config_tui_editor, get_settings, validate_settings
-from amcat4.connections import amcat_connections
+from amcat4.connections import amcat_connections, server_defaults
 from amcat4.models import FieldType, ProjectSettings, Roles
 from amcat4.objectstorage.image_processing import create_image_from_url
 from amcat4.projects.documents import create_or_update_documents
@@ -351,7 +351,9 @@ def main():
     logging.basicConfig(format="[%(levelname)-7s:%(name)-15s] %(message)s", level=logging.INFO)
 
     if inspect.iscoroutinefunction(args.func):
-        asyncio.run(args.func(args))
+        # CLI commands (optimize, migrations, test data) use the server's own settings, not the API's tuning
+        with server_defaults():
+            asyncio.run(args.func(args))
     else:
         args.func(args)
 
