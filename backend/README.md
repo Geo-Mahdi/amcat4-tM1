@@ -51,7 +51,7 @@ The API will be available at `http://localhost:5000`. Interactive docs at `/docs
 Requires PostgreSQL with pg_search running locally — start one via `pnpm start:db` (see the root README), or e.g.:
 
 ```bash
-docker run -d -p 5432:5432 -e POSTGRES_USER=amcat -e POSTGRES_PASSWORD=amcat -e POSTGRES_DB=amcat paradedb/paradedb
+docker run -d -p 5432:5432 -e POSTGRES_USER=amcat -e POSTGRES_PASSWORD=amcat -e POSTGRES_DB=amcat paradedb/paradedb:0.27.0-pg18
 ```
 
 ## Testing

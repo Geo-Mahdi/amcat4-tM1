@@ -19,7 +19,7 @@ jobs:
 
     services:
       postgres:
-        image: paradedb/paradedb:latest
+        image: paradedb/paradedb:0.27.0-pg18
         env:
           POSTGRES_USER: amcat
           POSTGRES_PASSWORD: amcat

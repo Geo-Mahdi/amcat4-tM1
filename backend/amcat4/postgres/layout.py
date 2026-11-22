@@ -28,8 +28,10 @@ Documents:
   does not know that a project is in one partition (see project_filter). partition_id is also in the BM25 index:
   pg_search checks SQL conditions on columns outside the index against the table, for every match. A foreign key
   keeps the documents of a project in its partition: updating projects.partition_id moves the documents.
-  Every upload adds segments to the BM25 index, which pg_search does not seem to merge, and updates leave deleted
-  documents in it. A periodic task rebuilds the index of a partition when it needs it, after the partition has been
+  Every upload adds segments to the BM25 index, and updates leave deleted documents in it. pg_search 0.26 does not
+  merge segments (in our tests), so the number of segments grows with every upload; from 0.27 on, pg_search merges
+  small segments in the background (index option background_layer_sizes), so it stays low. A periodic task rebuilds
+  the index of a partition when it still needs it (many segments or deleted documents), after the partition has been
   quiet for a while (see amcat4.projects.maintenance); manually: amcat4 optimize --reindex [--project ...].
 - BM25 scores (how rare a word is) are computed per partition, so other projects in the same partition affect the
   ranking (but not which documents match).
@@ -49,6 +51,7 @@ project ids inside the BM25 index and then joins on the referenced document ids.
 """
 
 import logging
+import re
 
 from psycopg import AsyncConnection, sql
 from psycopg.errors import LockNotAvailable
@@ -112,6 +115,21 @@ async def index_segments(conn: AsyncConnection, index: str) -> dict:
         [index],
     )
     return await cur.fetchone()  # type: ignore[return-value]
+
+
+async def index_merging(conn: AsyncConnection, index: str) -> bool:
+    """Whether pg_search is merging segments of a BM25 index in the background right now (0.27 and later merge)"""
+    cur = await conn.execute("SELECT paradedb.is_merging(%s::regclass) AS merging", [index])
+    return bool((await cur.fetchone())["merging"])  # type: ignore[index]
+
+
+async def pg_search_version(conn: AsyncConnection) -> tuple[int, ...]:
+    """The installed version of the pg_search extension (e.g. (0, 27, 0))"""
+    cur = await conn.execute("SELECT extversion FROM pg_extension WHERE extname = 'pg_search'")
+    row = await cur.fetchone()
+    if row is None:
+        return ()
+    return tuple(int(x) for x in re.findall(r"\d+", row["extversion"]))  # type: ignore[index, call-overload]
 
 
 async def partition_changes(conn: AsyncConnection) -> dict[str, int]:

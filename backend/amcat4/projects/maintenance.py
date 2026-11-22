@@ -1,12 +1,20 @@
 """
 Automatic maintenance of the BM25 indexes of the documents partitions.
 
-Every upload adds segments to the index of a partition (pg_search does not seem to merge them), and updates leave
-deleted documents in the index. Both make searches slower: rebuilding the index (REINDEX, online) fixes that and
-is cheap (seconds per million documents), but rebuilding while a partition is still changing is wasted work.
+Every upload adds segments to the index of a partition, and updates leave deleted documents in the index. Both make
+searches slower: rebuilding the index (REINDEX, online) fixes that and is cheap (seconds per million documents), but
+rebuilding while a partition is still changing is wasted work.
+
+How much this is needed depends on the pg_search version. pg_search 0.26 does not merge segments (in our tests: one
+new segment per upload, forever). From 0.27 on, pg_search merges small segments in the background, which also
+drops most deleted documents, so the number of segments stays low (about 5 to 10 in tests) and the segment trigger
+below rarely fires; the trigger for deleted documents (large segments are not merged again soon) stays relevant.
+The rebuild stays as the safety net for both.
 
 So a periodic task (check_partitions, run by the job worker) looks at every partition:
-- whether it changed since the previous check (postgres counts inserts, updates and deletes per table)
+- whether it changed since the previous check (postgres counts inserts, updates and deletes per table), or whether
+  pg_search is merging its index right now: a merge that is still running is activity too, and it may solve the
+  problem by itself, so we wait for it like for changes
 - whether its index needs a rebuild: many more segments than after the previous rebuild, or many deleted documents
 If a partition needs a rebuild and has been quiet for QUIET_PERIOD (or has needed one for MAX_WAIT, for partitions
 that are never quiet), it creates a reindex job. Only one reindex job exists at a time.
@@ -16,7 +24,14 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from amcat4.postgres.connection import connection, fetch_all, fetch_one
-from amcat4.postgres.layout import drop_reindex_leftovers, index_segments, list_partitions, partition_changes, reindex
+from amcat4.postgres.layout import (
+    drop_reindex_leftovers,
+    index_merging,
+    index_segments,
+    list_partitions,
+    partition_changes,
+    reindex,
+)
 
 if TYPE_CHECKING:
     from amcat4.projects.jobs import Job
@@ -24,7 +39,10 @@ if TYPE_CHECKING:
 CHECK_INTERVAL = timedelta(minutes=5)
 QUIET_PERIOD = timedelta(minutes=15)
 MAX_WAIT = timedelta(hours=24)
-MIN_SEGMENTS = 16  # a rebuild gives up to ~one segment per parallel worker; small indexes have fewer
+# A rebuild gives up to ~one segment per parallel worker; small indexes have fewer. The threshold is relative to the
+# number of segments after the previous rebuild (see needs_reindex), so a server with many cores does not rebuild
+# again right away. With background merging (pg_search 0.27+) the count stays below this in normal use.
+MIN_SEGMENTS = 16
 MAX_DELETED = 0.2  # fraction of the documents in the index
 
 
@@ -64,6 +82,7 @@ async def check_partitions(state: dict, now: datetime | None = None) -> dict:
         changes = await partition_changes(conn)
         partitions = await list_partitions(conn)
         segments = {p["partition_id"]: await index_segments(conn, p["index"]) for p in partitions}
+        merging = {p["partition_id"]: await index_merging(conn, p["index"]) for p in partitions}
     after_rebuild = await _segments_after_rebuild()
 
     seen = state.get("partitions", {})
@@ -73,7 +92,8 @@ async def check_partitions(state: dict, now: datetime | None = None) -> dict:
         pid = p["partition_id"]
         previous = seen.get(str(pid), {})
         n = changes.get(p["table"], 0)
-        changed_at = previous.get("changed_at") if previous.get("changes") == n else now.isoformat()
+        quiet = previous.get("changes") == n and not merging[pid]
+        changed_at = previous.get("changed_at") if quiet else now.isoformat()
         reason = needs_reindex(segments[pid], after_rebuild.get(pid))
         needed_since = (previous.get("needed_since") or now.isoformat()) if reason else None
         new_state[str(pid)] = {"changes": n, "changed_at": changed_at, "needed_since": needed_since}

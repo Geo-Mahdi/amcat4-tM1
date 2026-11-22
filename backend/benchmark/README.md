@@ -3,7 +3,8 @@
 AmCAT stores all data in PostgreSQL, using the [pg_search](https://github.com/paradedb/paradedb) extension for
 BM25 full-text search and [pgvector](https://github.com/pgvector/pgvector) for vectors. The
 [`paradedb/paradedb`](https://hub.docker.com/r/paradedb/paradedb) image contains both. Developed and tested with
-PostgreSQL 18.6 and pg_search 0.26.0.
+PostgreSQL 18.6 and pg_search 0.26.0 (the benchmark below); the test suite also runs on pg_search 0.27.0, the
+version the deploy files now use.
 
 The database code is in `amcat4/postgres/` (with the design in `layout.py`); the business logic in `amcat4/projects/`
 and `amcat4/systemdata/` uses it. The tables are defined by the (alembic) migrations in `amcat4/migrations/versions/`,
@@ -166,10 +167,12 @@ Other operations:
   take ~100 or ~200 ms depending on how the index happens to be built. Known upstream bug; we don't work around it.
 - **Uploads leave many small index segments** (one per upload batch), which makes searches 2-3x slower until the
   index is rebuilt. According to its docs, pg_search merges small segments in the background (setting
-  `background_layer_sizes`, on by default), but in our tests this never happened, also not with the default index
-  settings and after `VACUUM`. Bug or missing setting: worth asking ParadeDB. For now, the server rebuilds the index
-  of a partition automatically when it has many segments or deleted documents, once the partition has been quiet
-  for 15 minutes (or after 24 hours if it never is), one partition at a time (`amcat4/projects/maintenance.py`).
+  `background_layer_sizes`, on by default), but with pg_search 0.26.0 this never happened in our tests, also not
+  with the default index settings and after `VACUUM`. **pg_search 0.27.0 does merge**: 20 single-row inserts left 15
+  segments, and 5 a few seconds later (`paradedb.is_merging` shows the merge); 0.26.0 kept 20. The server still
+  rebuilds the index of a partition automatically when it has many segments or deleted documents, once the
+  partition has been quiet for 15 minutes (or after 24 hours if it never is), one partition at a time
+  (`amcat4/projects/maintenance.py`). On 0.27 the segment trigger rarely fires; a running merge counts as activity.
 - Aggregations are grouped by postgres, which reads the values from the table: pg_search can't group on json keys
   inside the index. Fine for now (~200 ms for 500k documents), but the standard `date` and `source` columns could probably be
   grouped inside the index, which would make overviews across projects fast.
