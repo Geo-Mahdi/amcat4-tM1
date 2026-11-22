@@ -415,3 +415,162 @@ async def test_move_step1_resume(moving_projects, monkeypatch):
     row = await fetch_one("SELECT partition_id, moving_to FROM projects WHERE pk = %s", [pk])
     assert row == {"partition_id": progress["target"], "moving_to": None}
     assert (await query_documents(a, per_page=100)).total_count == 40
+
+
+###################### 8. Fill and backfill jobs during a move: postponed, not failed ######################
+
+
+async def _jobs_of(index: str, type: str) -> list[dict]:
+    from amcat4.postgres.connection import fetch_all
+    from amcat4.postgres.projects import project_pk
+
+    return await fetch_all(
+        "SELECT id, status, progress, result, error FROM jobs WHERE type = %s AND project_pk = %s ORDER BY created_at",
+        [type, await project_pk(index)],
+    )
+
+
+async def _make_claimable(job_id: str) -> None:
+    """A postponed job waits POSTPONE_FOR before it is claimed again: let that time pass"""
+    from amcat4.postgres.connection import execute
+
+    await execute("UPDATE jobs SET updated_at = now() - interval '1 hour' WHERE id = %s", [job_id])
+
+
+@pytest.mark.anyio
+async def test_fill_and_backfill_jobs_wait_for_a_move(moving_projects, monkeypatch):
+    from amcat4.postgres.connection import connection, fetch_all
+    from amcat4.postgres.projects import project_pk
+    from amcat4.projects import jobs
+    from amcat4.systemdata.fields import field_infos
+    from tests.test_phase_c import _remove_quarter_keys
+
+    a, _ = moving_projects
+    pk = await project_pk(a)
+    await _remove_quarter_keys(a)
+    monkeypatch.setattr(get_settings(), "sort_slot_job_rows", 0)  # fill sort slots in a job
+    move = await _stop_move_after_first_batch(monkeypatch, a)  # halfway the move
+
+    # the scheduler does not start a backfill for a project that is being moved
+    await jobs.schedule_quarter_backfill({})
+    assert await _jobs_of(a, "backfill_quarter") == []
+    # jobs that were created anyway (e.g. before the move) are postponed, not failed, and not claimed again at once
+    await update_fields(a, {"pub": UpdateDocumentField(fast_sort=True)})
+    async with connection() as conn:
+        await jobs.create_job_in_transaction(conn, "backfill_quarter", pk, {"project_pk": pk})
+    assert await jobs.run_pending_jobs() == 2
+    assert await jobs.run_pending_jobs() == 0
+    [fill], [backfill] = await _jobs_of(a, "fill_sort_slot"), await _jobs_of(a, "backfill_quarter")
+    for job in (fill, backfill):
+        assert job["status"] == "pending" and "being moved" in job["progress"]["postponed"]
+
+    # after the move, they run
+    assert (await _finish_job(move["id"]))["status"] == "done"
+    for job in (fill, backfill):
+        await _make_claimable(job["id"])
+    assert await jobs.run_pending_jobs() >= 2
+    [fill], [backfill] = await _jobs_of(a, "fill_sort_slot"), await _jobs_of(a, "backfill_quarter")
+    assert fill["status"] == backfill["status"] == "done"
+    assert "postponed" not in fill["progress"] and "postponed" not in backfill["progress"]
+    infos = await field_infos(a)
+    assert infos["pub"].sort_ready and infos["date"].quarter_ready
+    await fetch_all("DELETE FROM jobs WHERE type IN ('fill_sort_slot', 'backfill_quarter') RETURNING id")
+
+
+@pytest.mark.anyio
+async def test_fill_job_postponed_between_batches(moving_projects, monkeypatch):
+    """A move that starts while the fill job runs: the next batch is refused, and the job is postponed"""
+    from amcat4.postgres.connection import execute, fetch_all
+    from amcat4.projects import jobs
+
+    a, _ = moving_projects
+    monkeypatch.setattr(get_settings(), "sort_slot_job_rows", 0)
+    monkeypatch.setattr(jobs, "FILL_BATCH_SIZE", 7)
+    await update_fields(a, {"pub": UpdateDocumentField(fast_sort=True)})
+    original = jobs.Job.save_progress
+
+    async def move_starts(self, **progress):  # (as if the move job set moving_to now)
+        await original(self, **progress)
+        await execute("UPDATE projects SET moving_to = partition_id WHERE id = %s", [a])
+
+    monkeypatch.setattr(jobs.Job, "save_progress", move_starts)
+    try:
+        await jobs.run_pending_jobs()
+    finally:
+        await execute("UPDATE projects SET moving_to = NULL WHERE id = %s", [a])
+    monkeypatch.setattr(jobs.Job, "save_progress", original)
+    [fill] = await _jobs_of(a, "fill_sort_slot")
+    assert fill["status"] == "pending" and fill["progress"]["after_id"] and fill["progress"]["batches"] == 1
+    await _make_claimable(fill["id"])
+    await jobs.run_pending_jobs()
+    [fill] = await _jobs_of(a, "fill_sort_slot")
+    assert fill["status"] == "done" and fill["result"]["batches"] == 6  # resumed after the first batch
+    assert (await list_fields(a))["pub"].sort_slot == "source"
+    await fetch_all("DELETE FROM jobs WHERE type IN ('fill_sort_slot', 'vacuum') RETURNING id")
+
+
+@pytest.mark.anyio
+async def test_backfill_retried_after_failure(two_projects, monkeypatch):  # noqa: F811
+    """The scheduler retries a failed backfill after RETRY_AFTER, at most MAX_BACKFILL_ATTEMPTS times"""
+    import uuid
+
+    from amcat4.postgres.connection import execute, fetch_all
+    from amcat4.postgres.projects import project_pk
+    from amcat4.projects import jobs
+    from tests.test_phase_c import _remove_quarter_keys
+
+    a, _ = two_projects
+    pk = await project_pk(a)
+    await _remove_quarter_keys(a)
+
+    async def failed(age: str) -> None:
+        await execute(
+            f"""INSERT INTO jobs (id, type, status, project_pk, params, error, updated_at)
+                VALUES (%s, 'backfill_quarter', 'failed', %s, %s, 'error', now() - interval '{age}')""",  # type: ignore[arg-type]
+            [uuid.uuid4().hex, pk, '{"project_pk": %d}' % pk],
+        )
+
+    async def pending() -> int:
+        return len([j for j in await _jobs_of(a, "backfill_quarter") if j["status"] == "pending"])
+
+    try:
+        await failed("1 minute")
+        await jobs.schedule_quarter_backfill({})
+        assert await pending() == 0  # a recent failure: not yet
+        await execute("UPDATE jobs SET updated_at = now() - interval '1 hour' WHERE type = 'backfill_quarter'")
+        await jobs.schedule_quarter_backfill({})
+        assert await pending() == 1  # retried
+        await execute("DELETE FROM jobs WHERE type = 'backfill_quarter' AND status = 'pending'")
+        for _ in range(jobs.MAX_BACKFILL_ATTEMPTS - 1):
+            await failed("1 hour")
+        await jobs.schedule_quarter_backfill({})
+        assert await pending() == 0  # too many failures: needs a look
+    finally:
+        await fetch_all("DELETE FROM jobs WHERE type = 'backfill_quarter' RETURNING id")
+
+
+@pytest.mark.anyio
+async def test_fast_sort_restarts_unfinished_fill(two_projects, monkeypatch):  # noqa: F811
+    """fast_sort on a field whose slot is reserved but not filled (its job failed): the fill starts again"""
+    from amcat4.postgres.connection import execute, fetch_all
+    from amcat4.projects import jobs
+    from amcat4.systemdata.fields import field_infos
+
+    a, _ = two_projects
+    monkeypatch.setattr(get_settings(), "sort_slot_job_rows", 0)
+    try:
+        await update_fields(a, {"pub": UpdateDocumentField(fast_sort=True)})
+        await execute("UPDATE jobs SET status = 'failed' WHERE type = 'fill_sort_slot'")
+        assert not (await field_infos(a))["pub"].sort_ready
+        await update_fields(a, {"pub": UpdateDocumentField(fast_sort=True)})
+        await update_fields(a, {"pub": UpdateDocumentField(fast_sort=True)})  # (not a second job while one is pending)
+        assert [j["status"] for j in await _jobs_of(a, "fill_sort_slot")] == ["failed", "pending"]
+        await jobs.run_pending_jobs()
+        assert (await field_infos(a))["pub"].sort_ready
+        # a small project (filled in the request): at once
+        await execute("UPDATE fields SET sort_slot_ready = false WHERE name = 'pub' AND sort_slot IS NOT NULL")
+        monkeypatch.setattr(get_settings(), "sort_slot_job_rows", 10_000)
+        await update_fields(a, {"pub": UpdateDocumentField(fast_sort=True)})
+        assert (await field_infos(a))["pub"].sort_ready
+    finally:
+        await fetch_all("DELETE FROM jobs WHERE type IN ('fill_sort_slot', 'vacuum') RETURNING id")

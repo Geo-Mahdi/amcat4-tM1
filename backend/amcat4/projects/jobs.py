@@ -29,11 +29,12 @@ from psycopg import AsyncConnection, sql
 from psycopg.types.json import Jsonb
 
 from amcat4.connections import server_defaults
-from amcat4.errors import NotFoundError
+from amcat4.errors import ConflictError, NotFoundError
 from amcat4.models import CreateDocumentField, FieldType, FilterSpec
 from amcat4.postgres import documents as storage
 from amcat4.postgres.connection import connection, execute, fetch_all, fetch_one
-from amcat4.postgres.fields import FIELD_COLUMNS, FieldSet
+from amcat4.postgres.fields import FIELD_COLUMNS, FieldInfo, FieldSet, quarter_sql
+from amcat4.postgres.layout import project_filter, writing
 from amcat4.postgres.projects import project_partitions, project_pk
 from amcat4.postgres.search import SearchQuery, compile_search
 from amcat4.projects import maintenance, partitions
@@ -44,6 +45,10 @@ BATCH_SIZE = 2000
 FILL_BATCH_SIZE = 10_000
 STALE_AFTER = "2 minutes"  # running jobs that were not updated for this long are considered interrupted
 HEARTBEAT_SECONDS = 30
+POSTPONE_FOR = "30 seconds"  # a postponed job (JobPostponed) is not claimed again for this long
+# A failed backfill_quarter job is retried by the periodic task after RETRY_AFTER, at most MAX_BACKFILL_ATTEMPTS times
+MAX_BACKFILL_ATTEMPTS = 3
+RETRY_AFTER = "5 minutes"
 
 _COLUMNS = (
     "id, type, status, (SELECT id FROM projects WHERE pk = jobs.project_pk) AS project, created_by, params, "
@@ -53,6 +58,19 @@ _COLUMNS = (
 
 class JobCancelled(Exception):
     pass
+
+
+class JobPostponed(Exception):
+    """
+    Raised by a job handler that cannot continue now (e.g. its project is being moved to another partition). The job
+    goes back to pending, keeps its progress, and is claimed again after POSTPONE_FOR: it does not fail.
+    """
+
+
+async def postpone_if_moving(project_pk: int) -> None:
+    """Raise JobPostponed if the project is being moved (its documents cannot be written until the move is done)"""
+    if await fetch_one("SELECT 1 FROM projects WHERE pk = %s AND moving_to IS NOT NULL", [project_pk]):
+        raise JobPostponed(f"project {project_pk} is being moved to another partition")
 
 
 @dataclass
@@ -126,16 +144,23 @@ async def cancel_job(job_id: str) -> None:
 async def _claim_job() -> Job | None:
     async with connection() as conn:
         async with conn.transaction():
+            # (postponed jobs wait POSTPONE_FOR: otherwise run_pending_jobs would claim them again at once)
             cur = await conn.execute(
                 f"""SELECT id, type, params, progress FROM jobs
-                    WHERE status = 'pending' OR (status = 'running' AND updated_at < now() - interval '{STALE_AFTER}')
+                    WHERE (status = 'pending'
+                           AND NOT (progress ? 'postponed' AND updated_at > now() - interval '{POSTPONE_FOR}'))
+                       OR (status = 'running' AND updated_at < now() - interval '{STALE_AFTER}')
                     ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED"""  # type: ignore[arg-type]
             )
             row = await cur.fetchone()
             if row is None:
                 return None
-            await conn.execute("UPDATE jobs SET status = 'running', updated_at = now() WHERE id = %s", [row["id"]])  # type: ignore[index, call-overload]
-    return Job(id=row["id"], type=row["type"], params=row["params"], progress=row["progress"])  # type: ignore[index, call-overload]
+            await conn.execute(
+                "UPDATE jobs SET status = 'running', progress = progress - 'postponed', updated_at = now() WHERE id = %s",
+                [row["id"]],  # type: ignore[index, call-overload]
+            )
+    progress = {k: v for k, v in row["progress"].items() if k != "postponed"}  # type: ignore[index, call-overload]
+    return Job(id=row["id"], type=row["type"], params=row["params"], progress=progress)  # type: ignore[index, call-overload]
 
 
 async def _heartbeat(job_id: str) -> None:
@@ -150,6 +175,15 @@ async def run_job(job: Job) -> None:
         result = await HANDLERS[job.type](job)
     except JobCancelled:
         logging.info(f"Job {job.id} was cancelled")
+        return
+    except JobPostponed as e:
+        logging.info(f"Job {job.id} is postponed: {e}")
+        await execute(
+            """UPDATE jobs SET status = 'pending', progress = progress || jsonb_build_object('postponed', %s::text),
+                   updated_at = now()
+               WHERE id = %s AND status = 'running'""",
+            [str(e), job.id],
+        )
         return
     except Exception as e:
         logging.exception(f"Job {job.id} failed")
@@ -310,11 +344,14 @@ async def _fill_sort_slot_job(job: Job) -> dict[str, Any]:
     column: field_pk None). params: project_pk, slot, field_pk. Resumable: progress is the last document id.
     Stops early if the slot was given to another field meanwhile (that field's own fill covers every document).
     When done, the field's sort_slot_ready is set, and sorting uses the slot.
+    While the project is being moved to another partition, the job is postponed (JobPostponed), at the start or
+    between batches.
     """
     from amcat4.postgres.fields import field_info_from_row
 
     p = job.params
     project, slot, field_pk = p["project_pk"], p["slot"], p.get("field_pk")
+    await postpone_if_moving(project)
     async with connection() as conn:
         # waits for a fill or clear of the same slot that is still running (another job, or a field update)
         await storage.lock_sort_slot(conn, project, slot)
@@ -328,9 +365,12 @@ async def _fill_sort_slot_job(job: Job) -> dict[str, Any]:
                 if (owner["pk"] if owner else None) != field_pk:  # type: ignore[index, call-overload]
                     return {"stopped": f"slot {slot} is now used by another field", **job.progress}
                 f = field_info_from_row(owner) if owner else None  # type: ignore[arg-type]
-                last = await storage.fill_sort_slot(
-                    conn, project, slot, f, after_id=job.progress.get("after_id"), batch_size=FILL_BATCH_SIZE
-                )
+                try:
+                    last = await storage.fill_sort_slot(
+                        conn, project, slot, f, after_id=job.progress.get("after_id"), batch_size=FILL_BATCH_SIZE
+                    )
+                except ConflictError as e:  # a move started (writes to the project are refused until it is done)
+                    raise JobPostponed(str(e)) from e
                 if last is None:
                     break
                 await job.save_progress(after_id=last, batches=job.progress.get("batches", 0) + 1)
@@ -351,11 +391,13 @@ async def _backfill_quarter_job(job: Job) -> dict[str, Any]:
     Give the documents of a project that were stored before migration 0002 the derived quarter key of their date
     fields, in batches (resumable), then mark the fields as ready (quarter aggregations then use the key).
     params: project_pk. Only touches documents that have a date value but no quarter key.
+    While the project is being moved to another partition, the job is postponed (JobPostponed), at the start or
+    between batches. Its updates are writes to the project (writing(), so a move waits for a running batch).
     """
-    from amcat4.postgres.fields import field_info_from_row, quarter_sql
-    from amcat4.postgres.layout import project_filter
+    from amcat4.postgres.fields import field_info_from_row
 
     project = job.params["project_pk"]
+    await postpone_if_moving(project)
     rows = await fetch_all(
         f"SELECT {FIELD_COLUMNS} FROM fields WHERE project_pk = %s AND type = 'date' AND NOT quarter_ready",  # type: ignore[arg-type]
         [project],
@@ -365,30 +407,13 @@ async def _backfill_quarter_job(job: Job) -> dict[str, Any]:
         f = field_info_from_row(row)
         after = done.get(str(f.pk), 0)
         while after is not None:
+            await postpone_if_moving(project)
             async with connection() as conn:
-                where = await project_filter(conn, project)
-                cur = await conn.execute(
-                    sql.SQL("SELECT max(id) AS last FROM ({}) b").format(
-                        sql.SQL("SELECT id FROM documents WHERE {} AND id > %s ORDER BY id LIMIT %s").format(where)
-                    ),
-                    [after, FILL_BATCH_SIZE],
-                )
-                last = (await cur.fetchone())["last"]  # type: ignore[index]
-                if last is not None:
-                    value = sql.SQL("(documents.exact_fields->>{})").format(sql.Literal(f.key))
-                    await conn.execute(
-                        sql.SQL(
-                            """UPDATE documents SET exact_fields = exact_fields || jsonb_build_object({qkey}, {quarter})
-                               WHERE {where} AND documents.id > %s AND documents.id <= %s
-                                 AND exact_fields ? {key} AND NOT exact_fields ? {qkey}"""
-                        ).format(
-                            qkey=sql.Literal(f.derived_key("quarter")),
-                            quarter=quarter_sql(value),
-                            key=sql.Literal(f.key),
-                            where=where,
-                        ),
-                        [after, last],
-                    )
+                try:
+                    async with writing(conn, project):
+                        last = await _backfill_quarter_batch(conn, project, f, after)
+                except ConflictError as e:  # a move started (writes to the project are refused until it is done)
+                    raise JobPostponed(str(e)) from e
             after = last
             done[str(f.pk)] = last
             await job.save_progress(fields=done)
@@ -397,16 +422,47 @@ async def _backfill_quarter_job(job: Job) -> dict[str, Any]:
     return {"fields": [row["name"] for row in rows]}
 
 
+async def _backfill_quarter_batch(conn: AsyncConnection, project: int, f: FieldInfo, after: int) -> int | None:
+    """Give the next FILL_BATCH_SIZE documents after id `after` the quarter key of f. Returns the last id (None: done)"""
+    where = await project_filter(conn, project)
+    cur = await conn.execute(
+        sql.SQL("SELECT max(id) AS last FROM ({}) b").format(
+            sql.SQL("SELECT id FROM documents WHERE {} AND id > %s ORDER BY id LIMIT %s").format(where)
+        ),
+        [after, FILL_BATCH_SIZE],
+    )
+    last = (await cur.fetchone())["last"]  # type: ignore[index]
+    if last is not None:
+        value = sql.SQL("(documents.exact_fields->>{})").format(sql.Literal(f.key))
+        await conn.execute(
+            sql.SQL(
+                """UPDATE documents SET exact_fields = exact_fields || jsonb_build_object({qkey}, {quarter})
+                   WHERE {where} AND documents.id > %s AND documents.id <= %s
+                     AND exact_fields ? {key} AND NOT exact_fields ? {qkey}"""
+            ).format(
+                qkey=sql.Literal(f.derived_key("quarter")), quarter=quarter_sql(value), key=sql.Literal(f.key), where=where
+            ),
+            [after, last],
+        )
+    return last
+
+
 async def schedule_quarter_backfill(state: dict) -> dict:
     """
     Periodic task: a backfill_quarter job for every project with date fields that do not have their quarter keys
-    (after migration 0002, or a copy from such a project). Not again for a project whose job failed (that needs a
-    look; delete the failed job to try again).
+    (after migration 0002, or a copy from such a project). Not for a project that is being moved (or has a move job
+    waiting): the job would only be postponed. A failed job is tried again after RETRY_AFTER, at most
+    MAX_BACKFILL_ATTEMPTS times in all (then it needs a look; delete the failed jobs to try again).
     """
     rows = await fetch_all(
-        """SELECT DISTINCT f.project_pk FROM fields f WHERE f.type = 'date' AND NOT f.quarter_ready
-           AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.type = 'backfill_quarter' AND j.project_pk = f.project_pk
-                           AND j.status IN ('pending', 'running', 'failed'))"""
+        f"""SELECT DISTINCT f.project_pk FROM fields f JOIN projects p ON p.pk = f.project_pk
+            WHERE f.type = 'date' AND NOT f.quarter_ready AND p.moving_to IS NULL
+              AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.project_pk = f.project_pk
+                              AND j.status IN ('pending', 'running') AND j.type IN ('backfill_quarter', 'move_project'))
+              AND (SELECT count(*) FROM jobs j WHERE j.type = 'backfill_quarter' AND j.project_pk = f.project_pk
+                   AND j.status = 'failed') < {MAX_BACKFILL_ATTEMPTS}
+              AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.type = 'backfill_quarter' AND j.project_pk = f.project_pk
+                              AND j.status = 'failed' AND j.updated_at > now() - interval '{RETRY_AFTER}')"""  # type: ignore[arg-type]
     )
     for row in rows:
         async with connection() as conn:

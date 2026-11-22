@@ -286,6 +286,7 @@ async def _rename_field(conn, pk: int, old: str, new: str) -> None:
 async def _set_sort_slot(conn, project: int, f: FieldInfo, fast_sort: bool) -> None:
     """
     Put a field in a free sort slot of its kind (or take it out), and copy its values to the slot column (or clear it).
+    For a field that is in a slot that is not filled yet, and no job is filling it: fill it again.
     Raises ValueError if the type has no slots, or all slots of its kind are used by other fields of the project.
     """
     if not fast_sort:
@@ -297,6 +298,10 @@ async def _set_sort_slot(conn, project: int, f: FieldInfo, fast_sort: bool) -> N
     if not slots:
         raise ValueError(f"Fields of type {f.type} cannot be used for fast sorting")
     if f.sort_slot in slots:
+        # Already in a slot. If the slot is not filled yet and no job is filling it (the fill job failed, or was
+        # cancelled), fill it again (fill_sort_slot only writes the documents that do not have the value yet)
+        if not f.sort_ready and not await _fill_job_active(conn, project, f.sort_slot):
+            await _fill_slot(conn, project, f.sort_slot, f)
         return
     cur = await conn.execute("SELECT sort_slot, name FROM fields WHERE project_pk = %s AND sort_slot IS NOT NULL", [project])
     used = {row["sort_slot"]: row["name"] for row in await cur.fetchall()}
@@ -313,6 +318,16 @@ async def _set_sort_slot(conn, project: int, f: FieldInfo, fast_sort: bool) -> N
     except UniqueViolation:
         raise ValueError(f"Sort slot {free[0]} was just taken by another field, please try again")
     await _fill_slot(conn, project, free[0], f)
+
+
+async def _fill_job_active(conn, project: int, slot: str) -> bool:
+    """Whether a fill_sort_slot job for this slot of the project is pending or running"""
+    cur = await conn.execute(
+        """SELECT 1 FROM jobs WHERE type = 'fill_sort_slot' AND status IN ('pending', 'running')
+           AND project_pk = %s AND params->>'slot' = %s""",
+        [project, slot],
+    )
+    return await cur.fetchone() is not None
 
 
 async def _fill_slot(conn, project: int, slot: str, f: FieldInfo | None) -> None:
