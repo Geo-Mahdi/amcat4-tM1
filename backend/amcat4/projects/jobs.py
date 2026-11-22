@@ -377,53 +377,100 @@ async def _copy_job(job: Job) -> dict[str, Any]:
 
 async def _fill_sort_slot_job(job: Job) -> dict[str, Any]:
     """
-    Copy the values of a field into its sort slot column for all documents of the project, in batches (or clear the
-    column: field_pk None). params: project_pk, slot, field_pk. Resumable: progress is the last document id.
-    Stops early if the slot was given to another field meanwhile (that field's own fill covers every document).
-    When done, the field's sort_slot_ready is set, and sorting uses the slot.
+    Copy the values of fields into their sort slot columns for all documents of the project, in batches (or clear a
+    column: field_pk None). params: project_pk, slots {slot: field_pk} (a job of an earlier version: slot, field_pk).
+    All slots of the job are filled in one pass over the rows (fill_sort_slots: one UPDATE per batch sets every slot
+    column), so filling N slots rewrites each row once, not N times: a request that maps several fields, or several
+    requests before the job starts, give one job (queue_fill_sort_slot). Before, every slot had its own job and its own
+    pass; measured on 2.68 M real documents with the previous version of this job (22 Nov 2026): two slots took more
+    than 10 minutes in total, and the index was rebuilt afterwards (searches 2-4x slower meanwhile).
+    Resumable: progress is the last document id.
+    A slot that was given to another field meanwhile is left out from then on (that field's own fill covers every
+    document); the job stops if that leaves no slot. When done, each filled field's sort_slot_ready is set, and
+    sorting uses the slot.
     Used for projects with more than sort_slot_job_rows documents (AMCAT4_SORT_SLOT_JOB_ROWS): filling rewrites every
     document with a value, too long for one request. Smaller projects are filled in the request, as in the original
     (which had only the date and source slots, filled in the request).
     While the project is being moved to another partition, the job is postponed (JobPostponed), at the start or
     between batches.
     """
-    from amcat4.postgres.fields import field_info_from_row
+    from amcat4.postgres.fields import SORT_SLOTS, field_info_from_row
 
     p = job.params
-    project, slot, field_pk = p["project_pk"], p["slot"], p.get("field_pk")
+    project = p["project_pk"]
+    slots: dict[str, int | None] = p["slots"] if "slots" in p else {p["slot"]: p.get("field_pk")}
+    order = sorted(slots, key=SORT_SLOTS.index)  # type: ignore[arg-type]  # (locks always in the same order)
     await postpone_if_moving(project)
+    stopped: list[str] = []
     async with connection() as conn:
-        # waits for a fill or clear of the same slot that is still running (another job, or a field update)
-        await storage.lock_sort_slot(conn, project, slot)
+        # waits for a fill or clear of the same slots that is still running (another job, or a field update)
+        for slot in order:
+            await storage.lock_sort_slot(conn, project, slot)
         try:
             while True:
                 cur = await conn.execute(
-                    f"SELECT {FIELD_COLUMNS} FROM fields WHERE project_pk = %s AND sort_slot = %s",  # type: ignore[arg-type]
-                    [project, slot],
+                    f"SELECT {FIELD_COLUMNS} FROM fields WHERE project_pk = %s AND sort_slot = ANY(%s)",  # type: ignore[arg-type]
+                    [project, order],
                 )
-                owner = await cur.fetchone()
-                if (owner["pk"] if owner else None) != field_pk:  # type: ignore[index, call-overload]
-                    return {"stopped": f"slot {slot} is now used by another field", **job.progress}
-                f = field_info_from_row(owner) if owner else None  # type: ignore[arg-type]
+                owners = {row["sort_slot"]: row for row in await cur.fetchall()}  # type: ignore[index, call-overload]
+                active: dict[str, FieldInfo | None] = {}
+                for slot in order:
+                    owner = owners.get(slot)
+                    if (owner["pk"] if owner else None) != slots[slot]:
+                        if slot not in stopped:
+                            stopped.append(slot)
+                        continue
+                    active[slot] = field_info_from_row(owner) if owner else None
+                if not active:
+                    return {"stopped": f"slot(s) {', '.join(stopped)} now used by another field", **job.progress}
                 try:
-                    last = await storage.fill_sort_slot(
-                        conn, project, slot, f, after_id=job.progress.get("after_id"), batch_size=FILL_BATCH_SIZE
+                    last = await storage.fill_sort_slots(
+                        conn, project, active, after_id=job.progress.get("after_id"), batch_size=FILL_BATCH_SIZE
                     )
                 except ConflictError as e:  # a move started (writes to the project are refused until it is done)
                     raise JobPostponed(str(e)) from e
                 if last is None:
                     break
                 await job.save_progress(after_id=last, batches=job.progress.get("batches", 0) + 1)
-            if field_pk is not None:
-                await conn.execute(
-                    "UPDATE fields SET sort_slot_ready = true WHERE pk = %s AND sort_slot = %s", [field_pk, slot]
-                )
+            for slot, f in active.items():
+                if f is not None:
+                    await conn.execute(
+                        "UPDATE fields SET sort_slot_ready = true WHERE pk = %s AND sort_slot = %s", [f.pk, slot]
+                    )
         finally:
-            await storage.lock_sort_slot(conn, project, slot, unlock=True)
+            for slot in reversed(order):
+                await storage.lock_sort_slot(conn, project, slot, unlock=True)
     # a mass update: without a vacuum, the next counts and sorts must check every rewritten row (measured on a 300k
     # test database after filling a slot for 270k documents: a sort on the slot 187 ms before, 3.4 ms after VACUUM)
     await maintenance.vacuum_soon((await project_partitions([project])).values())
-    return {"slot": slot, "field_pk": field_pk, "batches": job.progress.get("batches", 0)}
+    result: dict[str, Any] = {"slots": slots, "batches": job.progress.get("batches", 0)}
+    if stopped:
+        result["stopped"] = stopped
+    return result
+
+
+async def queue_fill_sort_slot(conn: AsyncConnection, project_pk: int, slot: str, field_pk: int | None) -> str:
+    """
+    Have a fill_sort_slot job fill (or clear: field_pk None) this slot of the project, in the transaction of the field
+    update. The slot is added to a pending fill job of the project that has not started yet (no progress) and does not
+    have this slot yet, so slots requested together are filled in one pass; otherwise a new job is created. Returns the
+    job id. (FOR UPDATE: a job that a worker is claiming right now is skipped once it is running, then a new job is
+    created; and a worker cannot claim the job until this transaction commits, SKIP LOCKED.)
+    """
+    cur = await conn.execute(
+        """UPDATE jobs SET params = jsonb_set(params, '{slots}', params->'slots' || jsonb_build_object(%s::text, %s::int))
+           WHERE id = (SELECT id FROM jobs WHERE type = 'fill_sort_slot' AND status = 'pending' AND project_pk = %s
+                       AND params ? 'slots' AND NOT params->'slots' ? %s AND progress = '{}'::jsonb
+                       ORDER BY created_at LIMIT 1 FOR UPDATE)
+           RETURNING id""",
+        [slot, field_pk, project_pk, slot],
+    )
+    row = await cur.fetchone()
+    if row is not None:
+        return row["id"]  # type: ignore[index, call-overload]
+    return await create_job_in_transaction(
+        conn, "fill_sort_slot", project_pk, {"project_pk": project_pk, "slots": {slot: field_pk}}
+    )
 
 
 async def _backfill_quarter_job(job: Job) -> dict[str, Any]:

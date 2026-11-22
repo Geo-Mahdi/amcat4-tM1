@@ -293,7 +293,7 @@ async def test_sort_slot_fill_job(slot_project, monkeypatch):
 
     assert await jobs.run_pending_jobs() >= 1
     [job] = await fetch_all(
-        "SELECT status, result FROM jobs WHERE type = 'fill_sort_slot' AND project_pk = %s AND params->>'slot' = 'source'",
+        "SELECT status, result FROM jobs WHERE type = 'fill_sort_slot' AND project_pk = %s AND params->'slots' ? 'source'",
         [await project_pk(p)],
     )
     assert job["status"] == "done" and job["result"]["batches"] == 6  # 40 documents in batches of 7

@@ -206,7 +206,11 @@ class UpdateDocumentField(BaseModel):
         "sort_date2 (date fields), source, sort_kw1, sort_kw2, sort_kw3 (keyword and url fields) or sort_num1 (number and "
         "integer fields) columns. Each slot holds one field per project. Tag fields cannot be put in a slot. For large "
         "projects, the slot is filled by a background job; until it is done, sorting works but is not faster. "
-        "false frees the slot.",
+        "Filling a slot on a large project is a maintenance operation: it rewrites every document of the project (and "
+        "pg_search indexes each one again), so do it when the project is not in heavy use, and put all fields that need "
+        "a slot in one request (slots requested together are filled in one pass over the documents). Measured on 2.68 M "
+        "documents, before slots were filled together: more than 10 minutes for two slots, searches 2-4x slower "
+        "meanwhile. false frees the slot (which also rewrites the documents that have a value in it).",
     )
 
 

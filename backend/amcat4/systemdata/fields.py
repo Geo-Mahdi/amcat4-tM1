@@ -335,8 +335,8 @@ async def _fill_job_active(conn, project: int, slot: str) -> bool:
     """Whether a fill_sort_slot job for this slot of the project is pending or running"""
     cur = await conn.execute(
         """SELECT 1 FROM jobs WHERE type = 'fill_sort_slot' AND status IN ('pending', 'running')
-           AND project_pk = %s AND params->>'slot' = %s""",
-        [project, slot],
+           AND project_pk = %s AND (params->'slots' ? %s OR params->>'slot' = %s)""",
+        [project, slot, slot],
     )
     return await cur.fetchone() is not None
 
@@ -357,10 +357,10 @@ async def _fill_slot(conn, project: int, slot: str, f: FieldInfo | None) -> None
         if f is not None:
             await conn.execute("UPDATE fields SET sort_slot_ready = true WHERE pk = %s AND sort_slot = %s", [f.pk, slot])
         return
-    from amcat4.projects.jobs import create_job_in_transaction
+    from amcat4.projects.jobs import queue_fill_sort_slot
 
-    params = {"project_pk": project, "slot": slot, "field_pk": f.pk if f is not None else None}
-    await create_job_in_transaction(conn, "fill_sort_slot", project, params)
+    # (one job per project for the slots requested together: they are filled in one pass over the rows)
+    await queue_fill_sort_slot(conn, project, slot, f.pk if f is not None else None)
 
 
 ###################### FIELD ACCESS ######################

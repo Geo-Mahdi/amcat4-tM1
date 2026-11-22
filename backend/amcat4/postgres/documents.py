@@ -399,7 +399,6 @@ async def lock_sort_slot(conn: AsyncConnection, project_pk: int, slot: str, unlo
     await conn.execute(f"SELECT {function}(%s, %s)", _sort_slot_lock(project_pk, slot))  # type: ignore[arg-type]
 
 
-@guard_writes(lambda conn, project_pk, *a, **k: project_pk)
 async def fill_sort_slot(
     conn: AsyncConnection,
     project_pk: int,
@@ -415,12 +414,30 @@ async def fill_sort_slot(
     With batch_size: only the next batch_size documents after after_id (in id order); returns the last id of the
     batch, or None if there were no more documents. Without: all documents (returns None).
     """
-    value = (
-        sql.SQL("NULL::{}").format(sql.SQL(SLOT_TYPES[slot]))  # type: ignore[index]
-        if f is None
-        else sql.SQL("({}->>{})::{}").format(sql.Identifier(f.column), sql.Literal(f.key), sql.SQL(SLOT_TYPES[slot]))  # type: ignore[index]
-    )
-    column = sql.Identifier(slot)
+    return await fill_sort_slots(conn, project_pk, {slot: f}, after_id=after_id, batch_size=batch_size)
+
+
+@guard_writes(lambda conn, project_pk, *a, **k: project_pk)
+async def fill_sort_slots(
+    conn: AsyncConnection,
+    project_pk: int,
+    slots: dict[str, FieldInfo | None],
+    after_id: int | None = None,
+    batch_size: int | None = None,
+) -> int | None:
+    """
+    fill_sort_slot for several slots at once (slot -> field, or None to clear it): one UPDATE sets all the slot
+    columns, so each row is rewritten (and indexed again by pg_search) once, however many slots are filled. A row is
+    only written if at least one of its slot columns changes. Unlike the original, which filled one slot per statement
+    (it had only the date and source slots, filled in the request).
+    """
+
+    def value(slot: str, f: FieldInfo | None) -> sql.Composable:
+        if f is None:
+            return sql.SQL("NULL::{}").format(sql.SQL(SLOT_TYPES[slot]))  # type: ignore[index]
+        return sql.SQL("({}->>{})::{}").format(sql.Identifier(f.column), sql.Literal(f.key), sql.SQL(SLOT_TYPES[slot]))  # type: ignore[index]
+
+    values = {slot: value(slot, f) for slot, f in slots.items()}
     where = await project_filter(conn, project_pk)
     params: list[Any] = []
     last_id = None
@@ -432,9 +449,13 @@ async def fill_sort_slot(
             return None
         where = sql.SQL("{} AND documents.id > %s AND documents.id <= %s").format(where)
         params = [after_id or 0, last_id]
+    assignments = sql.SQL(", ").join(sql.SQL("{} = {}").format(sql.Identifier(slot), v) for slot, v in values.items())
+    changed = sql.SQL(" OR ").join(
+        sql.SQL("documents.{} IS DISTINCT FROM {}").format(sql.Identifier(slot), v) for slot, v in values.items()
+    )
     await conn.execute(
-        sql.SQL("UPDATE documents SET {col} = {value} WHERE {where} AND documents.{col} IS DISTINCT FROM {value}").format(
-            col=column, value=value, where=where
+        sql.SQL("UPDATE documents SET {assignments} WHERE {where} AND ({changed})").format(
+            assignments=assignments, where=where, changed=changed
         ),
         params,
     )

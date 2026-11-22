@@ -3,6 +3,8 @@ Tests for the fixes of the second review of the postgres-fast-v2 branch (one sec
 review list).
 """
 
+# ruff: noqa: F811 (the fixtures are imported from other test files)
+
 import pytest
 
 from amcat4.config import get_settings
@@ -10,6 +12,7 @@ from amcat4.postgres.connection import connection, execute, fetch_all, fetch_one
 from amcat4.projects import jobs, partitions
 from amcat4.projects.query import query_documents
 from tests.test_fast_path import two_projects  # noqa: F401
+from tests.test_phase_c import slot_project  # noqa: F401
 from tests.test_review_fixes import _finish_job, _make_claimable, _stop_move_after_first_batch
 
 
@@ -233,3 +236,66 @@ async def test_move_grace_period(moving_projects, monkeypatch):
         assert await count(conn, fieldset, SearchQuery()) == 40
     done = await asyncio.wait_for(running, 10)
     assert done["status"] == "done" and done["result"]["moved"] == 40
+
+
+###################### 7. Sort slots requested together are filled in one pass ######################
+
+
+@pytest.mark.anyio
+async def test_slots_filled_in_one_pass(slot_project, monkeypatch):
+    """
+    Every slot had its own fill job, and each job rewrote every row of the project (measured: two slots on 2.68 M
+    documents took more than 10 minutes). Slots requested together (in one request, or in several before the job
+    starts) are now filled by one job, in one pass over the rows
+    """
+    from amcat4.models import UpdateDocumentField
+    from amcat4.postgres import documents as storage
+    from amcat4.systemdata.fields import field_infos, update_fields
+    from tests.test_phase_c import _order, _slot_values
+    from tests.test_review_fixes import _jobs_of
+
+    p = slot_project
+    monkeypatch.setattr(get_settings(), "sort_slot_job_rows", 0)  # (fill in a job)
+    monkeypatch.setattr(jobs, "FILL_BATCH_SIZE", 7)
+    await update_fields(p, {"k1": UpdateDocumentField(fast_sort=True), "k2": UpdateDocumentField(fast_sort=True)})
+    await update_fields(p, {"date2": UpdateDocumentField(fast_sort=True)})  # (a second request, before the job runs)
+    [job] = await _jobs_of(p, "fill_sort_slot")
+    infos = await field_infos(p)
+    slots = {infos[name].sort_slot: infos[name].pk for name in ("k1", "k2", "date2")}
+    assert len(slots) == 3 and (await jobs.get_job(job["id"]))["params"]["slots"] == slots
+
+    calls = []
+    original = storage.fill_sort_slots
+
+    async def spy(conn, project_pk, slots, **kwargs):
+        calls.append(sorted(slots))
+        return await original(conn, project_pk, slots, **kwargs)
+
+    monkeypatch.setattr(storage, "fill_sort_slots", spy)
+    expected = {name: await _order(p, name, "desc") for name in ("k1", "k2", "date2")}  # (on the json values)
+    assert await jobs.run_pending_jobs() >= 1
+    [job] = await _jobs_of(p, "fill_sort_slot")
+    assert job["status"] == "done" and job["result"]["batches"] == 6  # 40 documents in batches of 7, once
+    assert calls == [sorted(slots)] * 7  # (six batches and the empty seventh), every statement with all slots
+    infos = await field_infos(p)
+    assert all(infos[name].sort_ready and infos[name].sort_read_column for name in ("k1", "k2", "date2"))
+    values = set((await _slot_values(p, infos["k1"].sort_slot)).values())  # type: ignore[arg-type]
+    assert values - {None} == {f"v{i}" for i in range(17)}
+    for name, order in expected.items():
+        assert await _order(p, name, "desc") == order
+
+
+@pytest.mark.anyio
+async def test_slot_not_added_to_started_job(slot_project, monkeypatch):
+    """A fill job that already started (it has progress) gets no more slots: it would miss the rows it did already"""
+    from amcat4.models import UpdateDocumentField
+    from amcat4.systemdata.fields import update_fields
+    from tests.test_review_fixes import _jobs_of
+
+    p = slot_project
+    monkeypatch.setattr(get_settings(), "sort_slot_job_rows", 0)
+    await update_fields(p, {"k1": UpdateDocumentField(fast_sort=True)})
+    [job] = await _jobs_of(p, "fill_sort_slot")
+    await execute("""UPDATE jobs SET progress = '{"after_id": 1, "postponed": "moving"}' WHERE id = %s""", [job["id"]])
+    await update_fields(p, {"k2": UpdateDocumentField(fast_sort=True)})
+    assert len(await _jobs_of(p, "fill_sort_slot")) == 2

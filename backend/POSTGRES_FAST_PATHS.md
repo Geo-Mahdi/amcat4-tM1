@@ -89,7 +89,14 @@ the old paths. Files: `projects/jobs.py`, `systemdata/fields.py`, `postgres/inde
 `sort_num1` and `sort_date2`. Sorting on a slot is a Top-K scan inside the index (checked with EXPLAIN in the tests);
 sorting on a json value reads every hit. Projects with more than `AMCAT4_SORT_SLOT_JOB_ROWS` documents (default
 10000; -1 = always in the request, as before) fill the slot in a background job in batches; the slot is not used
-for sorting until it is filled. Files: `projects/jobs.py`, `systemdata/fields.py`, migration 0002.
+for sorting until it is filled. Slots requested together (in one request, or in several requests before the job
+starts) are filled by one job per project in one pass: one UPDATE per batch sets every slot column, so N slots
+rewrite each row once, not N times; rows where no slot value changes are not written. Filling a slot on a large
+project is a maintenance operation: it rewrites every document of the project (and pg_search indexes each one
+again), so do it when the project is not in heavy use. Measured on 2.68 M real documents (22 Nov 2026) with one job
+per slot, before this change: more than 10 minutes for two slots, searches 2 to 4 times slower meanwhile, and an
+index rebuild afterwards (one segment per batch; not re-measured since). Files: `projects/jobs.py`,
+`systemdata/fields.py`, `postgres/documents.py` (`fill_sort_slots`), migration 0002.
 
 **Byte order for text sorts** (`AMCAT4_BYTE_ORDER_SORT`, default true). Text values not in a slot are sorted with
 `COLLATE "C"`, like the slot columns and Elasticsearch, so the order does not change when a field gets a slot. Off:
