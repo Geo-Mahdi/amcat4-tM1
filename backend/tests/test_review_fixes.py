@@ -75,3 +75,76 @@ async def test_slot_sort_used_when_all_projects_have_it(two):
     await upload(b, [{"_id": f"b{i}", "date": f"2020-01-0{i + 4}"} for i in range(3)], fields={"date": "date"})
     assert slot_sort_column(await get_fieldset([a, b]), "date") == "date"
     assert await _ids([a, b], sort=[{"date": SortSpec(order="desc")}]) == ["b2", "b1", "b0", "a2", "a1", "a0"]
+
+
+###################### 2, 3, 4. Sorting on _id and _seq, and the page depth limit ######################
+
+
+async def _all_pages(index, per_page=2, **kwargs) -> list[str]:
+    """All documents, following the 'next' cursors"""
+    r = await query_documents(index, per_page=per_page, **kwargs)
+    ids = [d["_id"] for d in r.data]
+    while r.next:
+        r = await query_documents(index, per_page=per_page, after=r.next, **kwargs)
+        ids += [d["_id"] for d in r.data]
+    return ids
+
+
+ID_ORDER = ["a10", "a9", "b", "c1"]  # the doc_id (text) order of the documents below, which are stored as b, c1, a9, a10
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("fast_path", [True, False])
+async def test_sort_id_is_doc_id(two, monkeypatch, fast_path):
+    """sort on _id is the order of the document ids (as before), with page numbers and offset cursors"""
+    monkeypatch.setattr(get_settings(), "fast_path", fast_path)
+    a, _ = two
+    await upload(a, [{"_id": i, "text": "x"} for i in ["b", "c1", "a9", "a10"]], fields={"text": "text"})
+    for order, expected in (("asc", ID_ORDER), ("desc", ID_ORDER[::-1])):
+        sort = [{"_id": SortSpec(order=order)}]
+        assert await _ids(a, sort=sort) == expected
+        p0 = await query_documents(a, sort=sort, page=0, per_page=2)
+        p1 = await query_documents(a, sort=sort, page=1, per_page=2)
+        assert [d["_id"] for d in p0.data] + [d["_id"] for d in p1.data] == expected
+        assert await _all_pages(a, sort=sort) == expected
+        # with a query, too
+        assert await _all_pages(a, sort=sort, queries={"q": "x"}) == expected
+
+
+@pytest.mark.anyio
+async def test_sort_seq(two):
+    """_seq is the storage order with a keyset cursor at page 0 (or with a keyset cursor), and offset paging for page > 0"""
+    from amcat4.projects.query import _decode_cursor
+
+    a, _ = two
+    stored = ["b", "c1", "a9", "a10", "d", "e"]
+    await upload(a, [{"_id": i, "text": "x"} for i in stored], fields={"text": "text"})
+    for order, expected in (("asc", stored), ("desc", stored[::-1])):
+        sort = [{"_seq": SortSpec(order=order)}]
+        r = await query_documents(a, sort=sort, per_page=2, queries={"q": "x"})
+        assert r.next is not None and "id" in _decode_cursor(r.next)
+        assert await _all_pages(a, sort=sort, queries={"q": "x"}) == expected
+        assert await _all_pages(a, sort=sort) == expected
+        pages = [await query_documents(a, sort=sort, page=p, per_page=2, queries={"q": "x"}) for p in range(3)]
+        assert [d["_id"] for p in pages for d in p.data] == expected
+        assert all(p.total_count == 6 for p in pages)
+        # the cursor of a page number continues after that page (as a keyset cursor)
+        assert pages[1].next is not None and "id" in _decode_cursor(pages[1].next)
+        rest = await query_documents(a, sort=sort, per_page=10, after=pages[1].next, queries={"q": "x"})
+        assert [d["_id"] for d in rest.data] == expected[4:]
+
+
+@pytest.mark.anyio
+async def test_cursor_beyond_max_offset(two, monkeypatch):
+    """The 'next' cursors of a query without sort (offset cursors) are not limited by max_offset; page numbers are"""
+    monkeypatch.setattr(get_settings(), "max_offset", 4)
+    a, _ = two
+    await upload(a, [{"_id": f"d{i}", "text": "word"} for i in range(11)], fields={"text": "text"})
+    ids = await _all_pages(a, queries={"q": "word"})
+    assert sorted(ids) == sorted(f"d{i}" for i in range(11)) and len(ids) == 11
+    ids = await _all_pages(a, queries={"q": "word"}, sort=[{"_id": SortSpec(order="asc")}])
+    assert ids == sorted(f"d{i}" for i in range(11))
+    with pytest.raises(ValueError, match='"sort": "_seq"'):
+        await query_documents(a, queries={"q": "word"}, page=2, per_page=2)
+    with pytest.raises(ValueError, match='"sort": "_seq"'):
+        await query_documents(a, sort=[{"_seq": SortSpec(order="asc")}], page=2, per_page=2)

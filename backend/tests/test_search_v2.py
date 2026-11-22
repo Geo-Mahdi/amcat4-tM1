@@ -166,8 +166,8 @@ async def _pages(client, user, url, body) -> tuple[list[int], list[dict]]:
 
 
 @pytest.mark.anyio
-async def test_sort_id_keyset(client, index, user):
-    """sort _id pages a query by internal id with an 'after this id' cursor, in both directions"""
+async def test_sort_seq_keyset(client, index, user):
+    """sort _seq pages a query by internal id with an 'after this id' cursor, in both directions"""
     await create_project_role(user, index, Roles.READER)
     await upload(
         index,
@@ -176,7 +176,7 @@ async def test_sort_id_keyset(client, index, user):
     )
     url = f"/index/{index}/query"
     for direction in ("asc", "desc"):
-        body = {"queries": ["even"], "sort": [{"_id": {"order": direction}}], "per_page": 10, "fields": ["i"]}
+        body = {"queries": ["even"], "sort": [{"_seq": {"order": direction}}], "per_page": 10, "fields": ["i"]}
         seen, metas = await _pages(client, user, url, body)
         assert sorted(seen) == list(range(0, 66, 2)) and len(seen) == 33
         assert all(m["total_count"] == 33 for m in metas)
@@ -188,9 +188,10 @@ async def test_sort_id_keyset(client, index, user):
             ascending = seen
         else:
             assert seen == list(reversed(ascending))
-    # "sort": "_id" as a plain string works too
-    seen, _ = await _pages(client, user, url, {"queries": ["odd"], "sort": "_id", "per_page": 10, "fields": ["i"]})
-    assert sorted(seen) == list(range(1, 66, 2))
+    # "sort": "_seq" as a plain string, and as a list of names, work too
+    for sort in ("_seq", ["_seq"]):
+        seen, _ = await _pages(client, user, url, {"queries": ["odd"], "sort": sort, "per_page": 10, "fields": ["i"]})
+        assert sorted(seen) == list(range(1, 66, 2))
 
 
 @pytest.mark.anyio
@@ -205,7 +206,7 @@ async def test_default_cursors_unchanged(index):
 
 @pytest.mark.anyio
 async def test_max_offset(client, index, user, monkeypatch):
-    """Offset paging stops at AMCAT4_MAX_OFFSET with a 400 that names sort _id; id paging has no limit"""
+    """Page numbers stop at AMCAT4_MAX_OFFSET with a 400 that names sort _seq; cursors and id paging have no limit"""
     monkeypatch.setattr(get_settings(), "max_offset", 20)
     await create_project_role(user, index, Roles.READER)
     await upload(index, docs=[{"i": i, "text": "word"} for i in range(50)], fields={"i": "integer", "text": "text"})
@@ -213,15 +214,14 @@ async def test_max_offset(client, index, user, monkeypatch):
     body = {"queries": ["word"], "per_page": 10, "fields": ["i"]}
     await post_json(client, url, user=user, json={**body, "page": 1}, expected=200)  # offset 10 + 10 = 20: allowed
     r = await post_json(client, url, user=user, json={**body, "page": 2}, expected=400)
-    assert '"sort": "_id"' in r["message"]
-    # a cursor that walks past the limit fails the same way
-    r = await post_json(client, url, user=user, json=body, expected=200)
-    r = await post_json(client, url, user=user, json={**body, "after": r["meta"]["next"]}, expected=200)
-    await post_json(client, url, user=user, json={**body, "after": r["meta"]["next"]}, expected=400)
-    with pytest.raises(ValueError, match="_id"):
+    assert '"sort": "_seq"' in r["message"]
+    # the 'next' cursors of the server walk past the limit (a download of a query without sort)
+    seen, _ = await _pages(client, user, url, body)
+    assert sorted(seen) == list(range(50))
+    with pytest.raises(ValueError, match="_seq"):
         await query_documents(index, queries={"q": "word"}, sort=[{"i": SortSpec(order="desc")}], page=5, per_page=10)
     # paging by id and paging without query are not limited
-    seen, _ = await _pages(client, user, url, {**body, "sort": "_id"})
+    seen, _ = await _pages(client, user, url, {**body, "sort": "_seq"})
     assert sorted(seen) == list(range(50))
     seen, _ = await _pages(client, user, url, {"per_page": 10, "fields": ["i"]})
     assert sorted(seen) == list(range(50))

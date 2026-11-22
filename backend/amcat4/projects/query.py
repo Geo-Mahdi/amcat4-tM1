@@ -12,7 +12,7 @@ from amcat4.connections import with_server_defaults
 from amcat4.models import FieldSpec, FilterSpec, SnippetParams, SortSpec
 from amcat4.postgres import documents as storage
 from amcat4.postgres.connection import connection
-from amcat4.postgres.search import SearchQuery, search
+from amcat4.postgres.search import SEQ, SearchQuery, search
 from amcat4.projects.maintenance import vacuum_soon
 from amcat4.systemdata.fields import create_or_verify_tag_field, get_fieldset
 
@@ -59,9 +59,9 @@ def _sort_spec(sort: list[dict[str, SortSpec]] | None) -> list[tuple[str, Litera
     return out
 
 
-def _id_order(sort: list[tuple[str, Literal["asc", "desc"]]] | None) -> Literal["asc", "desc"] | None:
-    """The direction if the sort is only on _id (the internal id), which is paged with a keyset cursor"""
-    if sort and len(sort) == 1 and sort[0][0] == "_id":
+def _seq_order(sort: list[tuple[str, Literal["asc", "desc"]]] | None) -> Literal["asc", "desc"] | None:
+    """The direction if the sort is only on _seq (the internal id), which is paged with a keyset cursor"""
+    if sort and len(sort) == 1 and sort[0][0] == SEQ:
         return sort[0][1]
     return None
 
@@ -101,8 +101,9 @@ async def query_documents(
     :param queries: if not None, a dict with labels and queries {label1: query1, ...}
     :param filters: if not None, a dict where the key is the field and the value is a FilterSpec
     :param sort: Sort order of results, a list of {field: SortSpec} dicts. Use "?" as field for random order.
-                 Use "_id" (alone) for the order in which the documents were stored: the cursor is then "after this
-                 document", which stays fast at any depth (use it to download all results of a query).
+                 "_id" sorts on the document id. Use "_seq" (alone) for the order in which the documents were stored:
+                 the cursor is then "after this document", which stays fast at any depth (use it to download all
+                 results of a query). With page > 0, _seq pages by offset like other orders.
     :param page: The number of the page to request (starting from zero)
     :param per_page: The number of results per page
     :param after: A cursor (the 'next' value of a previous result) to get the next batch of results. This is the
@@ -121,19 +122,22 @@ async def query_documents(
     sort_spec = _sort_spec(sort)
 
     cursor = _decode_cursor(after) if after else {}
-    # Without explicit sort (and without query/similarity scores), or with sort on _id only, cursors use keyset
-    # pagination on the internal id, otherwise the cursor is an offset
-    id_order = None if similar else _id_order(sort_spec)
-    keyset = "id" in cursor or id_order is not None
-    descending = cursor.get("desc", id_order == "desc")
+    # Without explicit sort (and without query/similarity scores), or with sort on _seq only, cursors use keyset
+    # pagination on the internal id, otherwise the cursor is an offset. A _seq request for a page number (page > 0)
+    # is an offset request in the same order; its next cursor is a keyset cursor again
+    seq_order = None if similar else _seq_order(sort_spec)
+    keyset = "id" in cursor or (seq_order is not None and "offset" not in cursor and page == 0)
+    descending = cursor.get("desc", seq_order == "desc")
     offset = cursor.get("offset", page * per_page)
     max_offset = get_settings().max_offset
-    if not keyset and max_offset and offset + per_page > max_offset:
+    if after is None and not keyset and max_offset and offset + per_page > max_offset:
         # A page deep in score (or field) order means sorting all hits up to that page and throwing most away: a page
-        # at offset 100,000 costs 20x a page by id. Elasticsearch has the same limit (max_result_window)
+        # at offset 100,000 costs 20x a page by id. Elasticsearch has the same limit (max_result_window). The limit is
+        # for page numbers only: a cursor (after) was issued by this server, and a download that follows the 'next'
+        # cursors of a query without sort (an offset cursor) must be able to finish
         raise ValueError(
             f"Cannot page beyond {max_offset} results in this order (offset {offset} + per_page {per_page}). "
-            'To retrieve all results, use "sort": "_id" with the "after" cursor, which is fast at any depth.'
+            'To retrieve all results, use "sort": "_seq" with the "after" cursor, which is fast at any depth.'
         )
 
     async with connection() as conn:
@@ -159,7 +163,7 @@ async def query_documents(
     total = cursor.get("total", result.total)
     next_cursor = None
     if len(result.results) == per_page:
-        if keyset or (after is None and not sort_spec and not similar and not queries):
+        if keyset or seq_order is not None or (after is None and not sort_spec and not similar and not queries):
             next_cursor = _encode_cursor({"id": result.last_id, "total": total, **({"desc": True} if descending else {})})
         else:
             next_cursor = _encode_cursor({"offset": offset + per_page, "total": total})

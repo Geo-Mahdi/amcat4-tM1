@@ -174,6 +174,10 @@ def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False) -
     )
 
 
+# The sort key for the internal id (the order in which documents were stored), which is paged with a keyset cursor
+SEQ = "_seq"
+
+
 @dataclass
 class SearchResult:
     total: int
@@ -210,8 +214,11 @@ def order_by(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "desc"]]] 
         elif name == "?":
             items.append(sql.SQL("random()"))
         elif name == "_id":
+            # the document id (doc_id), as before (the doc_id column is not in the search index, so all hits are read)
+            items.append(sql.SQL("documents.doc_id {}").format(direction))
+        elif name == SEQ:
             # the internal id: the order in which documents were stored. Same order as id-ordered (keyset) paging, and
-            # pg_search can use it for a fast Top-K scan (the doc_id column is not in the search index)
+            # pg_search can use it for a fast Top-K scan
             items.append(sql.SQL("documents.id {}").format(direction))
         else:
             if name not in fieldset.by_name:
@@ -240,7 +247,9 @@ def _needs_late_fetch(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "
     if "?" in names:  # random order: the second statement would give another order
         return False
     for name in names:
-        if name in ("_score", "_id") or name not in fieldset.by_name:
+        if name == "_id":  # the doc_id column, read for every hit like a json field
+            return True
+        if name in ("_score", SEQ) or name not in fieldset.by_name:
             continue
         if slot_sort_column(fieldset, name) is None:
             return True

@@ -51,6 +51,7 @@ async def _pages(index, per_page=7, **kwargs) -> list[str]:
 
 LISTINGS = [
     {},
+    {"sort": [{"_seq": SortSpec(order="desc")}]},
     {"sort": [{"_id": SortSpec(order="desc")}]},
     {"filters": {"_id": FilterSpec(values=["a1", "a5", "a7", "b1"])}},
 ]

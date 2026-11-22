@@ -55,13 +55,14 @@ SortType = Annotated[
         description=(
             "Sort results by a field. Can be a single field name, a list of field names, "
             'or a list of dictionaries specifying field and sort order. Use "?" for random order. '
-            'Use "_id" to get results in the order they were stored, with a cursor ("next") that stays fast at any '
-            "depth: the way to download all results of a query. Other orders can be paged up to a limit "
-            "(default 10,000 results)."
+            '"_id" sorts on the document id. Use "_seq" (alone) to get results in the order they were stored, with a '
+            'cursor ("next") that stays fast at any depth: the way to download all results of a query. Page numbers '
+            "(page) can be used up to a limit (default 10,000 results) in any order; the 'next' cursor has no limit."
         ),
         examples=[
             "date",
             "?",
+            "_seq",
             ["date", "title"],
             [{"date": {"order": "desc"}}, {"title": {"order": "asc"}}],
         ],
@@ -104,7 +105,8 @@ class QueryDocumentsBody(BaseModel):
         default=None,
         description=(
             "Cursor to get the next batch of results: the 'next' value from the meta of the previous result (send the "
-            "same query again). This is the efficient way to retrieve large result sets (without sort, or with sort '_id')."
+            "same query again). This is the efficient way to retrieve large result sets (without sort, or with sort "
+            "'_seq'). Cursors are not subject to the page depth limit."
         ),
     )
     highlight: bool = Field(default=False, description="If true, highlight fields.")

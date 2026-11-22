@@ -119,8 +119,9 @@ class Settings(BaseSettings):
         int,
         Field(
             description=(
-                "Maximum depth (offset + per_page) of offset paging in score or field order; deeper pages get HTTP 400, "
-                'with the advice to use "sort": "_id" (paging by id, fast at any depth). 0 = no limit'
+                "Maximum depth (offset + per_page) of a request for a page number (page); deeper pages get HTTP 400, "
+                'with the advice to use "sort": "_seq" (paging by id, fast at any depth). Cursors (after) that the '
+                "server issued are never limited. 0 = no limit"
             ),
         ),
     ] = 10000
