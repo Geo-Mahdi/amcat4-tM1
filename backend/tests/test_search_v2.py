@@ -1,18 +1,24 @@
 """
-Tests for the version 2 read paths: no parallel workers for API connections (AMCAT4_API_PARALLEL_WORKERS), the
-project and filters as unscored clauses (AMCAT4_FILTER_CLAUSES), paging by id and the offset limit (AMCAT4_MAX_OFFSET).
+Tests for the version 2 read paths:
+- no parallel workers for API connections (AMCAT4_API_PARALLEL_WORKERS)
+- the project and filters as unscored clauses (AMCAT4_FILTER_CLAUSES)
+- paging by id and the offset limit (AMCAT4_MAX_OFFSET)
+- one count, next to the page (AMCAT4_CAPPED_COUNT, AMCAT4_PARALLEL_COUNT)
 
 The fixtures come from test_fast_path.py: two projects in the same partition, with overlapping words and values.
 """
 
 # ruff: noqa: F811 (the fixtures are imported from test_fast_path)
 
+import asyncio
+
 import pytest
 
 from amcat4.config import Settings, get_settings
-from amcat4.connections import _api_options, server_defaults
+from amcat4.connections import _api_options, db, server_defaults
 from amcat4.models import FieldSpec, FilterSpec, Roles, SortSpec
-from amcat4.postgres.connection import fetch_one
+from amcat4.postgres import search as search_module
+from amcat4.postgres.connection import connection, fetch_one, spare_connection
 from amcat4.postgres.search import SearchQuery, compile_search
 from amcat4.projects.query import _decode_cursor, delete_query, query_documents, update_tag_query
 from amcat4.systemdata.fields import get_fieldset
@@ -218,3 +224,61 @@ async def test_max_offset(client, index, user, monkeypatch):
     assert sorted(seen) == list(range(50))
     monkeypatch.setattr(get_settings(), "max_offset", 0)  # 0 = no limit
     await post_json(client, url, user=user, json={**body, "page": 4}, expected=200)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("kwargs", SEARCH_SHAPES)
+async def test_single_count_equals_capped_count(two_projects, monkeypatch, kwargs):
+    """One count (default) and the two-step capped count (AMCAT4_CAPPED_COUNT) give the same totals"""
+    monkeypatch.setattr(search_module, "COUNT_STEP", 3)  # so the capped count needs its second step
+    a, b = two_projects
+    totals = []
+    for capped in (False, True):
+        monkeypatch.setattr(get_settings(), "capped_count", capped)
+        totals.append([(await _search(index, **kwargs))[0] for index in (a, b, [a, b])])
+    assert totals[0] == totals[1]
+
+
+@pytest.mark.anyio
+async def test_parallel_count_uses_second_connection(two_projects, monkeypatch):
+    """With a spare connection, the count runs next to the page on another connection; the total is the same"""
+    a, _ = two_projects
+    fs = await get_fieldset([a])
+    used = []
+    original = search_module.count
+
+    async def spy(conn, *args, **kwargs):
+        used.append(conn)
+        return await original(conn, *args, **kwargs)
+
+    monkeypatch.setattr(search_module, "count", spy)
+    query = SearchQuery(queries={"q": "common"})
+    totals = []
+    for parallel in (True, False):
+        monkeypatch.setattr(get_settings(), "parallel_count", parallel)
+        async with connection() as conn:
+            r = await search_module.search(conn, fs, query, ["pub"], per_page=5)
+            totals.append(r.total)
+            assert len(r.results) == 5
+            assert (used[-1] is not conn) == parallel
+    assert totals == [40, 40]
+
+
+@pytest.mark.anyio
+async def test_parallel_count_busy_pool(two_projects):
+    """When the pool has fewer than two free connections, the count runs after the page (and nothing waits)"""
+    a, _ = two_projects
+    fs = await get_fieldset([a])
+    pool = db()
+    async with connection() as conn:
+        for keep_free in (0, 1):
+            held = [await pool.getconn() for _ in range(pool.max_size - 1 - keep_free)]
+            try:
+                async with spare_connection() as spare:
+                    assert spare is None
+                coro = search_module.search(conn, fs, SearchQuery(queries={"q": "common"}), ["pub"], per_page=5)
+                r = await asyncio.wait_for(coro, timeout=5)
+                assert r.total == 40
+            finally:
+                for c in held:
+                    await pool.putconn(c)

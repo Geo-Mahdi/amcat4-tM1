@@ -95,6 +95,26 @@ class Settings(BaseSettings):
         ),
     ] = True
 
+    capped_count: Annotated[
+        bool,
+        Field(
+            description=(
+                "Count hits in two steps (first up to 1000 one by one, then in the index if there are more), as in "
+                "version 1. Default false: one count, which is cheaper without parallel workers (AMCAT4_CAPPED_COUNT)"
+            ),
+        ),
+    ] = False
+
+    parallel_count: Annotated[
+        bool,
+        Field(
+            description=(
+                "Count the hits of a search on a second connection while the page is fetched, if the pool has one to "
+                "spare (otherwise one after the other). AMCAT4_PARALLEL_COUNT=false: always one after the other"
+            ),
+        ),
+    ] = True
+
     max_offset: Annotated[
         int,
         Field(

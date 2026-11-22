@@ -6,6 +6,7 @@ A search is a single SQL query on the documents table. Everything that can be ex
 BM25 index. Remaining conditions are added as plain SQL.
 """
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -15,6 +16,7 @@ from psycopg.types.json import Jsonb
 
 from amcat4.config import get_settings
 from amcat4.models import FilterSpec, SnippetParams
+from amcat4.postgres.connection import spare_connection
 from amcat4.postgres.fields import FieldInfo, FieldSet, QueryError
 from amcat4.postgres.filters import compile_filters, field_sql
 from amcat4.postgres.layout import partition_table
@@ -202,9 +204,11 @@ def _needs_late_fetch(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "
     return False
 
 
-# Counting in two steps (fast path): pg_search's in-index count (Aggregate Scan) has a floor of about 7-12 ms but
-# hardly grows with the number of hits; counting the hits one by one is 2-3 ms for a few hundred hits but grows with
-# them. So first count at most COUNT_STEP + 1 hits one by one, and only if there are more, count inside the index.
+# Counting in two steps (fast path, only with AMCAT4_CAPPED_COUNT=true): pg_search's in-index count (Aggregate Scan)
+# had a floor of about 7-12 ms with parallel workers, while counting the hits one by one is 2-3 ms for a few hundred
+# hits but grows with them. So first count at most COUNT_STEP + 1 hits one by one, and only if there are more, count
+# inside the index. Without parallel workers (AMCAT4_API_PARALLEL_WORKERS=0) one full count takes 2-4 ms, so the
+# default is a single count, which saves a statement (about 2.4 ms of planning) for every search with more hits.
 # The result is always exact.
 COUNT_STEP = 1_000
 
@@ -222,7 +226,7 @@ async def count_at_most(conn: AsyncConnection, c: CompiledSearch, limit: int) ->
 
 async def count(conn: AsyncConnection, fieldset: FieldSet, query: SearchQuery) -> int:
     c = compile_search(fieldset, query, fast=True)
-    if c.fast:
+    if c.fast and get_settings().capped_count:
         n = await count_at_most(conn, c, COUNT_STEP)
         if n <= COUNT_STEP:
             return n
@@ -306,25 +310,47 @@ async def search(
     else:
         ordering = order_by(fieldset, sort, scored)
         offset = page * per_page if offset is None else offset
-    if get_settings().fast_path and not keyset and not similar and _needs_late_fetch(fieldset, sort):
-        # Late fetch: the sort is on a json field (not a sort slot), so pg_search cannot do a Top-K scan and every hit
-        # is read and sorted. Do that with only the internal id (no text, no snippets), then fetch the full rows of
-        # just this page with the same statement as below, restricted to these ids (same order, same columns).
-        cur = await conn.execute(
-            sql.SQL("SELECT documents.id FROM {} WHERE {} ORDER BY {} LIMIT %s OFFSET %s").format(c.table, where, ordering),
-            [*params, per_page, offset],
+    late_fetch = get_settings().fast_path and not keyset and not similar and _needs_late_fetch(fieldset, sort)
+
+    async def page_rows() -> list[dict]:
+        where_, params_, query_offset = where, list(params), offset
+        if late_fetch:
+            # Late fetch: the sort is on a json field (not a sort slot), so pg_search cannot do a Top-K scan and every
+            # hit is read and sorted. Do that with only the internal id (no text, no snippets), then fetch the full
+            # rows of just this page with the same statement as below, restricted to these ids (same order, columns).
+            cur = await conn.execute(
+                sql.SQL("SELECT documents.id FROM {} WHERE {} ORDER BY {} LIMIT %s OFFSET %s").format(
+                    c.table, where_, ordering
+                ),
+                [*params_, per_page, offset],
+            )
+            page_ids = [row["id"] for row in await cur.fetchall()]  # type: ignore[index, call-overload]
+            where_ = sql.SQL("{} AND documents.id = ANY(%s)").format(where_)
+            params_.append(page_ids)
+            query_offset = 0
+        stmt = sql.SQL("SELECT {} FROM {} {} WHERE {} ORDER BY {} LIMIT %s OFFSET %s").format(
+            sql.SQL(", ").join(columns), c.table, join, where_, ordering
         )
-        page_ids = [row["id"] for row in await cur.fetchall()]  # type: ignore[index, call-overload]
-        where = sql.SQL("{} AND documents.id = ANY(%s)").format(where)
-        params.append(page_ids)
-        query_offset = 0
+        cur = await conn.execute(stmt, [*params_, per_page, query_offset])
+        return await cur.fetchall()  # type: ignore[return-value]
+
+    counted: int | None = None
+    if with_total and get_settings().parallel_count:
+        # Count on a second connection while the page is fetched: the request then takes as long as the slower of the
+        # two, not the sum. Without a spare connection (busy pool), the count runs after the page as before.
+        async with spare_connection() as conn2:
+            if conn2 is None:
+                rows = await page_rows()
+            else:
+                # return_exceptions: wait for both, so no statement is still running when conn2 goes back to the pool
+                got_rows, got_count = await asyncio.gather(page_rows(), count(conn2, fieldset, query), return_exceptions=True)
+                if isinstance(got_rows, BaseException):
+                    raise got_rows
+                if isinstance(got_count, BaseException):
+                    raise got_count
+                rows, counted = got_rows, got_count
     else:
-        query_offset = offset
-    stmt = sql.SQL("SELECT {} FROM {} {} WHERE {} ORDER BY {} LIMIT %s OFFSET %s").format(
-        sql.SQL(", ").join(columns), c.table, join, where, ordering
-    )
-    cur = await conn.execute(stmt, [*params, per_page, query_offset])
-    rows = await cur.fetchall()
+        rows = await page_rows()
 
     # Patterns to find query matches for highlighting / snippets (combined with the positions reported by pg_search,
     # which does not report positions for all query types)
@@ -363,6 +389,8 @@ async def search(
     elif offset == 0 and after_id is None and not similar and len(rows) < per_page:
         # the first page is not full, so these are all the hits: no need to count
         total = len(rows)
+    elif counted is not None:
+        total = counted
     else:
         total = await count(conn, fieldset, query)
     last_id = rows[-1]["_internal_id"] if rows else None  # type: ignore[index, call-overload]
