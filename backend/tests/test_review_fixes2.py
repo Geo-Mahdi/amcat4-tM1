@@ -348,3 +348,41 @@ async def test_query_canceled_message(monkeypatch):
     assert await detail(await cancelled(timeout=False)) == "The query was cancelled on the database server; please try again"
     monkeypatch.setattr(get_settings(), "statement_timeout_ms", 0)
     assert "longer than 0" not in await detail(await cancelled(timeout=True))
+
+
+###################### 10. Top hits fall back to the parent table after a query error ######################
+
+
+@pytest.mark.anyio
+async def test_top_hits_fallback(two_projects, monkeypatch):  # noqa: F811
+    """
+    Top hits on the partition table had no fallback after a query or feature error (unlike the other aggregations);
+    now they fall back to the original statement, but raise a timeout or connection error at once
+    """
+    import psycopg
+
+    from amcat4.projects import aggregate as aggregate_module
+    from amcat4.projects.aggregate import Axis, TopHitsAggregation, query_aggregate
+    from tests.test_review_fixes import _failing
+
+    if not get_settings().fast_path:
+        pytest.skip("fast path switched off (AMCAT4_FAST_PATH=false)")
+    a, _ = two_projects
+
+    async def top_hits():
+        r = await query_aggregate(a, [Axis("pub")], [TopHitsAggregation(["pub"], n=2)])
+        return sorted(map(str, r.data))
+
+    expected = await top_hits()
+
+    def marker(text: str) -> bool:
+        return "row_number() OVER" in text and '"documents_p' in text
+
+    made = _failing(monkeypatch, aggregate_module, marker, psycopg.errors.InternalError_("not in the index"))
+    assert await top_hits() == expected
+    assert sum(c.failed for c in made) == 1
+    for error in (psycopg.errors.QueryCanceled("statement timeout"), psycopg.OperationalError("connection lost")):
+        made = _failing(monkeypatch, aggregate_module, marker, error)
+        with pytest.raises(type(error)):
+            await top_hits()
+        assert sum(c.failed for c in made) == 1

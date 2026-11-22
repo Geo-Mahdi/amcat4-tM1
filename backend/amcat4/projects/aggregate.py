@@ -236,7 +236,9 @@ def _hashable(v):
 
 async def _top_hits(fieldset: FieldSet, query: SearchQuery, axes: list[Axis], th: TopHitsAggregation) -> dict[tuple, list]:
     """Get the top n documents per bucket using a window function"""
-    # On the partition table when the fast path applies (c.table, always named "documents"), as the other read paths
+    # On the partition table when the fast path applies (c.table, always named "documents"), as the other read paths.
+    # As in _aggregate: if that fails with a query or feature error, the original statement on the parent table runs;
+    # a statement timeout or connection problem is raised at once (must_not_fall_back). Before, it had no fallback
     c = compile_search(fieldset, query, fast=True)
     selects, laterals, partition = [], [], []
     for i, axis in enumerate(axes):
@@ -259,11 +261,21 @@ async def _top_hits(fieldset: FieldSet, query: SearchQuery, axes: list[Axis], th
     window = sql.SQL("row_number() OVER (PARTITION BY {} ORDER BY {}) AS rn").format(
         sql.SQL(", ").join(partition) if partition else sql.SQL("true"), sql.SQL(", ").join(order)
     )
-    stmt = sql.SQL("SELECT * FROM (SELECT {}, documents.project_pk, {} FROM {} {} WHERE {}) t WHERE rn <= %s").format(
-        sql.SQL(", ").join(selects), window, c.table, sql.SQL(" ").join(laterals), c.where
-    )
+
+    def statement(c) -> sql.Composable:
+        return sql.SQL("SELECT * FROM (SELECT {}, documents.project_pk, {} FROM {} {} WHERE {}) t WHERE rn <= %s").format(
+            sql.SQL(", ").join(selects), window, c.table, sql.SQL(" ").join(laterals), c.where
+        )
+
     async with connection() as conn:
-        cur = await conn.execute(stmt, [*c.params, th.n])
+        try:
+            cur = await conn.execute(statement(c), [*c.params, th.n])
+        except psycopg.Error as e:
+            if not c.fast or must_not_fall_back(e):
+                raise
+            logging.warning(f"Top hits on the partition table failed, using the original SQL: {e}")
+            c = compile_search(fieldset, query)
+            cur = await conn.execute(statement(c), [*c.params, th.n])
         rows = await cur.fetchall()
     storage_axes = [StorageAxis(ax.field, ax.interval) for ax in axes]
     hits: dict[tuple, list] = {}
