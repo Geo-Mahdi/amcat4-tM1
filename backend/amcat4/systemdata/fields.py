@@ -135,11 +135,13 @@ def _standardize_createfields(fields: Mapping[str, FieldType | CreateDocumentFie
     return sfields
 
 
+@with_server_defaults
 async def create_fields(index: str, fields: Mapping[str, FieldType | CreateDocumentField]):
     """
     Create fields that do not exist yet. Existing fields must have the same type; their other settings are not changed.
     (For example, a scraper might include the field types in every upload request.)
     Use update_fields to change existing fields.
+    With the server's settings (no API statement timeout): a new unique field computes the hashes of all documents.
     """
     pk = await project_pk(index)
     current = await list_fields(index)

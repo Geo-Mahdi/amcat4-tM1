@@ -280,3 +280,27 @@ async def test_aggregate_fallbacks(two, monkeypatch, path):
         with pytest.raises(type(error)):
             await query_aggregate(a, [Axis(axis)])
         assert made[-1].failed == 1
+
+
+###################### 7. Long field writes with the server's settings ######################
+
+
+@pytest.mark.anyio
+async def test_create_unique_field_uses_server_defaults(two, monkeypatch):
+    """A new unique field hashes every document: on the work pool, without the API's statement timeout"""
+    from amcat4 import connections
+    from amcat4.systemdata import fields as fields_module
+
+    a, _ = two
+    seen = []
+    original = fields_module.update_dedup_hashes
+
+    async def spy(conn, *args, **kwargs):
+        seen.append(connections.db() is connections.CONNECTIONS.db_work)
+        return await original(conn, *args, **kwargs)
+
+    monkeypatch.setattr(fields_module, "update_dedup_hashes", spy)
+    from amcat4.models import CreateDocumentField
+
+    await fields_module.create_fields(a, {"u": CreateDocumentField(type="keyword", unique=True)})
+    assert seen == [True]
