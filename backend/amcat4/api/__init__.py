@@ -28,9 +28,10 @@ from amcat4.api.users import app_users
 from amcat4.auth.CSRFMiddleware import CSRFMiddleware
 from amcat4.auth.oauth import MAX_AGE_SESSION
 from amcat4.config import get_settings
-from amcat4.connections import amcat_connections
+from amcat4.connections import amcat_connections, server_defaults
 from amcat4.errors import ConflictError, NotFoundError
 from amcat4.projects.jobs import job_worker
+from amcat4.projects.maintenance import prewarm_indexes
 from amcat4.systemdata.manage import create_or_update_systemdata
 
 
@@ -40,12 +41,21 @@ async def lifespan(app: FastAPI):
     async with amcat_connections():
         await create_or_update_systemdata()
         worker = asyncio.create_task(job_worker())
+        prewarm = asyncio.create_task(_prewarm()) if get_settings().prewarm else None
         try:
             yield
         finally:
-            worker.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await worker
+            for task in (worker, prewarm):
+                if task is not None:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+
+
+async def _prewarm() -> None:
+    # with the server's settings (no API statement timeout): loading a large index takes a while
+    with server_defaults():
+        await prewarm_indexes()
 
 
 app = FastAPI(

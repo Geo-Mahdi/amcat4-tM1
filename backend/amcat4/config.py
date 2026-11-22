@@ -169,6 +169,27 @@ class Settings(BaseSettings):
         ),
     ] = 10000
 
+    vacuum_after_rows: Annotated[
+        int,
+        Field(
+            description=(
+                "After an upload, update or delete (by query) that changed at least this many documents of a partition "
+                "(also counted over several smaller uploads), VACUUM (ANALYZE) the partition in a background job, so "
+                "counts can use the visibility map. 0 = off (leave it to autovacuum)"
+            ),
+        ),
+    ] = 10000
+
+    prewarm: Annotated[
+        bool,
+        Field(
+            description=(
+                "At startup, load the search indexes into postgres' cache with pg_prewarm (in the background; skipped "
+                "with a warning if the extension is not available)"
+            ),
+        ),
+    ] = False
+
     custom_plans: Annotated[
         bool,
         Field(

@@ -412,6 +412,7 @@ HANDLERS: dict[str, Callable[[Job], Awaitable[dict[str, Any]]]] = {
     "fill_sort_slot": _fill_sort_slot_job,
     "backfill_quarter": _backfill_quarter_job,
     "reindex": maintenance.reindex_job,
+    "vacuum": maintenance.vacuum_job,
 }
 
 PERIODIC: dict[str, PeriodicTask] = {

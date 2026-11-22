@@ -13,6 +13,7 @@ from amcat4.models import FieldSpec, FilterSpec, SnippetParams, SortSpec
 from amcat4.postgres import documents as storage
 from amcat4.postgres.connection import connection
 from amcat4.postgres.search import SearchQuery, search
+from amcat4.projects.maintenance import vacuum_soon
 from amcat4.systemdata.fields import create_or_verify_tag_field, get_fieldset
 
 
@@ -184,6 +185,7 @@ async def update_tag_query(
 
         total = await count(conn, fieldset, query)
         updated = await storage.update_tag_by_query(conn, fieldset, query, field, tag, action)
+    await vacuum_soon(fieldset.partitions.values(), updated)
     return dict(updated=updated, total=total)
 
 
@@ -201,6 +203,7 @@ async def update_query(
         raise ValueError(f"Field {field} does not exist")
     async with connection() as conn:
         updated = await storage.update_by_query(conn, fieldset, _search_query(queries, filters, ids), field, value)
+    await vacuum_soon(fieldset.partitions.values(), updated)
     return dict(updated=updated, total=updated)
 
 
@@ -214,4 +217,5 @@ async def delete_query(
     fieldset = await get_fieldset(index)
     async with connection() as conn:
         deleted = await storage.delete_by_query(conn, fieldset, _search_query(queries, filters, ids))
+    await vacuum_soon(fieldset.partitions.values(), deleted)
     return dict(updated=deleted, total=deleted)

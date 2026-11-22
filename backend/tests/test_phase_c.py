@@ -3,6 +3,7 @@ Tests for the version 2 changes that come with migration 0002:
 - listing without a query over the B-tree index (AMCAT4_BTREE_LISTING)
 - the five extra sort slots, filling them in a job for large projects (AMCAT4_SORT_SLOT_JOB_ROWS), Top-K sorting
 - the derived quarter key of date fields, and its backfill job for older documents (AMCAT4_QUARTER_KEY)
+- vacuum after large changes (AMCAT4_VACUUM_AFTER_ROWS) and prewarming the search indexes (AMCAT4_PREWARM)
 
 The fixtures come from test_fast_path.py: two projects in the same partition, with overlapping words and values.
 """
@@ -18,16 +19,17 @@ from amcat4.config import get_settings
 from amcat4.models import FilterSpec, ProjectSettings, SortSpec, UpdateDocumentField
 from amcat4.postgres import index_aggregate
 from amcat4.postgres import search as search_module
-from amcat4.postgres.connection import connection, fetch_all
+from amcat4.postgres.connection import connection, execute, fetch_all
 from amcat4.postgres.fields import normalize_date, quarter_sql
+from amcat4.postgres.layout import list_partitions, partition_of
 from amcat4.postgres.projects import project_pk
 from amcat4.postgres.search import SearchQuery, compile_search, order_by
 from amcat4.projects import aggregate as aggregate_module
-from amcat4.projects import jobs
+from amcat4.projects import jobs, maintenance
 from amcat4.projects.aggregate import Aggregation, Axis, query_aggregate
 from amcat4.projects.documents import create_or_update_documents
 from amcat4.projects.index import create_project_index, delete_project_index
-from amcat4.projects.query import query_documents
+from amcat4.projects.query import delete_query, query_documents, update_tag_query
 from amcat4.systemdata.fields import field_infos, get_fieldset, list_fields, update_fields
 from tests.conftest import upload
 from tests.test_fast_path import _same_partition, two_projects  # noqa: F401
@@ -453,3 +455,50 @@ async def test_quarter_backfill(quarter_project, monkeypatch):
     assert (await field_infos(p))["date"].quarter_ready
     assert await _quarter_aggs(p) == expected_aggs
     await fetch_all("DELETE FROM jobs WHERE type = 'backfill_quarter' RETURNING id")
+
+
+################ vacuum and prewarm ################
+
+
+async def _vacuum_jobs() -> list[dict]:
+    return await fetch_all("SELECT status, params, result FROM jobs WHERE type = 'vacuum' ORDER BY created_at")
+
+
+@pytest.mark.anyio
+async def test_vacuum_after_large_changes(slot_project, monkeypatch):
+    p = slot_project
+    await fetch_all("DELETE FROM jobs WHERE type = 'vacuum' RETURNING id")
+    monkeypatch.setattr(get_settings(), "vacuum_after_rows", 30)
+    async with connection() as conn:
+        partition_id = await partition_of(conn, await project_pk(p))
+    # a small change: no vacuum (unless the statistics say the partition changed a lot: vacuum it first)
+    await execute(sql.SQL("VACUUM {}").format(sql.Identifier(f"documents_p{partition_id}")))  # type: ignore[arg-type]
+    await update_tag_query(p, "add", "tags", "small", ids=["d1", "d2"])
+    assert await _vacuum_jobs() == []
+    # a large one: a vacuum job for the partition, only one while it is pending
+    await update_tag_query(p, "add", "tags", "large")
+    await delete_query(p, ids=[f"d{i}" for i in range(31)])
+    [job] = await _vacuum_jobs()
+    assert job["status"] == "pending" and job["params"] == {"partition_id": partition_id}
+    await jobs.run_pending_jobs()
+    [job] = await _vacuum_jobs()
+    assert job["status"] == "done" and job["result"]["table"] == f"documents_p{partition_id}"
+    row = await fetch_all(
+        "SELECT last_vacuum IS NOT NULL AS v FROM pg_stat_user_tables WHERE relid = to_regclass(%s)",
+        [f"documents_p{partition_id}"],
+    )
+    assert row[0]["v"]
+    # switched off: never
+    monkeypatch.setattr(get_settings(), "vacuum_after_rows", 0)
+    await update_tag_query(p, "add", "tags", "again")
+    assert len(await _vacuum_jobs()) == 1
+    await fetch_all("DELETE FROM jobs WHERE type = 'vacuum' RETURNING id")
+
+
+@pytest.mark.anyio
+async def test_prewarm(slot_project):
+    loaded = await maintenance.prewarm_indexes()
+    async with connection() as conn:
+        partitions = await list_partitions(conn)
+    # (if the server has no pg_prewarm, nothing is loaded, without an error)
+    assert loaded in ([], [p["index"] for p in partitions])

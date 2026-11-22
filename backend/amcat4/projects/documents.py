@@ -10,7 +10,8 @@ from amcat4.postgres import documents as storage
 from amcat4.postgres.connection import connection
 from amcat4.postgres.documents import OpType, UploadError
 from amcat4.postgres.layout import project_filter
-from amcat4.postgres.projects import project_pk
+from amcat4.postgres.projects import project_partitions, project_pk
+from amcat4.projects.maintenance import vacuum_soon
 from amcat4.systemdata.fields import create_fields, field_infos
 
 
@@ -45,16 +46,17 @@ async def create_or_update_documents(
     infos = await field_infos(index)
     try:
         async with connection() as conn:
-            return await storage.upload_documents(conn, pk, documents, infos, op_type)
+            result = await storage.upload_documents(conn, pk, documents, infos, op_type)
     except UniqueViolation:
         # Another upload of (some of) the same documents committed between our duplicate check and our insert.
         # Retrying once sees those documents and updates (or, for op_type create, reports) them.
-        pass
-    try:
-        async with connection() as conn:
-            return await storage.upload_documents(conn, pk, documents, infos, op_type)
-    except UniqueViolation as e:
-        raise UploadError("The same documents are being uploaded concurrently; please try again") from e
+        try:
+            async with connection() as conn:
+                result = await storage.upload_documents(conn, pk, documents, infos, op_type)
+        except UniqueViolation as e:
+            raise UploadError("The same documents are being uploaded concurrently; please try again") from e
+    await vacuum_soon((await project_partitions([pk])).values(), result["created"] + result["updated"])
+    return result
 
 
 async def fetch_document(index: str, doc_id: str, _source: str | list[str] | None = None) -> dict:

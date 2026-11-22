@@ -20,9 +20,13 @@ If a partition needs a rebuild and has been quiet for QUIET_PERIOD (or has neede
 that are never quiet), it creates a reindex job. Only one reindex job exists at a time.
 """
 
+import logging
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
+from psycopg import sql
+
+from amcat4.config import get_settings
 from amcat4.postgres.connection import connection, fetch_all, fetch_one
 from amcat4.postgres.layout import (
     drop_reindex_leftovers,
@@ -30,6 +34,7 @@ from amcat4.postgres.layout import (
     index_segments,
     list_partitions,
     partition_changes,
+    partition_table,
     reindex,
 )
 
@@ -126,3 +131,74 @@ async def reindex_job(job: "Job") -> dict:
         "segments_after": after["segments"],
         "deleted_before": before["deleted"],
     }
+
+
+###################### VACUUM AND PREWARM ######################
+#
+# The fast count (and other in-index shortcuts of pg_search) skip the visibility check for pages that the visibility
+# map marks as all-visible, and that map is only updated by VACUUM. Autovacuum starts late on big tables (by default
+# after 20% of the rows changed), so after a large upload or update by query, counts can be slow (measured: on a
+# freshly vacuumed table, all segments were skipped). So after large changes we vacuum the partition ourselves, in a
+# job (VACUUM cannot run in a transaction, and takes a while on big partitions; requests do not wait for it).
+
+
+async def vacuum_soon(partition_ids: Iterable[int], changed_rows: int = 0) -> None:
+    """
+    After a write: create a vacuum job for each partition that changed a lot since its last vacuum (at least
+    vacuum_after_rows rows: this change, or inserted plus dead rows according to postgres' statistics, which also
+    catches many small uploads). Never raises: a write must not fail because of this.
+    """
+    threshold = get_settings().vacuum_after_rows
+    if threshold <= 0:
+        return
+    from amcat4.projects.jobs import create_job
+
+    try:
+        for pid in set(partition_ids):
+            if changed_rows < threshold:
+                row = await fetch_one(
+                    """SELECT n_ins_since_vacuum + n_dead_tup AS changed FROM pg_stat_user_tables
+                       WHERE relid = to_regclass(%s)""",
+                    [partition_table(pid)],
+                )
+                if row is None or row["changed"] < threshold:
+                    continue
+            if await fetch_one(
+                """SELECT 1 FROM jobs
+                   WHERE type = 'vacuum' AND status IN ('pending', 'running') AND params->>'partition_id' = %s""",
+                [str(pid)],
+            ):
+                continue
+            await create_job("vacuum", None, None, {"partition_id": pid})
+    except Exception:
+        logging.exception("Could not schedule a vacuum")
+
+
+async def vacuum_job(job: "Job") -> dict:
+    """Job: VACUUM (ANALYZE) a documents partition (params: partition_id)"""
+    table = partition_table(job.params["partition_id"])
+    started = datetime.now(UTC)
+    async with connection() as conn:
+        await conn.execute(sql.SQL("VACUUM (ANALYZE) {}").format(sql.Identifier(table)))
+    return {"table": table, "seconds": round((datetime.now(UTC) - started).total_seconds(), 1)}
+
+
+async def prewarm_indexes() -> list[str]:
+    """
+    Load the search indexes of all partitions into postgres' cache (pg_prewarm), so the first searches after a restart
+    are not slow. Needs the pg_prewarm extension (created if possible). Never raises. Returns the indexes loaded.
+    """
+    loaded = []
+    try:
+        async with connection() as conn:
+            cur = await conn.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_prewarm'")
+            if await cur.fetchone() is None:
+                await conn.execute("CREATE EXTENSION IF NOT EXISTS pg_prewarm")
+            for p in await list_partitions(conn):
+                await conn.execute("SELECT pg_prewarm(%s::regclass)", [p["index"]])
+                loaded.append(p["index"])
+    except Exception as e:
+        logging.warning(f"Could not prewarm the search indexes ({e}); continuing without")
+    else:
+        logging.info(f"Prewarmed search indexes: {', '.join(loaded)}")
+    return loaded

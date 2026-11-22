@@ -82,6 +82,15 @@ def index_paths_everywhere(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_automatic_vacuum(monkeypatch):
+    """
+    Writes can create vacuum jobs (AMCAT4_VACUUM_AFTER_ROWS), which would show up in tests that count or run the
+    pending jobs. The tests of that feature (test_phase_c.py) switch it on themselves.
+    """
+    monkeypatch.setattr(get_settings(), "vacuum_after_rows", 0)
+
+
+@pytest.fixture(autouse=True)
 def mock_middlecat(httpx_mock):
     get_settings().middlecat_url = "http://mock_middlecat.net"
     get_settings().host = "http://localhost:3000"
