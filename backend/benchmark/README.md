@@ -6,6 +6,10 @@ BM25 full-text search and [pgvector](https://github.com/pgvector/pgvector) for v
 PostgreSQL 18.6 and pg_search 0.26.0 (the benchmark below); the test suite also runs on pg_search 0.27.0, the
 version the deploy files now use.
 
+The numbers and open issues below describe the code of the original branch (bb35e43a). The later changes on this branch
+(settings `AMCAT4_FAST_PATH`, `AMCAT4_FILTER_CLAUSES` and others) are listed in `POSTGRES_FAST_PATHS.md`; where one of them
+changes a statement below, a note says so. The benchmark itself was not rerun on the later code.
+
 The database code is in `amcat4/postgres/` (with the design in `layout.py`); the business logic in `amcat4/projects/`
 and `amcat4/systemdata/` uses it. The tables are defined by the (alembic) migrations in `amcat4/migrations/versions/`,
 which are run at startup.
@@ -147,7 +151,7 @@ Other operations:
   a common term, sorting everything, aggregating the whole project) take ~100-250 ms in a single process; tag
   aggregations (done in SQL) ~350 ms.
 - **Reindexing after uploads matters most.** Every upload batch becomes its own index *segment*, and pg_search does
-  not merge them (`VACUUM` doesn't either): after uploading there were 240 segments of at most 5000 documents, and
+  not merge them with pg_search 0.26.0 (`VACUUM` doesn't either; 0.27.0 does, see open issues): after uploading there were 240 segments of at most 5000 documents, and
   searches have to visit all of them. A reindex builds ~30 large segments, which makes most searches 2-3x faster
   (e.g. 21 -> 6 ms in a small project). It is cheap (7 s for 1M documents, online) but makes the index ~20% larger.
 - **A mass update does not make searches much slower** (the updated documents are added as a few large segments),
@@ -174,7 +178,8 @@ Other operations:
   partition has been quiet for 15 minutes (or after 24 hours if it never is), one partition at a time
   (`amcat4/projects/maintenance.py`). On 0.27 the segment trigger rarely fires; a running merge counts as activity.
 - Aggregations are grouped by postgres, which reads the values from the table: pg_search can't group on json keys
-  inside the index. Fine for now (~200 ms for 500k documents), but the standard `date` and `source` columns could probably be
+  inside the index. (Later changed: with `AMCAT4_FAST_PATH` on, tags, quarters, metrics and nested axes are
+  aggregated inside the index with `pdb.agg`, see `POSTGRES_FAST_PATHS.md`.) Fine for now (~200 ms for 500k documents), but the standard `date` and `source` columns could probably be
   grouped inside the index, which would make overviews across projects fast.
 - Once, an update by query directly after `REINDEX INDEX CONCURRENTLY` (with autovacuum running) took more than 10
   minutes before it was cancelled; it took 2 s when repeated. Not reproduced; keep an eye on this.

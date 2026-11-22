@@ -439,6 +439,10 @@ async def _make_claimable(job_id: str) -> None:
 
 @pytest.mark.anyio
 async def test_fill_and_backfill_jobs_wait_for_a_move(moving_projects, monkeypatch):
+    """
+    Fill and backfill jobs met a project move and failed for good (and a failed backfill was never scheduled again).
+    Now they are postponed while the project moves and run after it
+    """
     from amcat4.postgres.connection import connection, fetch_all
     from amcat4.postgres.projects import project_pk
     from amcat4.projects import jobs

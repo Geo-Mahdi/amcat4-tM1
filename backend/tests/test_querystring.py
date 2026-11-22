@@ -74,6 +74,10 @@ async def test_compile_default_fields_and_visibility():
 
 
 async def test_compile_leaves():
+    """
+    A prefix is compiled with max_expansions set to the maximum: pg_search expands only the first 50 terms per segment
+    by default, so broad prefixes (pol*) silently missed most documents
+    """
     fs = fieldset()
     assert query_string_to_json("title:immigr*", fs) == {
         "phrase_prefix": {"field": "text_fields.f1", "phrases": ["immigr"], "max_expansions": PREFIX_MAX_EXPANSIONS}
@@ -124,6 +128,10 @@ async def test_proximity_highlight():
 
 
 async def test_phrase_wildcards():
+    """
+    A prefix at the end of a phrase keeps a bound (PHRASE_PREFIX_MAX_EXPANSIONS) because it is much more expensive per
+    expansion; a prefix in a proximity phrase is refused
+    """
     fs = FieldSet({1: FIELDS})
     assert query_string_to_json('title:"quick fo*"', fs) == {
         "phrase_prefix": {

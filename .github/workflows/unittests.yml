@@ -19,6 +19,7 @@ jobs:
 
     services:
       postgres:
+        # pinned (not :latest): the tests and the server code assume this pg_search version (0.26.0 also works)
         image: paradedb/paradedb:0.27.0-pg18
         env:
           POSTGRES_USER: amcat

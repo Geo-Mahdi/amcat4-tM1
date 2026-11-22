@@ -7,7 +7,8 @@ from psycopg_pool import PoolTimeout
 
 from amcat4.connections import db
 
-# How long to wait for a spare connection before running the statement after the other one instead
+# How long to wait for a spare connection (seconds) before running the statement after the other one instead.
+# Short on purpose: waiting longer would cost more than the parallel count saves
 SPARE_TIMEOUT = 0.2
 
 
@@ -28,9 +29,12 @@ async def spare_connection() -> AsyncGenerator[AsyncConnection | None, None]:
     a search), or None if the pool has none to spare. The caller already holds a connection, so asking for a second
     one could wait for itself on a busy pool: we only take one when at least two are free (idle, or room to open
     one), nobody is waiting, and only for SPARE_TIMEOUT. Otherwise the caller runs its statements one after the other.
+    The caller must await both statements before leaving the block, so the connection is never returned while busy.
+    Used for settings.parallel_count (a common word: 8.0 ms -> 4.9 ms per search, not measured under concurrent load).
     """
     pool = db()
     stats = pool.get_stats()
+    # idle connections, plus the connections the pool may still open
     free = stats.get("pool_available", 0) + pool.max_size - stats.get("pool_size", 0)
     conn = None
     if free >= 2 and not stats.get("requests_waiting", 0):
@@ -70,6 +74,7 @@ def must_not_fall_back(e: BaseException) -> bool:
     timeout, QueryCanceled, which psycopg classes as OperationalError), or there is a problem with the connection or
     the server (OperationalError, e.g. a lost connection, admin shutdown, out of memory, lock timeout; InterfaceError:
     the client side). A fallback would only run longer, or fail again. Fallbacks are for query and feature errors
-    (e.g. a shape pg_search cannot handle in its index).
+    (e.g. a shape pg_search cannot handle in its index). Before this, a request that had used up its statement timeout
+    ran a second, slower statement.
     """
     return isinstance(e, (psycopg.OperationalError, psycopg.InterfaceError))

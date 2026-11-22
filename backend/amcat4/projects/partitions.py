@@ -3,11 +3,13 @@ Moving a (big) project to a documents partition of its own.
 
 Projects share partitions (see amcat4.postgres.layout). A big project in a shared partition is slower than it needs
 to be (whole-project counts and aggregations go through the other projects' index entries: measured for 2.68 M
-documents next to 10.7 M others, aggregation 14.5 ms shared against 6.2 ms alone), its relevance scores depend on the
+documents next to 10.7 M others, whole-project aggregation 14.5 ms shared against 6.2 ms alone, count 3.4 ms against
+1.3 ms; searches gain little), its relevance scores depend on the
 other projects, and its index cannot be rebuilt on its own. Moving it gives it its own partition and search index.
 
-Setting projects.partition_id moves all documents in one statement: one huge transaction that locks every document
-of the project until the end. The move_project job moves them in batches instead (migration 0003 lets a project's
+The original layout foresaw this move, as an update of projects.partition_id. That moves all documents in one
+statement (still possible, see migration 0003): one huge transaction that locks every document of the project until
+the end. The move_project job moves them in batches instead (migration 0003 lets a project's
 documents be in two partitions):
 1. create a new partition, register it in project_partitions, set projects.moving_to and own_partition, and store
    the target in the job's progress (one transaction, so a resumed job never creates a second partition). This waits
@@ -21,7 +23,8 @@ Reads are never blocked. During the move, the relevance scores mix the statistic
 paths (which need a single partition) are not used. Afterwards the old partition has deleted documents in its index,
 which the automatic maintenance cleans up (a rebuild), and both partitions get a vacuum job.
 
-Start it with `amcat4 move-project --project <id>` (an admin command; the job worker of the server runs it).
+Start it with `amcat4 move-project --project <id>` (an admin command; the job worker of the server runs it, or with
+--now the command itself). A move is refused while the project has unfinished jobs (start_move).
 """
 
 import logging
@@ -35,11 +38,15 @@ from amcat4.postgres.layout import _PARTITION_LOCK, create_partition, lock_write
 if TYPE_CHECKING:
     from amcat4.projects.jobs import Job
 
+# Documents per transaction in step 2: each batch is a short transaction (rows locked only until its commit)
 MOVE_BATCH_SIZE = 10_000
 
 
 async def start_move(project: str, created_by: str | None = None) -> dict:
-    """Create a move_project job for this project (ValueError if it cannot be moved now)"""
+    """
+    Create a move_project job for this project (ValueError if it cannot be moved now: it does not exist, is already
+    being moved, already has a partition of its own, or has jobs that are not done yet).
+    """
     from amcat4.projects.jobs import create_job
 
     row = await fetch_one("SELECT pk, partition_id, moving_to, own_partition FROM projects WHERE id = %s", [project])
@@ -81,6 +88,8 @@ async def move_project_job(job: "Job") -> dict[str, Any]:
                 await lock_writes(conn, project)  # wait for running writes; new ones wait until moving_to is set
                 try:
                     async with conn.transaction():
+                        # the lock of assign_partition: the two never create a partition with the same id, and a new
+                        # project is not assigned to this one (it sees moving_to once this commits)
                         await conn.execute("SELECT pg_advisory_xact_lock(%s)", [_PARTITION_LOCK])
                         target = await next_partition_id(conn)
                         await create_partition(conn, target, lock_timeout="30s")
@@ -103,6 +112,8 @@ async def move_project_job(job: "Job") -> dict[str, Any]:
 
     while True:
         async with connection() as conn:
+            # the next batch in id order (over the B-tree index of migration 0002); moving a row changes its partition,
+            # so the documents left in the source are exactly those still to move (no progress needed to resume)
             cur = await conn.execute(
                 """WITH batch AS (SELECT id FROM documents WHERE partition_id = %s AND project_pk = %s ORDER BY id LIMIT %s)
                    UPDATE documents d SET partition_id = %s FROM batch
@@ -118,9 +129,11 @@ async def move_project_job(job: "Job") -> dict[str, Any]:
         cur = await conn.execute(
             "SELECT count(*) AS n FROM documents WHERE partition_id = %s AND project_pk = %s", [source, project]
         )
+        # (writes are refused during the move, so this is only a safety check before the switch)
         if (await cur.fetchone())["n"]:  # type: ignore[index]
             raise RuntimeError("Documents were added to the old partition during the move")
         # (the trigger on projects moves nothing now, and removes the old partition from project_partitions)
         await conn.execute("UPDATE projects SET partition_id = %s, moving_to = NULL WHERE pk = %s", [target, project])
+    # both partitions changed a lot: the source has dead rows, the target new ones (see maintenance, VACUUM)
     await vacuum_soon([source, target], job.progress["moved"])
     return {"source": partition_table(source), "target": partition_table(target), "moved": job.progress["moved"]}

@@ -74,7 +74,10 @@ async def delete_all_project_fields(index: str):
 
 @with_server_defaults
 async def delete_fields(index: str, names: list[str]) -> None:
-    """Delete fields and their values from all documents of the project"""
+    """
+    Delete fields and their values from all documents of the project.
+    With the server's settings (the work pool, no API statement timeout): this rewrites every document of the project.
+    """
     pk = await project_pk(index)
     infos = await field_infos(index)
     missing = [n for n in names if n not in infos]
@@ -117,6 +120,8 @@ async def get_fieldset(indices: str | list[str], queryable: set[str] | None = No
     project_fields: dict[int, dict[str, FieldInfo]] = {pk: {} for pk in pks.values()}
     for row in rows:
         project_fields[row["project_pk"]][row["name"]] = field_info_from_row(row)
+    # partition and move target in one statement (one snapshot): read separately, a move that finished in between
+    # made the request search only the old, by then empty, partition
     partitions, moving = await project_layout(list(pks.values()))
     return FieldSet(project_fields, queryable=queryable, partitions=partitions, moving=moving)
 
@@ -198,6 +203,8 @@ async def create_fields(index: str, fields: Mapping[str, FieldType | CreateDocum
 async def update_fields(index: str, fields: dict[str, UpdateDocumentField]):
     """
     Update field settings. Changing the type converts the existing values (or raises an error, changing nothing).
+    With the server's settings (the work pool, no API statement timeout): a type conversion or a sort slot rewrites
+    the documents of the project.
     """
     pk = await project_pk(index)
     rows = {row["name"]: row for row in await _field_rows(index)}
@@ -221,7 +228,7 @@ async def update_fields(index: str, fields: dict[str, UpdateDocumentField]):
                     if info.sort_slot and info.sort_slot not in sort_slots_for_type(update.type):
                         await _set_sort_slot(conn, pk, info, False)
                         settings["sort_slot"] = None
-                        info = FieldInfo(pk=info.pk, name=info.name, type=info.type, unique=info.unique)
+                        info = FieldInfo(pk=info.pk, name=info.name, type=info.type, unique=info.unique)  # (no slot now)
                     # A slot of the same kind is kept as it is: within a kind the converted values are the same (keyword
                     # and url are the same string, integer and number the same number)
                     info = FieldInfo(
@@ -291,6 +298,7 @@ async def _set_sort_slot(conn, project: int, f: FieldInfo, fast_sort: bool) -> N
     """
     if not fast_sort:
         if f.sort_slot:
+            # (sort_slot_ready goes back to its default: it only matters for a field that has a slot)
             await conn.execute("UPDATE fields SET sort_slot = NULL, sort_slot_ready = true WHERE pk = %s", [f.pk])
             await _fill_slot(conn, project, f.sort_slot, None)
         return
@@ -312,6 +320,9 @@ async def _set_sort_slot(conn, project: int, f: FieldInfo, fast_sort: bool) -> N
             f"No free sort slot for {f.type} field {f.name}: all slots for {f.type} fields are in use: {taken}. "
             "Set fast_sort to false for one of these fields first."
         )
+    # Reserve the slot at once, not ready: from now on writes fill it, but sorting and the API do not use it until
+    # every document has its value. UNIQUE (project_pk, sort_slot) of 0001 catches a concurrent request that took
+    # the same slot, which is reported as a clear error (the savepoint contains the failed statement).
     try:
         async with conn.transaction():  # (a savepoint)
             await conn.execute("UPDATE fields SET sort_slot = %s, sort_slot_ready = false WHERE pk = %s", [free[0], f.pk])
@@ -337,6 +348,7 @@ async def _fill_slot(conn, project: int, slot: str, f: FieldInfo | None) -> None
     documents: a background job (fill_sort_slot) that does it in batches, because it rewrites every document with a
     value (and indexes it again); until it is done, the field is not sorted on the slot (sort_slot_ready).
     """
+    # AMCAT4_SORT_SLOT_JOB_ROWS: -1 = always here, in the request, as in the original; 0 = always a job
     job_rows = get_settings().sort_slot_job_rows
     small = job_rows < 0 or await project_size_at_most(conn, project, job_rows)
     # a fill job for this slot may still be running (e.g. after the project grew): then this becomes a job too

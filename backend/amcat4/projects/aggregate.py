@@ -20,7 +20,9 @@ from amcat4.postgres.index_aggregate import index_aggregate
 from amcat4.postgres.search import SearchQuery, compile_search, count_at_most
 from amcat4.systemdata.fields import get_fieldset
 
-# Aggregations over at most this many hits use the plain SQL statement (faster for small results)
+# Aggregations over at most this many hits use the original GROUP BY on the parent table, without the in-index paths:
+# those cost at least 10 to 25 ms whatever the number of hits, while GROUP BY over a few hundred rows is faster.
+# (Counting up to this limit first is cheap: it stops at SMALL_RESULT + 1 hits.)
 SMALL_RESULT = 1_000
 
 # Maximum number of rows (buckets) that can be requested
@@ -149,7 +151,20 @@ async def _aggregate(
     axes: list[Axis],
     aggregations: list[Aggregation | TopHitsAggregation],
 ) -> list[tuple]:
-    """Run an aggregation (without _query axis). Returns rows of (axis values..., count, aggregation values...)"""
+    """
+    Run an aggregation (without _query axis). Returns rows of (axis values..., count, aggregation values...)
+
+    Unlike the original (one GROUP BY on the parent table), the first of these that applies is used:
+    1. no fast path (projects in several partitions, a project being moved, a filter on document ids,
+       AMCAT4_FAST_PATH=false), or at most SMALL_RESULT hits: the original GROUP BY on the parent table;
+    2. pdb.agg inside the BM25 index of the one partition (amcat4.postgres.index_aggregate), for the shapes it handles;
+    3. the same GROUP BY on the partition table, which pg_search can partly do inside the index;
+    4. if 3 fails with a query or feature error: the original GROUP BY on the parent table.
+    All give the same rows. Measured: a whole-project aggregation on the partition table took 37 ms against 1,640 ms on
+    the parent (2.7 M documents, pg_search 0.26); pdb.agg takes 30-50 ms per million documents for tag, quarter and
+    metric axes, where GROUP BY fetches every row (0.6-0.8 s per million).
+    A statement timeout or connection problem is raised at once, without a slower second statement.
+    """
     c = compile_search(fieldset, query, fast=True)
     selects: list[sql.Composable] = []
     laterals: list[sql.Composable] = []
@@ -174,7 +189,7 @@ async def _aggregate(
 
     async with connection() as conn:
         if c.fast and await count_at_most(conn, c, SMALL_RESULT) <= SMALL_RESULT:
-            # In-index aggregation has a floor of 10-25 ms; for a few hundred hits the plain statement is faster
+            # In-index aggregation has a floor of 10-25 ms; for a few hundred hits the original statement is faster
             c = compile_search(fieldset, query)
         # In-index aggregation with pdb.agg where possible (returns None for shapes it does not handle)
         rows = await index_aggregate(conn, c.table, c.where, c.params, fieldset, axes, metrics) if c.fast else None
@@ -183,7 +198,7 @@ async def _aggregate(
                 cur = await conn.execute(statement(c), c.params)
             except psycopg.Error as e:
                 if not c.fast or must_not_fall_back(e):
-                    raise
+                    raise  # (a timed out request must not run a second, slower statement)
                 # The in-index GROUP BY has limits (e.g. at most paradedb.max_term_agg_buckets = 65,000 groups, an
                 # error rather than a silent cut). The original statement on the parent table has none of these.
                 logging.warning(f"In-index aggregation failed, using the original SQL: {e}")
@@ -221,6 +236,7 @@ def _hashable(v):
 
 async def _top_hits(fieldset: FieldSet, query: SearchQuery, axes: list[Axis], th: TopHitsAggregation) -> dict[tuple, list]:
     """Get the top n documents per bucket using a window function"""
+    # On the partition table when the fast path applies (c.table, always named "documents"), as the other read paths
     c = compile_search(fieldset, query, fast=True)
     selects, laterals, partition = [], [], []
     for i, axis in enumerate(axes):

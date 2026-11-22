@@ -159,7 +159,8 @@ class DocumentField(BaseModel):
     reader: DocumentFieldReaderAccess = DocumentFieldReaderAccess()
     client_settings: dict[str, Any] = {}
     # If set, the field is mapped to a sort slot: a column of the documents table that makes sorting on it fast (the
-    # standard columns date and source, or a generic slot). Only shown once the slot is filled for all documents
+    # standard columns date and source, or one of the generic slots of migration 0002, which the original did not
+    # have). Only shown once the slot is filled for all documents: until then sorting does not use it
     sort_slot: Literal["date", "source", "sort_kw1", "sort_kw2", "sort_kw3", "sort_num1", "sort_date2"] | None = None
 
     @model_validator(mode="after")
@@ -203,8 +204,9 @@ class UpdateDocumentField(BaseModel):
         default=None,
         description="Map this field to a sort slot, which makes sorting on this field fast: a free one of the date, "
         "sort_date2 (date fields), source, sort_kw1, sort_kw2, sort_kw3 (keyword and url fields) or sort_num1 (number and "
-        "integer fields) columns. Each slot holds one field per project. For large projects, the slot is filled by a "
-        "background job; until it is done, sorting works but is not faster. false frees the slot.",
+        "integer fields) columns. Each slot holds one field per project. Tag fields cannot be put in a slot. For large "
+        "projects, the slot is filled by a background job; until it is done, sorting works but is not faster. "
+        "false frees the slot.",
     )
 
 

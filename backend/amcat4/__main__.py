@@ -224,7 +224,9 @@ async def optimize(args):
 async def move_project(args):
     """
     Move a project to a documents partition of its own, in batches (see amcat4.projects.partitions). Creates a job,
-    which the job worker of the server runs; with --now, it runs here (and waits until it is done).
+    which the job worker of the server runs; with --now, it runs here (and waits until it is done). --now runs all
+    pending jobs (run_pending_jobs), and if the server's worker claims the move job first, this returns before the move
+    is done: then follow the job in the jobs table.
     """
     from amcat4.projects.jobs import run_pending_jobs
     from amcat4.projects.partitions import start_move
@@ -372,7 +374,8 @@ def main():
     logging.basicConfig(format="[%(levelname)-7s:%(name)-15s] %(message)s", level=logging.INFO)
 
     if inspect.iscoroutinefunction(args.func):
-        # CLI commands (optimize, migrations, test data) use the server's own settings, not the API's tuning
+        # CLI commands (optimize, move-project, migrations, test data) use the server's own settings (parallel workers,
+        # no statement timeout), not the API's tuning (see amcat4.connections.server_defaults)
         with server_defaults():
             asyncio.run(args.func(args))
     else:

@@ -4,6 +4,11 @@ Searching documents in the postgres backend.
 A search is a single SQL query on the documents table. Everything that can be expressed as a pg_search query
 (project selection, query string, most filters) is combined into one json query, so it is evaluated inside the
 BM25 index. Remaining conditions are added as plain SQL.
+
+Unlike the original, a page of results can take two statements (late fetch, for sorts on json fields), and the
+total is counted with a separate statement, if possible on a second connection at the same time as the page. Read
+statements can go to the table of a single partition instead of the parent table (the fast path). Each of these
+has a switch in the settings (config.py) that gives back the original behaviour.
 """
 
 import asyncio
@@ -42,6 +47,7 @@ class CompiledSearch:
     # The FROM item, always available under the name "documents": the partitioned table, or (fast read path) the
     # table of the one partition that holds all projects of the query
     table: sql.Composable = field(default_factory=lambda: sql.Identifier("documents"))
+    # True if table is a single partition (the fast path, see compile_search)
     fast: bool = False
     # If the search has no query string and no filters that need the search index (so only the projects, and maybe
     # document ids, select): the same selection as plain SQL conditions, without the search index. Listing documents
@@ -62,10 +68,12 @@ def unscored(clauses: list[dict]) -> dict:
 
     pg_search has no 'filter' list in its json boolean query: an unknown key such as "filter" is silently ignored,
     so {"boolean": {"must": [...], "filter": [project]}} would NOT select the project (tested on 0.26.0 and 0.27.0).
-    A const_score clause with score 0 inside 'must' does select, and adds nothing to the score. That is what makes the
-    filter form faster: the project term is not scored for every hit (top 10 of a very common word in a 156k test
-    partition: 5.8 ms -> 2.9 ms), and the relevance order becomes the plain BM25 order of the query (the scored
-    project term added a score that depended on the index segment). Counts and hits do not change.
+    A const_score clause with score 0 inside 'must' does select, and adds nothing to the score. That is what makes this
+    form faster: the project term is not scored for every hit (top 10 for a very common word: 33.7 ms -> 3.0 ms
+    on the shared partition with the 2.7 M document project, 5.8 ms -> 2.9 ms on a 156k test partition, no parallel
+    workers, pg_search 0.27, 22 Nov 2026), and the relevance order becomes the plain BM25 order of the query (the
+    scored project term added a score that depended on the index segment). Counts and hits do not change.
+    A boost of 0 on the project term also gives correct counts, but no speed gain.
     """
     query = clauses[0] if len(clauses) == 1 else {"boolean": {"must": clauses}}
     return {"const_score": {"score": 0.0, "query": query}}
@@ -94,7 +102,7 @@ def _equals_any(column: str, values: list[int]) -> tuple[sql.Composable, Any]:
     """
     `column = value` for a single value, `column = ANY(values)` otherwise. pg_search turns `= ANY(...)` into a term
     set that it evaluates over every row of the partition (about 14 ms at 13 million rows, growing with the
-    partition); a plain value is a single term.
+    partition); a plain value is a single term. The original always used `= ANY(...)`; the result is the same.
     """
     if len(values) == 1:
         return sql.SQL("{} = %s").format(sql.SQL(column)), values[0]
@@ -112,6 +120,8 @@ def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False) -
     `must` clause, built here and never from user input, so a query string cannot escape it). A second SQL condition on
     project_pk would be evaluated by pg_search as a second term inside the index and made large counts up to 2x
     slower. Write statements (update/delete by query) must not use this: they keep both SQL conditions.
+    Not used while a project of the query is being moved to its own partition (its documents are then in two
+    partitions). AMCAT4_FAST_PATH=false always uses the parent table with both SQL conditions, as in the original.
     """
     # selection: the project clause first (built here, never from user input), then the user's filters
     selection: list[dict] = [project_clause(fieldset.project_pks)]
@@ -120,7 +130,7 @@ def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False) -
         qs = [_compile_query_string(label, q, fieldset) for label, q in query.queries.items()]
         scored.append(qs[0] if len(qs) == 1 else {"boolean": {"should": qs}})
     # The project condition is also in the json query, but postgres needs the partitions in SQL to only scan the
-    # partitions of these projects
+    # partitions of these projects (a project being moved to its own partition has two)
     partitions = sorted({part for pk in fieldset.project_pks for part in fieldset.all_partitions(pk)})
     filters = dict(query.filters or {})
     use_partition_table = fast and get_settings().fast_path and len(partitions) == 1 and "_id" not in filters and not query.ids
@@ -150,10 +160,11 @@ def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False) -
         extra_params.append(list(query.ids))
     sql_clauses, params = [*base_clauses, *extra_clauses], [*base_params, *extra_params]
     if get_settings().filter_clauses:
-        # the project and the filters select without scoring; only the query string is scored
+        # the project and the filters select without scoring; only the query string is scored (see unscored)
         must = [unscored(selection), *scored]
     else:
-        # original form: everything is a scored must clause (same hits and counts, other scores)
+        # AMCAT4_FILTER_CLAUSES=false: the original form, everything is a scored must clause (same hits and counts,
+        # other scores and so another relevance order)
         must = [selection[0], *scored, *selection[1:]]
     json_query = must[0] if len(must) == 1 else {"boolean": {"must": must}}
     where = sql.SQL(" AND ").join([sql.SQL("documents.id @@@ %s::jsonb"), *sql_clauses])
@@ -174,7 +185,9 @@ def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False) -
     )
 
 
-# The sort key for the internal id (the order in which documents were stored), which is paged with a keyset cursor
+# Sort key for the internal id (the order in which documents were stored). New in this version: "_id" keeps its
+# original meaning (the doc_id text). Sorting on _seq alone is paged with a keyset cursor ("after this id"), which
+# stays fast at any depth, unlike an offset (see projects/query.py)
 SEQ = "_seq"
 
 
@@ -231,7 +244,8 @@ def order_by(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "desc"]]] 
                 items.append(sql.SQL("documents.{} {}").format(sql.Identifier(slot), direction))
             elif get_settings().byte_order_sort and fs[0].type in ("keyword", "url", "text", "tag"):
                 # The same order as the text slot columns (COLLATE "C", byte order), so sorting does not change when a
-                # field gets a slot, or while its slot is being filled. It is also the order of Elasticsearch
+                # field gets a slot, or while its slot is being filled. It is also the order of Elasticsearch.
+                # AMCAT4_BYTE_ORDER_SORT=false: the database's collation, as in the original
                 items.append(sql.SQL('{} COLLATE "C" {}').format(_coalesce(fs), direction))
             else:
                 items.append(sql.SQL("{} {}").format(_coalesce(fs), direction))
@@ -242,7 +256,11 @@ def order_by(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "desc"]]] 
 
 
 def _needs_late_fetch(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "desc"]]] | None) -> bool:
-    """Whether the sort uses a json field (so all hits are read to sort them), and gives the same order twice"""
+    """
+    Whether to sort in two statements (late fetch, see search): the sort uses a json field or doc_id (so all hits are
+    read to sort them), and it is deterministic, so that both statements give the same order. _score, _seq and slot
+    columns are sorted inside the search index and need no late fetch.
+    """
     names = [name for name, _ in sort or []]
     if "?" in names:  # random order: the second statement would give another order
         return False
@@ -277,6 +295,7 @@ async def count_at_most(conn: AsyncConnection, c: CompiledSearch, limit: int) ->
 
 
 async def count(conn: AsyncConnection, fieldset: FieldSet, query: SearchQuery) -> int:
+    """The exact number of hits. On a single partition (fast path) pg_search counts inside its index"""
     c = compile_search(fieldset, query, fast=True)
     if c.fast and get_settings().capped_count:
         n = await count_at_most(conn, c, COUNT_STEP)
@@ -313,6 +332,8 @@ async def search(
     (efficient pagination through large result sets; sort and page are ignored). descending: keyset in reverse order.
     offset overrides page * per_page.
     similar: (vector field, vector): order by cosine distance to the vector (documents without vector are skipped)
+    with_total: count all hits (otherwise total is the number of results). Unlike the original, the count is skipped
+    if the first page is not full, and it can run on a second connection at the same time as the page.
     """
     from amcat4.postgres.documents import field_select
 
@@ -366,7 +387,8 @@ async def search(
     if get_settings().btree_listing and c.plain_where is not None and not similar and (keyset or not sort):
         # No query string and no index filters, in id order: a plain SQL list over the B-tree index (partition_id,
         # project_pk, id), which reads just the rows of the page (in SQL, first page of the 2.7M document project in a
-        # shared partition: 13.5 ms -> 0.14 ms, research notes of 22 Nov). The total is still counted in the index
+        # shared partition: 13.5 ms -> 0.14 ms, 22 Nov 2026). The total is still counted in the index.
+        # AMCAT4_BTREE_LISTING=false: list through the search index, as in the original
         where, params = c.plain_where, list(c.plain_params)
         if keyset and after_id is not None:
             where = sql.SQL("{} AND documents.id {} %s").format(where, sql.SQL("<" if descending else ">"))
@@ -378,6 +400,8 @@ async def search(
             # Late fetch: the sort is on a json field (not a sort slot), so pg_search cannot do a Top-K scan and every
             # hit is read and sorted. Do that with only the internal id (no text, no snippets), then fetch the full
             # rows of just this page with the same statement as below, restricted to these ids (same order, columns).
+            # With late fetch such a sort takes about 60 ms at 46,000 hits (2.7 M document project, 22 Nov 2026).
+            # Part of the fast path: AMCAT4_FAST_PATH=false gives the original single statement
             cur = await conn.execute(
                 sql.SQL("SELECT documents.id FROM {} WHERE {} ORDER BY {} LIMIT %s OFFSET %s").format(
                     c.table, where_, ordering
@@ -397,7 +421,9 @@ async def search(
     counted: int | None = None
     if with_total and get_settings().parallel_count:
         # Count on a second connection while the page is fetched: the request then takes as long as the slower of the
-        # two, not the sum. Without a spare connection (busy pool), the count runs after the page as before.
+        # two, not the sum (a common word: 8.0 ms -> 4.9 ms on a 156k test partition; not measured under concurrent
+        # load). Without a spare connection (busy pool), the count runs after the page, on the same connection.
+        # AMCAT4_PARALLEL_COUNT=false: always one after the other, as in the original
         async with spare_connection() as conn2:
             if conn2 is None:
                 rows = await page_rows()
@@ -447,7 +473,8 @@ async def search(
     if not with_total:
         total = len(results)
     elif offset == 0 and after_id is None and not similar and len(rows) < per_page:
-        # the first page is not full, so these are all the hits: no need to count
+        # the first page is not full, so these are all the hits: no need to count (with the parallel count it has
+        # already run, cheaply as there are few hits; its result is not used)
         total = len(rows)
     elif counted is not None:
         total = counted

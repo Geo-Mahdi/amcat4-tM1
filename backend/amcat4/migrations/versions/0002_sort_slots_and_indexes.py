@@ -41,6 +41,8 @@ depends_on: str | Sequence[str] | None = None
 # The same key as amcat4.postgres.layout._REINDEX_LOCK: no automatic rebuild while the migration builds the index
 REINDEX_LOCK = 4_000_002
 
+# Text slots in byte order (COLLATE "C"), the order of Elasticsearch, and of the sort on keyword values without a slot
+# (AMCAT4_BYTE_ORDER_SORT), so the order does not change when a field gets a slot
 SLOT_COLUMNS = {
     "sort_kw1": 'text COLLATE "C"',
     "sort_kw2": 'text COLLATE "C"',
@@ -49,7 +51,7 @@ SLOT_COLUMNS = {
     "sort_date2": "timestamptz",
 }
 
-BM25_OPTIONS = "WITH (mutable_segment_rows = 0)"
+BM25_OPTIONS = "WITH (mutable_segment_rows = 0)"  # as in 0001
 
 # The columns of the BM25 index in 0001
 BM25_0001 = """
@@ -192,6 +194,7 @@ def upgrade() -> None:
     op.execute("ALTER TABLE fields ADD COLUMN IF NOT EXISTS sort_slot_ready boolean NOT NULL DEFAULT true")
     # existing date fields get their quarter keys from a background job (amcat4.projects.jobs, backfill_quarter)
     op.execute("ALTER TABLE fields ADD COLUMN IF NOT EXISTS quarter_ready boolean")
+    # (added without a default first, so existing date fields are marked not ready, and new fields later get true)
     op.execute("UPDATE fields SET quarter_ready = (type <> 'date') WHERE quarter_ready IS NULL")
     op.execute("ALTER TABLE fields ALTER COLUMN quarter_ready SET DEFAULT true, ALTER COLUMN quarter_ready SET NOT NULL")
     _set_compression("lz4")
@@ -206,9 +209,11 @@ def downgrade() -> None:
         _replace_bm25(BM25_0001)
         op.get_bind().execute(text("DROP INDEX IF EXISTS documents_project_id"))
     _set_compression("default")
+    # job types that the 0001 code does not know (its worker would fail them)
     op.execute("DELETE FROM jobs WHERE type IN ('fill_sort_slot', 'backfill_quarter', 'vacuum', 'move_project')")
     # fields mapped to the new slots lose their slot (0001 only knows date and source)
     op.execute("UPDATE fields SET sort_slot = NULL WHERE sort_slot NOT IN ('date', 'source')")
+    # a slot that a job was still filling: 0001 has no readiness flag, so it would sort on a half-filled column
     op.execute("UPDATE fields SET sort_slot = NULL WHERE NOT sort_slot_ready")
     op.execute("ALTER TABLE fields DROP COLUMN IF EXISTS sort_slot_ready, DROP COLUMN IF EXISTS quarter_ready")
     alter_with_lock_timeout(

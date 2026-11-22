@@ -87,6 +87,10 @@ async def _search(conn, field_key: str, word: str) -> int:
 
 @pytest.mark.anyio
 async def test_migration_0002_with_data():
+    """
+    Migrations 0002 and 0003 on a database with 0001 data: nothing is lost, the new columns and indexes exist, the
+    search index is rebuilt, and the downgrade restores the 0001 schema (0001 itself is not edited)
+    """
     conn = await _connect()
     try:
         await drop_schema(conn, SCHEMA)

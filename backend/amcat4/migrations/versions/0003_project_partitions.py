@@ -35,6 +35,8 @@ depends_on: str | Sequence[str] | None = None
 NEW_FK = "documents_project_partition_fkey"
 OLD_FK = "documents_project_pk_partition_id_fkey"  # the name postgres gave the foreign key of 0001
 
+# Keeps project_partitions in sync with projects.partition_id. SET search_path FROM CURRENT: the function finds the
+# tables in the amcat schema whatever the search path of the statement that fires it. RETURN NULL: an AFTER trigger
 TRIGGER_FUNCTION = """
 CREATE OR REPLACE FUNCTION project_partition_sync() RETURNS trigger LANGUAGE plpgsql
 SET search_path FROM CURRENT AS $$
@@ -53,6 +55,7 @@ $$
 
 
 def _fk_name(referenced: str) -> str | None:
+    """The name of the foreign key from documents to this table (None if there is none): makes the steps idempotent"""
     return (
         op.get_bind()
         .execute(
@@ -74,6 +77,7 @@ def upgrade() -> None:
                PRIMARY KEY (project_pk, partition_id)
            )"""
     )
+    # one row per existing project, so every document has a row to reference
     op.execute("INSERT INTO project_partitions SELECT pk, partition_id FROM projects ON CONFLICT DO NOTHING")
     op.execute(
         "ALTER TABLE projects ADD COLUMN IF NOT EXISTS moving_to integer, "
@@ -85,6 +89,7 @@ def upgrade() -> None:
         "CREATE TRIGGER projects_partition AFTER INSERT OR UPDATE OF partition_id ON projects "
         "FOR EACH ROW EXECUTE FUNCTION project_partition_sync()"
     )
+    # (with a lock timeout: waiting for the lock behind a long query would block every other query on documents)
     old = _fk_name("projects")
     if old:
         alter_with_lock_timeout(op.get_bind(), f"ALTER TABLE documents DROP CONSTRAINT {old}")
@@ -102,6 +107,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     moving = op.get_bind().execute(text("SELECT count(*) FROM projects WHERE moving_to IS NOT NULL")).scalar_one()
     if moving:
+        # its documents are in two partitions, which the 0001 foreign key does not allow
         raise RuntimeError("A project is being moved to another partition: finish or undo the move first")
     if _fk_name("project_partitions"):
         alter_with_lock_timeout(op.get_bind(), f"ALTER TABLE documents DROP CONSTRAINT {NEW_FK}")

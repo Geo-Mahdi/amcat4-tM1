@@ -111,6 +111,8 @@ async def test_snippets_non_ascii(index):
 
 @pytest.mark.anyio
 async def test_sort_slots(docs_index):
+    """A number field can now get the sort_num1 slot (migration 0002; before, this was an error) and sorts on it"""
+
     async def order(field, direction="asc"):
         res = await query_documents(docs_index, sort=[{field: {"order": direction}}], per_page=10)  # type: ignore
         return [d["_id"] for d in res.data] if res else []

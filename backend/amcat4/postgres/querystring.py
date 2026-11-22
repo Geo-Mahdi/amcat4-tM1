@@ -389,10 +389,12 @@ def _compile_text(node: Term | Phrase | Range, f: FieldInfo) -> dict:
 
 
 # pg_search (Tantivy) expands a prefix to only the first 50 terms (in dictionary order) of each index segment unless
-# told otherwise. Broad prefixes then silently missed most documents (pol* found 2% of them), and the result changed
-# when segments were merged. A single-word prefix is expanded fully: it costs about as much as a plain word with the
+# told otherwise. With that default (the original code set no max_expansions) broad prefixes silently missed most
+# documents (pol* found 13,678 documents where Elasticsearch found 592,319, Nov 2026), and the result changed when
+# segments were merged. A single-word prefix is expanded fully: it costs about as much as a plain word with the
 # same number of hits. A prefix at the end of a phrase ("tweede ka*") is much more expensive per expansion (10,000
-# expansions took 5-20 s), so it keeps a (documented) bound.
+# expansions took 5-20 s), so it keeps a bound (see POSTGRES_FAST_PATHS.md): such a phrase can still miss documents
+# if its last word has more than 1000 completions in a segment.
 PREFIX_MAX_EXPANSIONS = 2**31 - 1
 PHRASE_PREFIX_MAX_EXPANSIONS = 1000
 

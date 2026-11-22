@@ -17,7 +17,7 @@ LOCK_ATTEMPTS = 6
 
 
 class TableBusyError(RuntimeError):
-    pass
+    """The documents table stayed in use; the migration stopped without changing it (see alter_with_lock_timeout)"""
 
 
 def alter_with_lock_timeout(
@@ -31,12 +31,16 @@ def alter_with_lock_timeout(
     would hang until that query is done. With a lock timeout the statement gives up instead (and the queries go on),
     and is tried again a little later. If the table stays busy, the migration stops with TableBusyError, without
     changing anything; it can simply be run again (restart the server, or `alembic upgrade head`).
+    The original migration (0001) created the table and needed no lock timeout. Up to LOCK_ATTEMPTS * LOCK_TIMEOUT plus
+    the pauses (about 45 s) in all.
     """
     for attempt in range(1, attempts + 1):
         try:
             with bind.begin_nested():
                 bind.execute(text(f"SET LOCAL lock_timeout = '{timeout}'"))
                 bind.execute(text(statement))
+                # SET LOCAL holds until the end of the migration's transaction, not of the savepoint: reset it, so the
+                # other steps of the migration wait as long as they need
                 bind.execute(text("SET LOCAL lock_timeout = DEFAULT"))
             return
         except DBAPIError as e:
@@ -44,7 +48,7 @@ def alter_with_lock_timeout(
                 raise
             log.warning(f"The documents table is in use (attempt {attempt} of {attempts}, waited {timeout}): {e.orig}")
             if attempt < attempts:
-                time.sleep(attempt)
+                time.sleep(attempt)  # a short pause, a bit longer each time (1, 2, ... seconds)
     raise TableBusyError(
         f"Migration stopped: could not get a lock on the documents table within {timeout}, {attempts} times, because "
         "other queries or jobs keep using it. Nothing was changed. Please run the migration again (restart the server, "

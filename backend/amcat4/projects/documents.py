@@ -32,6 +32,10 @@ async def create_or_update_documents(
     :param op_type: create (only new documents), update (existing documents, keeping fields that are not given),
                     upsert (update or create), replace (replace the whole document, or create)
     :return: dict(created=<number>, updated=<number>)
+
+    Runs with the server's settings (the work pool, no API statement timeout): a large upload can take longer than an
+    API request may. After a large upload a vacuum job is created for the partition (maintenance.vacuum_soon), so that
+    pg_search's fast counts stay fast.
     """
     if fields:
         create_fields_dict: dict[str, CreateDocumentField] = dict()
@@ -49,12 +53,14 @@ async def create_or_update_documents(
             result = await storage.upload_documents(conn, pk, documents, infos, op_type)
     except UniqueViolation:
         # Another upload of (some of) the same documents committed between our duplicate check and our insert.
-        # Retrying once sees those documents and updates (or, for op_type create, reports) them.
+        # Retrying once sees those documents and updates (or, for op_type create, reports) them. (The original gave
+        # HTTP 500 for this, seen in the benchmark with concurrent uploads of the same documents.)
         try:
             async with connection() as conn:
                 result = await storage.upload_documents(conn, pk, documents, infos, op_type)
         except UniqueViolation as e:
             raise UploadError("The same documents are being uploaded concurrently; please try again") from e
+    # (never raises; a write to a project that is being moved is refused, so its one partition is the right one)
     await vacuum_soon((await project_partitions([pk])).values(), result["created"] + result["updated"])
     return result
 

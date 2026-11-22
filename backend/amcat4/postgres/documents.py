@@ -100,6 +100,10 @@ def dedup_expression(unique_fields: list[FieldInfo], table: str = "documents") -
     return sql.SQL("md5(jsonb_build_array({})::text)").format(values)
 
 
+# Every write function of this module is wrapped in guard_writes (amcat4.postgres.layout), which the original did not
+# need: while a project is being moved to a partition of its own, writes to it are refused (ConflictError), and a move
+# that starts waits for the writes that are running. Uploads look up existing documents in one partition only, so a
+# write during a move could create duplicates.
 @guard_writes(lambda conn, project_pk, *a, **k: project_pk)
 async def update_dedup_hashes(
     conn: AsyncConnection, project_pk: int, fields: dict[str, FieldInfo], ids: list[int] | None = None
@@ -139,6 +143,8 @@ def join_document(row: dict[str, Any], fields: dict[str, FieldInfo], names: Iter
     return out
 
 
+# The staging table and the column lists below name every sort slot column, so uploads fill all slots directly
+# (the original named only date and source)
 _STAGING = """
 CREATE TEMP TABLE IF NOT EXISTS staging_documents (
     rn integer, doc_id text, new_doc_id text, dedup_hash text, target_id bigint, target_doc_id text,
@@ -357,7 +363,10 @@ async def delete_field_values(conn: AsyncConnection, project_pk: int, f: FieldIn
 
 
 async def project_size_at_most(conn: AsyncConnection, project_pk: int, n: int) -> bool:
-    """Whether the project has at most n documents (reads at most n + 1 entries of the id index)"""
+    """
+    Whether the project has at most n documents (reads at most n + 1 rows, so it is cheap also for a large project,
+    where count(*) of the whole project is not). Used to decide between filling a sort slot in the request or a job.
+    """
     cur = await conn.execute(
         sql.SQL("SELECT count(*) AS n FROM (SELECT 1 FROM documents WHERE {} LIMIT %s) x").format(
             await project_filter(conn, project_pk)
@@ -368,7 +377,13 @@ async def project_size_at_most(conn: AsyncConnection, project_pk: int, n: int) -
 
 
 def _sort_slot_lock(project_pk: int, slot: str) -> list[int]:
-    # (two-key advisory locks do not overlap with the single-key locks of layout.py and the migrations)
+    """
+    The keys of the advisory lock of a sort slot of a project: a fill and a clear of the same slot (in the request or
+    in the fill_sort_slot job) must not run at the same time, or the slot could end up with values of the wrong field.
+    """
+    # (two-key advisory locks do not overlap with the single-key locks of layout.py and the migrations. The second key
+    # is the position of the slot in SORT_SLOTS, 0 to 6, so it does not meet the write lock (project_pk, 100) of
+    # layout.py either)
     return [project_pk, SORT_SLOTS.index(slot)]  # type: ignore[arg-type]
 
 
@@ -396,7 +411,7 @@ async def fill_sort_slot(
     """
     Set the sort slot column to the value of field f (or NULL if f is None) for the documents of the project. Rows that
     already have the right value are not written (an update rewrites the row and indexes it again), so filling a slot
-    for a field that few documents have is cheap, and filling it again (e.g. after an interruption) costs nothing.
+    for a field that few documents have is cheap, and filling it again (e.g. after an interruption) only reads the rows.
     With batch_size: only the next batch_size documents after after_id (in id order); returns the last id of the
     batch, or None if there were no more documents. Without: all documents (returns None).
     """
@@ -503,6 +518,9 @@ async def copy_batch(
         return f"jsonb_strip_nulls(jsonb_build_object({args}))"
 
     def sort_value(slot_column: str) -> str:
+        # The value for a slot column of the destination: from the source field's slot column if that is filled and
+        # of the same SQL type (e.g. source -> sort_kw1), else from its json value. Not from a slot that is still being
+        # filled: some documents would get NULL
         source = [s for s, d in field_map.items() if d.sort_column == slot_column]
         if not source:
             return "NULL"

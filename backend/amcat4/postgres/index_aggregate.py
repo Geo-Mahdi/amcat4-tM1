@@ -33,12 +33,14 @@ from psycopg import AsyncConnection, sql
 from amcat4.postgres.connection import must_not_fall_back
 from amcat4.postgres.fields import DATE_DERIVED, FieldInfo, FieldSet, use_quarter_key
 
-MAX_BUCKETS = 65_000  # paradedb.max_term_agg_buckets
+# Ask every terms aggregation for all its buckets: the most pg_search returns (paradedb.max_term_agg_buckets).
+# A smaller size would make pg_search leave out the smallest buckets, which GROUP BY never does.
+MAX_BUCKETS = 65_000
 METRICS = {"avg", "min", "max", "sum"}
 
 
 class _NotSupported(Exception):
-    pass
+    """This aggregation (or its result) cannot be done with pdb.agg: the caller uses GROUP BY instead"""
 
 
 def _axis_field(fieldset: FieldSet, axis) -> tuple[FieldInfo, str]:
@@ -60,6 +62,7 @@ def _axis_field(fieldset: FieldSet, axis) -> tuple[FieldInfo, str]:
 
 
 def _metric_path(fieldset: FieldSet, metric) -> str:
+    """The index path of a metric field: only avg/min/max/sum of a number or integer field of one project"""
     fs = fieldset.resolve(metric.field)
     if len(fs) != 1 or fs[0].type not in ("number", "integer") or fs[0].subkey or metric.function not in METRICS:
         raise _NotSupported("metric")
@@ -78,6 +81,7 @@ def _key(value: Any) -> Any:
 
 
 def _quarter(month: str | None) -> datetime | None:
+    """The first day of the quarter of a month key (2024-05 -> 2024-04-01), as date_trunc('quarter') in GROUP BY"""
     if month is None:
         return None
     year, m = month.split("-")
@@ -111,6 +115,10 @@ def build_request(fieldset: FieldSet, axes: list, metrics: list) -> tuple[dict, 
 
 
 def _rows(result: dict, axes: list, fields: list[FieldInfo], metrics: list, level: int, prefix: tuple) -> list[dict]:
+    """
+    Flatten the (nested) terms buckets into rows {a0.., n, m0..}, one per combination of axis values.
+    Raises _NotSupported if pg_search left out buckets, so a cut result is never returned.
+    """
     if level == len(axes):
         return []
     agg = result if level == 0 else result[f"a{level}"]
@@ -120,7 +128,7 @@ def _rows(result: dict, axes: list, fields: list[FieldInfo], metrics: list, leve
     for bucket in agg.get("buckets", []):
         key = _key(bucket.get("key"))
         if key is None and fields[level].type == "tag":
-            continue
+            continue  # documents without tags: GROUP BY (a lateral join over the tag list) has no such group
         if axes[level].interval == "quarter":
             key = _quarter(key)
         if level + 1 < len(axes):
@@ -142,6 +150,11 @@ def _metric_value(stats: dict, function: str) -> Any:
 
 
 def _merge_quarters(rows: list[dict], n_axes: int) -> list[dict]:
+    """
+    Add up the counts of rows with the same axis values: the three month buckets of a quarter (when quarters are
+    computed from months) become one row. With the quarter key the rows are unique already and nothing changes.
+    Metrics are not merged: build_request refuses metrics with quarters computed from months.
+    """
     merged: dict[tuple, dict] = {}
     for row in rows:
         key = tuple(row[f"a{i}"] for i in range(n_axes))

@@ -13,26 +13,38 @@ Documents:
   field name. Field names are project-level labels in the `fields` table, so renaming a field is a metadata
   update, and two projects can use the same name with different types.
 - Values are split over columns by how they need to be indexed:
-    - text_fields:   tokenized full-text fields (BM25, with positions for phrase queries)
+    - text_fields:   tokenized full-text fields (BM25, with positions for phrase queries). Compressed with lz4 since
+                     migration 0002 (lz4 decompresses faster than the default pglz); rows written before keep pglz.
+                     Each partition has its own compression setting (see create_partition)
     - exact_fields:  untokenized fields (keyword, tag, url, number, integer, boolean, date, geo_point, multimedia
                      paths), stored as fast (columnar) fields for filtering, sorting and aggregation
     - stored_fields: values that are stored but not indexed (object)
 - Vectors are stored in the document_vectors table (pgvector), with a vector index per field.
-- A BM25 index covers partition_id, project_pk, the standard columns, text_fields and exact_fields. New fields are
-  new json keys, so adding a field never requires rebuilding the index.
+- A BM25 index covers partition_id, project_pk, the standard columns and sort slots (see below), text_fields and
+  exact_fields. New fields are new json keys, so adding a field never requires rebuilding the index.
+- A search selects the project twice: in SQL (partition_id and project_pk, so postgres only scans the right
+  partitions) and as a term on project_pk in the json query of the BM25 index (amcat4.postgres.search). That term
+  and the user's filters are one unscored clause, {"const_score": {"score": 0, "query": ...}} inside "must", so only
+  the query string is scored. pg_search's json boolean query has no "filter" list: an unknown key such as "filter"
+  is silently ignored (tested on 0.26 and 0.27), so it would drop the project condition. Unlike the original, where
+  the project term was a scored "must" clause: top 10 for a very common word went from 34 ms to 3 ms in a shared
+  partition of 13 M documents (0.27, no parallel workers, 22 Nov 2026). Counts and hits are the same; only the
+  relevance order changes. AMCAT4_FILTER_CLAUSES=false gives the original form.
 - The documents table is list partitioned on partition_id, and every partition has its own BM25 index. Every project
   is assigned to a partition when it is created (projects.partition_id): the newest partition, until its BM25 index
   reaches partition_max_gb, after which a new partition is created. So the long tail of small projects shares
   partitions, and a big project fills (most of) a partition. A big project can be moved to a partition of its own
-  (amcat4.projects.partitions, in batches; projects.own_partition).
+  (amcat4.projects.partitions, in batches; projects.own_partition). During the move its documents are in two
+  partitions (projects.moving_to): reads look in both (project_filter), writes are refused (writing).
   Queries on a project only use its own partition, but only if they have a SQL condition on partition_id: postgres
   does not know that a project is in one partition (see project_filter). partition_id is also in the BM25 index:
   pg_search checks SQL conditions on columns outside the index against the table, for every match. A foreign key
   keeps the documents of a project in its partition(s) (project_partitions, migration 0003: one row per project,
   two while it is being moved): updating projects.partition_id moves the documents (a trigger, in one statement).
   Every upload adds segments to the BM25 index, and updates leave deleted documents in it. pg_search 0.26 does not
-  merge segments (in our tests), so the number of segments grows with every upload; from 0.27 on, pg_search merges
-  small segments in the background (index option background_layer_sizes), so it stays low. A periodic task rebuilds
+  merge segments (in our tests), so the number of segments grows with every upload; from 0.27 on (the target version
+  of this code), pg_search merges small segments in the background (index option background_layer_sizes; measured:
+  20 single-row inserts leave 15 segments, 5 a few seconds later), so it stays low. A periodic task rebuilds
   the index of a partition when it still needs it (many segments or deleted documents), after the partition has been
   quiet for a while (see amcat4.projects.maintenance); manually: amcat4 optimize --reindex [--project ...].
 - BM25 scores (how rare a word is) are computed per partition, so other projects in the same partition affect the
@@ -48,9 +60,13 @@ Documents:
 - Date fields also get derived keys (f12_year, f12_quarter, f12_month, f12_dayofweek, ...) in exact_fields, so date
   histograms and date-part filters run inside the index. (The quarter key came with migration 0002: older documents
   get it from a background job, see fields.quarter_ready.)
-- Sort slots: migration 0002 added five generic slot columns (sort_kw1..3, sort_num1, sort_date2) next to date and
-  source; fast_sort puts a field in a free slot of its kind (see amcat4.postgres.fields). A B-tree index on
-  (partition_id, project_pk, id) serves listings without a query in id order.
+- Sort slots: migration 0002 added five generic slot columns (sort_kw1..3 as text COLLATE "C", sort_num1,
+  sort_date2) next to date and source, also in the BM25 index, so sorting on them is a Top-K scan inside the index.
+  fast_sort puts a field in a free slot of its kind (see amcat4.postgres.fields). For a large project a background
+  job fills the column (fields.sort_slot_ready is false until it is done; sorting does not use the slot meanwhile).
+- A B-tree index on (partition_id, project_pk, id) (migration 0002) serves listings without a query string in id
+  order with plain SQL, reading only the rows of the page; through the BM25 index, such a listing goes over the ids
+  of all projects in the partition (AMCAT4_BTREE_LISTING=false: the original way). Counts stay in the BM25 index.
 
 TODO (later): read-only *reference* projects, that reference documents owned by other projects
 (project_references / document_references tables). Querying a reference project filters on the owner
@@ -93,7 +109,9 @@ async def project_filter(conn: AsyncConnection, project_pk: int, table: str = "d
     """
     SQL condition that selects the documents of a project. This includes the partition: postgres can only skip the
     other partitions if the query has a condition on the partition key. While the project is being moved to another
-    partition (see amcat4.projects.partitions), its documents are in both.
+    partition (see amcat4.projects.partitions), its documents are in both, so the condition names both (each document
+    is in exactly one of them, so it is seen once). Unlike the original, which used partition_of (one partition);
+    partition and move target are read in one statement, so a move that ends in between cannot be missed.
     """
     cur = await conn.execute("SELECT partition_id, moving_to FROM projects WHERE pk = %s", [project_pk])
     row: dict | None = await cur.fetchone()  # type: ignore[assignment]
@@ -109,6 +127,7 @@ async def project_filter(conn: AsyncConnection, project_pk: int, table: str = "d
 
 
 # Second key of the advisory lock (project_pk, _WRITE_LOCK) between writes to a project (shared) and moving it
+# (exclusive, see lock_writes). The sort slot locks use the second keys 0 to 6 (documents._sort_slot_lock)
 _WRITE_LOCK = 100
 
 
@@ -117,7 +136,8 @@ async def writing(conn: AsyncConnection, project_pk: int) -> AsyncGenerator[None
     """
     Wrap every write to the documents of a project. While the project is being moved to another partition, writes are
     refused (ConflictError): uploads look up existing documents in the project's partition, and the move job relies on
-    the documents not changing. The shared lock makes the move wait for writes that already started.
+    the documents not changing. The shared lock makes the move wait for writes that already started; writes do not
+    block each other. New in this version: the original could not move a project in batches, so it had no such check.
     """
     # In a transaction: a transaction lock (released at commit or rollback, also after an error). Otherwise (autocommit
     # statements) a session lock, released afterwards
@@ -156,7 +176,10 @@ def guard_writes(project: Callable[..., int | list[int]]):
 
 
 async def lock_writes(conn: AsyncConnection, project_pk: int, unlock: bool = False) -> None:
-    """Wait for the writes to a project that are running (and keep new ones waiting), for the move job"""
+    """
+    Wait for the writes to a project that are running (and keep new ones waiting), for the move job: an exclusive
+    session lock on the key that writing() takes shared. Call again with unlock=True to release it.
+    """
     function = "pg_advisory_unlock" if unlock else "pg_advisory_lock"
     await conn.execute(f"SELECT {function}(%s, %s)", [project_pk, _WRITE_LOCK])  # type: ignore[arg-type]
 
@@ -192,7 +215,10 @@ async def index_segments(conn: AsyncConnection, index: str) -> dict:
 
 
 async def index_merging(conn: AsyncConnection, index: str) -> bool:
-    """Whether pg_search is merging segments of a BM25 index in the background right now (0.27 and later merge)"""
+    """
+    Whether pg_search is merging segments of a BM25 index in the background right now (0.27 and later merge;
+    paradedb.is_merging exists on 0.26 too). Used by the maintenance, which waits for a running merge.
+    """
     cur = await conn.execute("SELECT paradedb.is_merging(%s::regclass) AS merging", [index])
     return bool((await cur.fetchone())["merging"])  # type: ignore[index]
 
@@ -258,6 +284,7 @@ async def partition_overview(conn: AsyncConnection) -> list[dict]:
     """
     The documents partitions with their sizes, and the projects in each partition with their number of documents.
     Counting documents reads the (document id) index of all partitions, so this takes a moment on large databases.
+    While a project is being moved, only its documents in projects.partition_id (the old partition) are counted.
     """
     cur = await conn.execute(
         """SELECT p.partition_id, p.id AS project, coalesce(c.n, 0) AS documents
@@ -324,13 +351,14 @@ async def assign_partition(conn: AsyncConnection) -> int:
     )
     own = {row["partition_id"] for row in await cur.fetchall()}  # type: ignore[index, call-overload]
     shared = [p for p in partitions if p["partition_id"] not in own]
+    # (unlike the original, the newest shared partition, which need not be the newest partition)
     if shared and shared[-1]["index_bytes"] < get_settings().partition_max_gb * 1024**3:
         return shared[-1]["partition_id"]
     partition_id = await next_partition_id(conn)
     try:
         await create_partition(conn, partition_id)
     except LockNotAvailable:
-        if not shared:
+        if not shared:  # every partition belongs to a big project: there is no partition to fall back to
             raise
         logging.warning(f"Could not create documents partition {partition_id} (lock timeout), using the current one")
         return shared[-1]["partition_id"]
@@ -338,7 +366,10 @@ async def assign_partition(conn: AsyncConnection) -> int:
 
 
 async def next_partition_id(conn: AsyncConnection) -> int:
-    """The id for a new partition (one more than the highest, also counting partitions without a valid index)"""
+    """
+    The id for a new partition: one more than the highest, also counting partitions without a valid BM25 index (which
+    list_partitions leaves out, e.g. one whose index is still being built), so an id is never used twice.
+    """
     cur = await conn.execute(
         r"""SELECT coalesce(max((regexp_match(pg_get_expr(c.relpartbound, c.oid), 'IN \((\d+)\)'))[1]::int), 0) AS n
             FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid WHERE i.inhparent = 'documents'::regclass"""

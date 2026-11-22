@@ -9,6 +9,9 @@ left off: running jobs that have not been updated for a while are claimed again.
 While a job runs, a heartbeat keeps updated_at current, so long steps (e.g. rebuilding an index) are not mistaken
 for interrupted jobs.
 
+A handler that cannot continue now (e.g. its project is being moved to another partition) raises JobPostponed: the
+job goes back to pending with its progress, and is claimed again after POSTPONE_FOR. Other exceptions fail the job.
+
 Periodic tasks are quick checks that run every interval (e.g. "does a partition need a reindex?", or later "are
 outsourced tasks done?"). The worker loop runs them too; the periodic_tasks table makes sure each task runs at most
 once per interval across all server processes, and keeps its state between runs. Periodic tasks should be quick:
@@ -40,8 +43,9 @@ from amcat4.postgres.search import SearchQuery, compile_search
 from amcat4.projects import maintenance, partitions
 
 BATCH_SIZE = 2000
-# Documents per transaction when filling a sort slot. Every transaction adds a segment to the search index (on
-# pg_search 0.26, which does not merge them, see amcat4.projects.maintenance), so not too small
+# Documents per transaction when filling a sort slot or adding quarter keys. Every transaction adds a segment to the
+# search index (pg_search 0.26 does not merge them, 0.27 merges small ones in the background, see
+# amcat4.projects.maintenance), so not too small; and not too large, so each transaction stays short
 FILL_BATCH_SIZE = 10_000
 STALE_AFTER = "2 minutes"  # running jobs that were not updated for this long are considered interrupted
 HEARTBEAT_SECONDS = 30
@@ -103,7 +107,10 @@ async def create_job(type: str, project: str | None, created_by: str | None, par
 
 
 async def create_job_in_transaction(conn: AsyncConnection, type: str, project_pk: int | None, params: dict) -> str:
-    """Create a job with this connection, so it only exists if the transaction it is in commits. Returns its id."""
+    """
+    Create a job with this connection, so it only exists if the transaction it is in commits (used where a check and
+    the insert must be atomic, e.g. maintenance.vacuum_soon). Takes the project's pk, not its id. Returns the job id.
+    """
     if type not in HANDLERS:
         raise ValueError(f"Unknown job type {type}")
     job_id = uuid.uuid4().hex
@@ -177,6 +184,8 @@ async def run_job(job: Job) -> None:
         logging.info(f"Job {job.id} was cancelled")
         return
     except JobPostponed as e:
+        # back to pending; the progress is kept, the 'postponed' note makes _claim_job wait POSTPONE_FOR. Only if the job
+        # is still running (not cancelled meanwhile)
         logging.info(f"Job {job.id} is postponed: {e}")
         await execute(
             """UPDATE jobs SET status = 'pending', progress = progress || jsonb_build_object('postponed', %s::text),
@@ -237,7 +246,8 @@ async def run_periodic_tasks() -> list[str]:
 
 async def job_worker(poll_interval: float = 2.0) -> None:
     """Run periodic tasks and jobs forever (started as a background task by the API server)"""
-    # Jobs and maintenance use the server's own settings (parallel workers, no API timeouts), not the API's tuning.
+    # Jobs and maintenance use the server's own settings (parallel workers, no API timeouts), not the API's tuning
+    # (no parallel workers, a statement timeout; see amcat4.connections). Unlike the original, which had one pool.
     # This task runs in its own context, so this holds for the worker (and the tasks it starts) only.
     with server_defaults():
         await _job_loop(poll_interval)
@@ -269,7 +279,8 @@ async def _copy_job(job: Job) -> dict[str, Any]:
     p = job.params
     from_pk, to_pk = await project_pk(p["source"]), await project_pk(p["destination"])
     if await fetch_one("SELECT 1 FROM projects WHERE pk = %s AND moving_to IS NOT NULL", [from_pk]):
-        # (the batches below read the source's documents in its partition: they would miss the ones already moved)
+        # (the batches below read the source's documents in its partition: they would miss the ones already moved).
+        # The job fails; start the copy again after the move
         raise ValueError(f"Project {p['source']} is being moved to another partition; copy it when that is done")
 
     if "field_map" not in job.progress:
@@ -300,8 +311,9 @@ async def _copy_job(job: Job) -> dict[str, Any]:
         if new_fields:
             await create_fields(p["destination"], new_fields)
         source_infos = await field_infos(p["source"])
-        # date fields copied from fields whose documents do not all have the quarter key yet: the copies don't either
-        # (the backfill task fills them later)
+        # date fields copied from fields whose documents do not all have the quarter key yet: the copies don't either,
+        # so the destination field is marked not ready too (quarter aggregations use the slower path with the same
+        # results, and the backfill task fills the keys later)
         not_ready = [d for s, d in field_map.items() if s in source_infos and not source_infos[s].quarter_ready]
         if not_ready:
             await execute(
@@ -344,6 +356,9 @@ async def _fill_sort_slot_job(job: Job) -> dict[str, Any]:
     column: field_pk None). params: project_pk, slot, field_pk. Resumable: progress is the last document id.
     Stops early if the slot was given to another field meanwhile (that field's own fill covers every document).
     When done, the field's sort_slot_ready is set, and sorting uses the slot.
+    Used for projects with more than sort_slot_job_rows documents (AMCAT4_SORT_SLOT_JOB_ROWS): filling rewrites every
+    document with a value, too long for one request. Smaller projects are filled in the request, as in the original
+    (which had only the date and source slots, filled in the request).
     While the project is being moved to another partition, the job is postponed (JobPostponed), at the start or
     between batches.
     """
@@ -380,8 +395,8 @@ async def _fill_sort_slot_job(job: Job) -> dict[str, Any]:
                 )
         finally:
             await storage.lock_sort_slot(conn, project, slot, unlock=True)
-    # a mass update: without a vacuum, the next counts and sorts must check every rewritten row (measured on 270k
-    # rewritten documents: a sort on the slot 187 ms before, 3.4 ms after VACUUM)
+    # a mass update: without a vacuum, the next counts and sorts must check every rewritten row (measured on a 300k
+    # test database after filling a slot for 270k documents: a sort on the slot 187 ms before, 3.4 ms after VACUUM)
     await maintenance.vacuum_soon((await project_partitions([project])).values())
     return {"slot": slot, "field_pk": field_pk, "batches": job.progress.get("batches", 0)}
 
@@ -393,6 +408,8 @@ async def _backfill_quarter_job(job: Job) -> dict[str, Any]:
     params: project_pk. Only touches documents that have a date value but no quarter key.
     While the project is being moved to another partition, the job is postponed (JobPostponed), at the start or
     between batches. Its updates are writes to the project (writing(), so a move waits for a running batch).
+    Why a job plus a readiness flag (fields.quarter_ready) rather than a fallback at query time: the fast path then
+    needs no extra statement per aggregation, and results are the same before, during and after the backfill.
     """
     from amcat4.postgres.fields import field_info_from_row
 
@@ -423,7 +440,11 @@ async def _backfill_quarter_job(job: Job) -> dict[str, Any]:
 
 
 async def _backfill_quarter_batch(conn: AsyncConnection, project: int, f: FieldInfo, after: int) -> int | None:
-    """Give the next FILL_BATCH_SIZE documents after id `after` the quarter key of f. Returns the last id (None: done)"""
+    """
+    Give the next FILL_BATCH_SIZE documents after id `after` the quarter key of f. Returns the last id (None: done).
+    The batch is a range of ids (read over the B-tree index of migration 0002), so a resumed job starts after the last
+    batch. quarter_sql gives the same value as the Python function used at upload (checked in a test).
+    """
     where = await project_filter(conn, project)
     cur = await conn.execute(
         sql.SQL("SELECT max(id) AS last FROM ({}) b").format(
@@ -465,7 +486,7 @@ async def schedule_quarter_backfill(state: dict) -> dict:
                               AND j.status = 'failed' AND j.updated_at > now() - interval '{RETRY_AFTER}')"""  # type: ignore[arg-type]
     )
     for row in rows:
-        async with connection() as conn:
+        async with connection() as conn:  # (autocommit: the job exists at once)
             await create_job_in_transaction(conn, "backfill_quarter", row["project_pk"], {"project_pk": row["project_pk"]})
     return state
 

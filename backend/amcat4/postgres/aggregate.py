@@ -2,8 +2,12 @@
 Aggregation for the postgres backend.
 
 Aggregations are plain SQL GROUP BY queries over the documents selected by the BM25 index. Date intervals
-(year, month, ...) use date_trunc, derived date parts (day of week, month number, ...) use the same
-expressions as the filters. Results are returned as rows, sorted by the axes.
+(year, quarter, month, ...) and date parts (day of week, month number, ...) group on the derived date keys that are
+stored with each document; date_trunc is used for hour and minute, and for quarters of fields whose older documents
+do not have the quarter key yet (see use_quarter_key). Results are returned as rows, sorted by the axes.
+
+These statements are the general path. Where it can, the caller (amcat4.projects.aggregate) first uses
+amcat4.postgres.index_aggregate (pdb.agg inside the index), which gives the same rows for the shapes it handles.
 """
 
 from dataclasses import dataclass
@@ -43,11 +47,13 @@ def axis_expr(axis: Axis, fs: list[FieldInfo], lateral_alias: str) -> tuple[sql.
         )
         return sql.SQL("{}.value").format(sql.Identifier(lateral_alias)), lateral
 
+    # The quarter key (migration 0002) is used only if every document has it; otherwise quarters use date_trunc below,
+    # as in the original, so results do not change while older documents are backfilled
     derived = ftype == "date" and axis.interval in DATE_DERIVED and (axis.interval != "quarter" or use_quarter_key(fs))
     if (axis.interval is None and ftype in RAW_GROUP_TYPES) or derived:
         # Group on the raw json value (or the derived date key, so no date expression is needed), and convert
-        # the values to the right type afterwards. Postgres does the grouping: pg_search can only group inside
-        # the index on indexed columns, not on json expressions like this.
+        # the values to the right type afterwards. On a partition table (fast path) pg_search can do this GROUP BY
+        # inside the index for some shapes; on the parent table postgres groups the fetched rows.
         keys = [f.key if axis.interval is None else f.derived_key(axis.interval) for f in fs]
         raws = [sql.SQL("documents.exact_fields->>{}").format(sql.Literal(k)) for k in keys]
         return (raws[0] if len(raws) == 1 else sql.SQL("coalesce({})").format(sql.SQL(", ").join(raws))), None
@@ -79,7 +85,7 @@ def postprocess_value(value: Any, axis: Axis, ftype: str) -> Any:
     match axis.interval if ftype == "date" else ftype:
         case "year":
             return date(int(value), 1, 1)
-        case "month" | "quarter":
+        case "month" | "quarter":  # the quarter key is the first month of the quarter, e.g. 2024-04
             return date.fromisoformat(value + "-01")
         case "week" | "day":
             return date.fromisoformat(value)
@@ -96,5 +102,6 @@ def postprocess_value(value: Any, axis: Axis, ftype: str) -> Any:
 
 def sort_key(row: dict, axes: list[Axis]) -> tuple:
     # sort by axis values (None last), with values of mixed types compared as strings
-    # (an empty string is a value, not "no value": `or 0` would compare 0 with strings and crash, e.g. on `section`)
+    # (an empty string is a value, not "no value": the original `or 0` compared 0 with strings and crashed, e.g. the
+    # HTTP 500 of the `section` aggregation in the benchmark)
     return tuple((row[ax.name] is None, str(type(row[ax.name])), 0 if row[ax.name] is None else row[ax.name]) for ax in axes)

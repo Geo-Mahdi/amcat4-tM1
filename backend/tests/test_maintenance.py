@@ -76,6 +76,10 @@ async def test_periodic_tasks(clean_jobs, monkeypatch):
 
 @pytest.mark.anyio
 async def test_reindex_when_quiet(clean_jobs):
+    """
+    A partition with many segments is rebuilt by a job, but only once it has been quiet for QUIET_PERIOD (background
+    merging is off here so the test is the same on pg_search 0.26 and 0.27)
+    """
     index = "amcat4_unittest_maintenance"
     await delete_project_index(index, ignore_missing=True)
     try:

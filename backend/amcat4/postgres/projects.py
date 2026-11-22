@@ -20,7 +20,10 @@ async def project_pks(project_ids: list[str]) -> dict[str, int]:
 
 
 async def project_partitions(pks: list[int]) -> dict[int, int]:
-    """The documents partition of each project (by internal primary key)"""
+    """
+    The documents partition of each project (by internal primary key). Without the target of a move: reads that must
+    find all documents use project_layout.
+    """
     rows = await fetch_all("SELECT pk, partition_id FROM projects WHERE pk = ANY(%s)", [pks])
     return {row["pk"]: row["partition_id"] for row in rows}
 
@@ -28,8 +31,8 @@ async def project_partitions(pks: list[int]) -> dict[int, int]:
 async def project_layout(pks: list[int]) -> tuple[dict[int, int], dict[int, int]]:
     """
     The documents partition of each project, and the partition it is being moved to (only for projects that are being
-    moved), read in one statement: one snapshot. Read separately, a move that finishes in between gives the new
-    partition_id or no moving_to while the other value is still the old one, so the request would see no documents.
+    moved), read in one statement: one snapshot. Read separately, a move that finished in between gave the old
+    partition_id and no moving_to, so the request searched only the old partition, which was empty by then.
     """
     rows = await fetch_all("SELECT pk, partition_id, moving_to FROM projects WHERE pk = ANY(%s)", [pks])
     partitions = {row["pk"]: row["partition_id"] for row in rows}

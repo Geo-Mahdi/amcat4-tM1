@@ -77,6 +77,10 @@ async def _agg(index, axes, **kwargs):
 
 @pytest.mark.anyio
 async def test_fast_path_uses_partition_table(two_projects):
+    """
+    The fast read path uses the partition table; writes and document id filters keep the parent table (aggregating on the
+    partition table instead of the parent: 37 ms instead of 1,640 ms)
+    """
     if not get_settings().fast_path:
         pytest.skip("fast path switched off (AMCAT4_FAST_PATH=false)")
     a, _ = two_projects
@@ -139,6 +143,7 @@ async def test_aggregate_parity(two_projects, index_paths, axes, kwargs):
 @pytest.mark.anyio
 @pytest.mark.parametrize("function", ["avg", "min", "max", "sum"])
 async def test_metric_parity(two_projects, index_paths, function):
+    """avg, min, max and sum per bucket from the fast path equal the original GROUP BY (sum and avg with a float tolerance)"""
     a, _ = two_projects
     aggs = [Aggregation("n", function)]
     get_settings().fast_path = False
@@ -164,6 +169,7 @@ async def test_metric_parity(two_projects, index_paths, function):
     ],
 )
 async def test_search_parity(two_projects, index_paths, kwargs):
+    """Hits, totals and order of searches (query, filter, wildcard, sorts) are the same with the fast path on and off"""
     a, _ = two_projects
 
     async def run():

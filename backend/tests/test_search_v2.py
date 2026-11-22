@@ -33,6 +33,10 @@ from tests.tools import auth_cookie, post_json
 
 @pytest.mark.anyio
 async def test_api_parallel_workers_setting(monkeypatch):
+    """
+    AMCAT4_API_PARALLEL_WORKERS: default 0, empty or 'default' means the server's setting (no option sent), a number is
+    sent as is
+    """
     assert Settings(api_parallel_workers="default").api_parallel_workers is None  # type: ignore[arg-type]
     assert Settings(api_parallel_workers="").api_parallel_workers is None  # type: ignore[arg-type]
     assert Settings(api_parallel_workers="2").api_parallel_workers == 2  # type: ignore[arg-type]
@@ -308,6 +312,8 @@ async def test_statement_timeout_only_for_api(monkeypatch):
 
 @pytest.mark.anyio
 async def test_statement_timeout_gives_503(client, index, user, monkeypatch):
+    """A statement stopped by statement_timeout becomes HTTP 503 with advice, not a 500 (protects the overload behaviour)"""
+
     async def slow_query(*args, **kwargs):
         async with connection() as conn, conn.transaction():
             await conn.execute("SET LOCAL statement_timeout = 50")

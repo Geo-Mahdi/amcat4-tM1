@@ -73,7 +73,10 @@ async def set_project_archived(index_id: str, archived) -> None:
 
 @with_server_defaults
 async def delete_project_settings(index_id: str, ignore_missing: bool = False):
-    """Delete the project (including its fields and documents) and its roles"""
+    """
+    Delete the project (including its fields and documents) and its roles.
+    With the server's settings (the work pool, no API statement timeout): deleting a large project takes long.
+    """
     async with connection() as conn:
         async with conn.transaction():
             cur = await conn.execute("DELETE FROM projects WHERE id = %s", [index_id])

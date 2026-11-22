@@ -61,7 +61,8 @@ async def amcat_connections() -> AsyncGenerator[None, None]:
         await _close_http()
 
 
-# Whether the current task does background or maintenance work (see server_defaults)
+# Whether the current task does background or maintenance work (see server_defaults). A context variable, not a global,
+# so that concurrent API requests are not affected by a job that runs at the same time
 _SERVER_DEFAULTS: ContextVar[bool] = ContextVar("amcat4_server_defaults", default=False)
 
 
@@ -72,7 +73,8 @@ def server_defaults() -> Iterator[None]:
 
     The API's request connections are tuned for many short read queries (see _api_options). Background jobs,
     index maintenance, CLI commands and long writes (uploads, update/delete by query) should not get those settings:
-    they keep the parallel workers and have no API statement timeout. The setting is a context variable, so it
+    they keep the parallel workers and have no API statement timeout. Unlike the original, which had one pool
+    for everything, so API tuning would also have applied to these jobs. The setting is a context variable, so it
     holds for the current task and for tasks started from it (e.g. the job worker and its heartbeat).
     """
     token = _SERVER_DEFAULTS.set(True)
@@ -87,7 +89,10 @@ T = TypeVar("T")
 
 
 def with_server_defaults(func: Callable[P, Awaitable[T]]) -> Callable[P, Awaitable[T]]:
-    """Decorator: run this (long) database work with the server's settings, see server_defaults"""
+    """
+    Decorator: run this (long) database work with the server's settings, see server_defaults.
+    Put it on every function that can touch many documents (a 30 s API statement timeout would stop it).
+    """
 
     @functools.wraps(func)
     async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
@@ -158,21 +163,27 @@ def _api_options() -> str:
     if workers is not None:
         # pg_search searches of the API take a few ms; starting parallel workers for them costs more than it saves
         # (a count of a normal word: 10 ms with 4 workers, 3.7 ms without; and it also costs throughput under load).
-        # Only very common words get slower, which the filter form of the project clause (search.py) makes up for.
+        # Only very common words get slower alone, which the unscored project clause (const_score, settings.filter_clauses
+        # in projects/search.py) makes up for: top 10 for a very common word 5.8 ms -> 2.9 ms (pg_search 0.27, 22 Nov 2026).
+        # Setting api_parallel_workers to empty keeps the server's setting, as in the original.
         options.append(f"-c max_parallel_workers_per_gather={workers}")
     if settings.statement_timeout_ms:
-        # a runaway search should not hold a connection (and a CPU) for minutes; the request gets a 503
+        # A runaway search should not hold a connection (and a CPU) for minutes; the request gets a 503 (api/__init__.py).
+        # Only the API pool has this option: jobs and long writes use the work pool (server_defaults).
         options.append(f"-c statement_timeout={int(settings.statement_timeout_ms)}")
     return " ".join(options)
 
 
+# Opens one pool. Unlike the original, which opened one pool with min_size=1, max_size=20 and psycopg_pool's default wait
+# of 30 s, this sets a name (shown in pool statistics and logs), a configurable wait and per-pool connection options.
 async def _open_pool(name: str, options: str, min_size: int, max_size: int, timeout: float = 30.0) -> AsyncConnectionPool[Any]:
     settings = get_settings()
     options = f"-c search_path={db_schema()},public {options}"
     if settings.custom_plans:
         # psycopg prepares a statement after 5 uses on a connection, and postgres may then switch to a generic plan
         # that does not know the project or query. For pg_search that plan is 5-10x slower (row estimate 1, no
-        # parallel workers). Planning each statement costs 1-3 ms, which is much less.
+        # parallel workers); measured: the first 5 requests took 84 ms, from the 11th on 469 ms, for a very common word.
+        # Planning each statement costs 1-3 ms, which is much less. settings.custom_plans = false restores the default.
         options += " -c plan_cache_mode=force_custom_plan"
     pool = AsyncConnectionPool(
         settings.postgres_url,
@@ -195,13 +206,15 @@ async def _start_db():
     logging.debug(f"Connecting with postgres, schema {db_schema()}")
     # Two pools: one for API requests (tuned for short queries), one with the server's defaults for background jobs,
     # maintenance, CLI commands and long writes (see server_defaults). The second one opens connections only when needed.
-    # An API request waits at most pool_timeout_s for a connection (then HTTP 503, see api/__init__.py)
+    # An API request waits at most pool_timeout_s for a connection (then HTTP 503 with Retry-After, see api/__init__.py).
+    # The work pool keeps the 30 s default wait, has no connection open until needed (min_size=0) and at most 10 per process.
     CONNECTIONS.db = await _open_pool(
         "amcat4-api", _api_options(), min_size=1, max_size=20, timeout=get_settings().pool_timeout_s
     )
     try:
         CONNECTIONS.db_work = await _open_pool("amcat4-work", "", min_size=0, max_size=10)
     except Exception:
+        # do not leave the API pool open when the second pool fails
         await _close_db()
         raise
 

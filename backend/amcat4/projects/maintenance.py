@@ -97,6 +97,7 @@ async def check_partitions(state: dict, now: datetime | None = None) -> dict:
         pid = p["partition_id"]
         previous = seen.get(str(pid), {})
         n = changes.get(p["table"], 0)
+        # (a running background merge counts as activity, like a change: the merge may solve the problem by itself)
         quiet = previous.get("changes") == n and not merging[pid]
         changed_at = previous.get("changed_at") if quiet else now.isoformat()
         reason = needs_reindex(segments[pid], after_rebuild.get(pid))
@@ -138,8 +139,9 @@ async def reindex_job(job: "Job") -> dict:
 # The fast count (and other in-index shortcuts of pg_search) skip the visibility check for pages that the visibility
 # map marks as all-visible, and that map is only updated by VACUUM. Autovacuum starts late on big tables (by default
 # after 20% of the rows changed), so after a large upload or update by query, counts can be slow (measured: on a
-# freshly vacuumed table, all segments were skipped). So after large changes we vacuum the partition ourselves, in a
-# job (VACUUM cannot run in a transaction, and takes a while on big partitions; requests do not wait for it).
+# freshly vacuumed table, the count skipped the visibility check for all segments). So after large changes we vacuum
+# the partition ourselves, in a job (VACUUM cannot run in a transaction, and takes a while on big partitions; requests
+# do not wait for it). Unlike the original, which left this to autovacuum.
 
 
 # Single-key advisory lock per partition (this plus the partition id) for scheduling its vacuum job. (Far from the
@@ -152,6 +154,7 @@ async def vacuum_soon(partition_ids: Iterable[int], changed_rows: int = 0) -> No
     After a write: create a vacuum job for each partition that changed a lot since its last vacuum (at least
     vacuum_after_rows rows: this change, or inserted plus dead rows according to postgres' statistics, which also
     catches many small uploads). Never raises: a write must not fail because of this.
+    AMCAT4_VACUUM_AFTER_ROWS=0 switches this off (then autovacuum only, as in the original).
     """
     threshold = get_settings().vacuum_after_rows
     if threshold <= 0:
@@ -184,7 +187,10 @@ async def vacuum_soon(partition_ids: Iterable[int], changed_rows: int = 0) -> No
 
 
 async def vacuum_job(job: "Job") -> dict:
-    """Job: VACUUM (ANALYZE) a documents partition (params: partition_id)"""
+    """
+    Job: VACUUM (ANALYZE) a documents partition (params: partition_id). The connection is in autocommit mode, as VACUUM
+    requires. ANALYZE also refreshes the planner's statistics after the large change.
+    """
     table = partition_table(job.params["partition_id"])
     started = datetime.now(UTC)
     async with connection() as conn:
@@ -196,6 +202,7 @@ async def prewarm_indexes() -> list[str]:
     """
     Load the search indexes of all partitions into postgres' cache (pg_prewarm), so the first searches after a restart
     are not slow. Needs the pg_prewarm extension (created if possible). Never raises. Returns the indexes loaded.
+    Only with AMCAT4_PREWARM=true (default false: no prewarm, as in the original; the effect is not measured).
     """
     loaded = []
     try:

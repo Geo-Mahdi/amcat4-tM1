@@ -62,6 +62,8 @@ async def archive_project_index(index_id: str, archived: bool):
 async def clear_project_index(index_id: str):
     """
     Clear all documents and fields from a project, keeping settings and roles intact.
+    With the server's settings (the work pool, no API statement timeout): deleting all documents of a large project
+    takes long.
     """
     row = await fetch_one("SELECT pk FROM projects WHERE id = %s", [index_id])
     if row is None:
@@ -130,8 +132,8 @@ async def list_user_project_indices(
 
 
 # Projects with more documents than this get an estimated size: the average size of SIZE_SAMPLE of their documents
-# times their number of documents. Summing the size of every document read the whole project (12 s for 10.7 million
-# documents), on every GET /index/{ix}.
+# times their number of documents. Summing the size of every document, as the original does, read the whole project
+# (12 s for 10.7 million documents), on every GET /index/{ix}.
 SIZE_SAMPLE = 20_000
 
 
@@ -141,6 +143,9 @@ async def index_size_in_bytes(index_id: IndexId) -> int:
     if project is None:
         return 0
     if get_settings().fast_path:
+        # On the partition table, with only the project term in the json query: pg_search counts inside its index.
+        # The sample is the first SIZE_SAMPLE documents the index returns, not a random sample, so the size is an
+        # estimate. AMCAT4_FAST_PATH=false: always the exact sum below, as in the original.
         table = sql.Identifier(partition_table(project["partition_id"]))
         query = sql.Literal(json.dumps({"term": {"field": "project_pk", "value": project["pk"]}}))
         async with connection() as conn:

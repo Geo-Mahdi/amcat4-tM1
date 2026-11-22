@@ -37,7 +37,10 @@ _STORAGE: dict[str, StorageColumn] = {
 # Sort slots: real columns of the documents table that are also in the BM25 index, so pg_search can sort on them
 # with a Top-K scan (it cannot for json keys). date and source are the standard metadata columns (0001); migration
 # 0002 added five generic slots. A field of these types can be put in a free slot of its kind (fast_sort), in this
-# order. Tags have several values per document, so they cannot be sorted on a single column.
+# order. Unlike the original (date and keyword only), url fields can use the keyword slots too (the value is the same
+# text). Tags have several values per document, so they cannot be sorted on a single column.
+# Measured (sort by publisher, Nov 2026): 2.9 to 4.6 ms on a slot against 48.7 ms on the json value. Slots do not
+# speed up filters or aggregations, so they are only for fields people sort on.
 _SORT_SLOTS: dict[str, list[SortSlot]] = {
     "date": ["date", "sort_date2"],
     "keyword": ["source", "sort_kw1", "sort_kw2", "sort_kw3"],
@@ -45,6 +48,8 @@ _SORT_SLOTS: dict[str, list[SortSlot]] = {
     "number": ["sort_num1"],
     "integer": ["sort_num1"],
 }
+# All slot columns, in a fixed order: the column order of uploads and copies, and (by position) the second key of the
+# advisory lock of a slot (amcat4.postgres.documents._sort_slot_lock). Add new slots at the end.
 SORT_SLOTS: list[SortSlot] = ["date", "source", "sort_kw1", "sort_kw2", "sort_kw3", "sort_num1", "sort_date2"]
 # The SQL type of each slot column, to copy a value from its json column
 SLOT_TYPES: dict[SortSlot, str] = {
@@ -230,6 +235,7 @@ def normalize_geo(value: Any) -> dict[str, float]:
     return {"lat": lat, "lon": lon}
 
 
+# The columns of the fields table that field_info_from_row reads
 FIELD_COLUMNS = "pk, name, type, unique_field, sort_slot, sort_slot_ready, quarter_ready"
 
 
@@ -251,7 +257,11 @@ def quarter_sql(value: sql.Composable) -> sql.Composable:
 
 
 def use_quarter_key(fs: list[FieldInfo]) -> bool:
-    """Whether quarter aggregations on these fields can use the derived quarter key (all documents have it)"""
+    """
+    Whether quarter aggregations on these fields can use the derived quarter key: the switch AMCAT4_QUARTER_KEY is on
+    and every document has the key (quarter_ready). Otherwise quarters are computed as in the original (date_trunc),
+    or, inside the index, from the month keys.
+    """
     from amcat4.config import get_settings
 
     return get_settings().quarter_key and all(f.quarter_ready for f in fs)

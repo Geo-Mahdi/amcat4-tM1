@@ -77,8 +77,12 @@ class Settings(BaseSettings):
         bool,
         Field(
             description=(
-                "Use the faster read paths (counts and aggregations inside the BM25 index of a single partition). "
-                "Set to false to use the original SQL, e.g. to compare results (AMCAT4_FAST_PATH=false)"
+                "Use the faster read paths: counts and aggregations inside the BM25 index of a single partition, "
+                "without a duplicate project term. "
+                "Why: aggregating on the partition table instead of the parent table took 37 ms instead of 1,640 ms, "
+                "with the same result (2.7 M documents, pg_search 0.26). "
+                "Set to false to use the original SQL, e.g. to compare results "
+                "or if a result looks wrong (AMCAT4_FAST_PATH=false)"
             ),
         ),
     ] = True
@@ -87,10 +91,12 @@ class Settings(BaseSettings):
         bool,
         Field(
             description=(
-                "Select the project and apply filters in the search index without scoring them (a const_score clause), "
-                "so only the query string is scored. Faster for common words; changes the relevance order once (to the "
-                "plain BM25 order of the query). Counts and hits are the same. false = the original form, in which "
-                "every clause is scored (AMCAT4_FILTER_CLAUSES=false)"
+                "Select the project and apply filters in the search index without scoring them (a const_score "
+                "clause), so only the query string is scored. "
+                "Why: top 10 for a very common word: 5.8 ms -> 2.9 ms (synthetic 156k documents, pg_search 0.27). "
+                "Counts and hits are the same; only the relevance order changes, once, to the plain BM25 order of "
+                "the query. "
+                "false = the original form, in which every clause is scored (AMCAT4_FILTER_CLAUSES=false)"
             ),
         ),
     ] = True
@@ -100,7 +106,11 @@ class Settings(BaseSettings):
         Field(
             description=(
                 "Count hits in two steps (first up to 1000 one by one, then in the index if there are more), as in "
-                "version 1. Default false: one count, which is cheaper without parallel workers (AMCAT4_CAPPED_COUNT)"
+                "the original. "
+                "Default false: one count. Why: the two steps paid off only while a count had a floor of 7-12 ms "
+                "with parallel workers; "
+                "without workers a full count takes 2-4 ms and every extra statement costs planning time. true = "
+                "the original behaviour (AMCAT4_CAPPED_COUNT)"
             ),
         ),
     ] = False
@@ -110,7 +120,10 @@ class Settings(BaseSettings):
         Field(
             description=(
                 "Count the hits of a search on a second connection while the page is fetched, if the pool has one to "
-                "spare (otherwise one after the other). AMCAT4_PARALLEL_COUNT=false: always one after the other"
+                "spare (otherwise one after the other). "
+                "Why: the request takes as long as the slower of the two (a common word: 8.0 ms -> 4.9 ms; not "
+                "measured under concurrent load). "
+                "false = always one after the other, as in the original (AMCAT4_PARALLEL_COUNT=false)"
             ),
         ),
     ] = True
@@ -120,8 +133,11 @@ class Settings(BaseSettings):
         Field(
             description=(
                 "Maximum depth (offset + per_page) of a request for a page number (page); deeper pages get HTTP 400, "
-                'with the advice to use "sort": "_seq" (paging by id, fast at any depth). Cursors (after) that the '
-                "server issued are never limited. 0 = no limit"
+                'with the advice to use "sort": "_seq" (paging by id, fast at any depth). Why: offset paging '
+                "computes and throws away all earlier hits, "
+                "so a download got slower with every page (a download by offset: 25,500 documents/s, by id: 107,600; "
+                "like max_result_window in Elasticsearch). "
+                "Cursors (after) that the server issued are never limited. 0 = no limit, as in the original"
             ),
         ),
     ] = 10000
@@ -131,8 +147,11 @@ class Settings(BaseSettings):
         Field(
             description=(
                 "List documents without a query string (and without filters that need the search index) in id order "
-                "with plain SQL over the B-tree index (partition_id, project_pk, id) of migration 0002, which reads only "
-                "the rows of the page. false = through the search index, as before (AMCAT4_BTREE_LISTING=false)"
+                "with plain SQL over the B-tree index (partition_id, project_pk, id) of migration 0002, which reads "
+                "only the rows of the page. "
+                "Why: a plain listing in id order does not need the search index. Counts stay in the search "
+                "index. "
+                "false = through the search index, as in the original (AMCAT4_BTREE_LISTING=false)"
             ),
         ),
     ] = True
@@ -141,9 +160,11 @@ class Settings(BaseSettings):
         bool,
         Field(
             description=(
-                'Sort text values (keyword, url) that are not in a sort slot in byte order (COLLATE "C"), like the slot '
-                "columns and Elasticsearch, so the order does not change when a field gets a slot. false = the database's "
-                "collation, as before (AMCAT4_BYTE_ORDER_SORT=false)"
+                'Sort text values (keyword, url, text, tag) that are not in a sort slot in byte order (COLLATE "C"), like the '
+                "slot columns and Elasticsearch. "
+                "Why: otherwise the order of mixed-case values changes when a field gets a slot, or while a slot is "
+                "being filled. "
+                "false = the database's collation, as in the original (AMCAT4_BYTE_ORDER_SORT=false)"
             ),
         ),
     ] = True
@@ -152,9 +173,13 @@ class Settings(BaseSettings):
         bool,
         Field(
             description=(
-                "Aggregate date fields by quarter on the derived quarter key (migration 0002), inside the search index, "
-                "also with metrics. Fields whose older documents do not have the key yet keep the slower way until the "
-                "backfill job is done. false = always the slower way, as before (AMCAT4_QUARTER_KEY=false)"
+                "Aggregate date fields by quarter on the derived quarter key (migration 0002), inside the search "
+                "index, also with metrics. "
+                "Why: it avoids date_trunc per row, and avg/min/max/sum per quarter were not possible in the index "
+                "before. "
+                "Fields whose older documents do not have the key yet keep the slower way until the backfill job is "
+                "done (results are the same). "
+                "false = always the slower way, as in the original (AMCAT4_QUARTER_KEY=false)"
             ),
         ),
     ] = True
@@ -163,9 +188,13 @@ class Settings(BaseSettings):
         int,
         Field(
             description=(
-                "fast_sort on a field of a project with more documents than this fills (or clears) the sort slot in a "
-                "background job, in batches; until it is done the field is sorted the slower way. Smaller projects: "
-                "right away, in the request. -1 = always in the request (as before); 0 = always a job"
+                "fast_sort on a field of a project with more documents than this fills (or clears) the sort slot in "
+                "a background job, in batches. "
+                "Why: filling a slot rewrites every document that has a value, too long for one request on a large "
+                "project. "
+                "Until the job is done the field is sorted the slower way. Smaller projects: right away, in the "
+                "request. "
+                "-1 = always in the request (as in the original); 0 = always a job"
             ),
         ),
     ] = 10000
@@ -174,9 +203,13 @@ class Settings(BaseSettings):
         int,
         Field(
             description=(
-                "After an upload, update or delete (by query) that changed at least this many documents of a partition "
-                "(also counted over several smaller uploads), VACUUM (ANALYZE) the partition in a background job, so "
-                "counts can use the visibility map. 0 = off (leave it to autovacuum)"
+                "After an upload, update or delete (by query) that changed at least this many documents of a "
+                "partition (also counted over several smaller uploads), "
+                "VACUUM (ANALYZE) the partition in a background job. Why: in-index counts skip the visibility check "
+                "only for pages that the visibility map "
+                "marks all-visible, and only VACUUM updates that map; autovacuum starts late on big tables (20% of "
+                "the rows by default). "
+                "0 = off (leave it to autovacuum, as in the original)"
             ),
         ),
     ] = 10000
@@ -185,8 +218,10 @@ class Settings(BaseSettings):
         bool,
         Field(
             description=(
-                "At startup, load the search indexes into postgres' cache with pg_prewarm (in the background; skipped "
-                "with a warning if the extension is not available)"
+                "At startup, load the search indexes into postgres' cache with pg_prewarm (in the background; "
+                "skipped with a warning if the extension is not available). "
+                "Why: the first searches after a restart read the index from disk. Default false (off, as in the "
+                "original); the effect is not measured"
             ),
         ),
     ] = False
@@ -196,7 +231,11 @@ class Settings(BaseSettings):
         Field(
             description=(
                 "Run API statements with plan_cache_mode=force_custom_plan, so prepared statements never switch to a "
-                "generic plan that ignores the project and query (which made counts 5-10x slower after 10 requests)"
+                "generic plan that ignores the project "
+                "and query. Why: psycopg prepares a statement after 5 uses on a connection; the generic plan made "
+                "counts 5-10x slower (469 ms against 84 ms "
+                "for a very common word, from the 11th request on); planning each statement costs 1-3 ms. false = "
+                "the postgres default (AMCAT4_CUSTOM_PLANS=false)"
             ),
         ),
     ] = True
@@ -206,8 +245,13 @@ class Settings(BaseSettings):
         Field(
             description=(
                 "max_parallel_workers_per_gather for the connections of API requests. 0 (default) means no parallel "
-                "workers, which is faster for the short searches of the API. Empty or 'default' keeps the server's "
-                "setting. Background jobs, maintenance and CLI commands always keep the server's setting"
+                "workers. "
+                "Why: the searches of the API take a few ms and starting workers costs more than it saves (a count "
+                "of a normal word: 10 ms with 4 workers, 3.7 ms without), "
+                "also under load; very common words get slower, which the unscored project clause (filter_clauses) "
+                "makes up for. "
+                "Empty or 'default' keeps the server's setting (as in the original). Background jobs, maintenance and "
+                "CLI commands always keep the server's setting"
             ),
         ),
     ] = 0
@@ -216,9 +260,12 @@ class Settings(BaseSettings):
         int,
         Field(
             description=(
-                "Stop a statement of an API request that runs longer than this (milliseconds); the request gets HTTP 503. "
-                "0 = no limit. Background jobs, maintenance, CLI commands and long writes (uploads, update or delete by "
-                "query, field changes) have no limit"
+                "Stop a statement of an API request that runs longer than this (milliseconds); the request gets HTTP "
+                "503. "
+                "Why: a runaway search should not hold a connection and a CPU for minutes. 0 = no limit, as in "
+                "the original. "
+                "Background jobs, maintenance, CLI commands and long writes (uploads, update or delete by query, "
+                "field changes) have no limit"
             ),
         ),
     ] = 30000
@@ -228,7 +275,10 @@ class Settings(BaseSettings):
         Field(
             description=(
                 "How long an API request waits for a free database connection (seconds). After that it gets HTTP 503 "
-                "with Retry-After, so an overloaded server answers quickly instead of letting requests queue"
+                "with Retry-After, "
+                "so an overloaded server answers quickly and clients can back off, instead of letting requests "
+                "queue. "
+                "The original used the pool's default of 30 seconds; set 30 to get that back"
             ),
         ),
     ] = 5
@@ -295,7 +345,8 @@ class Settings(BaseSettings):
     @field_validator("api_parallel_workers", mode="before")
     @classmethod
     def _server_default(cls, value):
-        # an empty value or 'default' means: do not set it, keep the server's setting
+        # An empty value or 'default' means: do not set the option, keep the server's setting (the original behaviour).
+        # Needed because an empty environment variable would otherwise fail to parse as an int.
         if isinstance(value, str) and value.strip().lower() in ("", "default", "none"):
             return None
         return value

@@ -57,7 +57,8 @@ SortType = Annotated[
             'or a list of dictionaries specifying field and sort order. Use "?" for random order. '
             '"_id" sorts on the document id. Use "_seq" (alone) to get results in the order they were stored, with a '
             'cursor ("next") that stays fast at any depth: the way to download all results of a query. Page numbers '
-            "(page) can be used up to a limit (default 10,000 results) in any order; the 'next' cursor has no limit."
+            "(page) can be used up to a limit (offset + per_page, default 10,000 results) in any order; the 'next' "
+            "cursor has no limit."
         ),
         examples=[
             "date",

@@ -60,7 +60,7 @@ def _sort_spec(sort: list[dict[str, SortSpec]] | None) -> list[tuple[str, Litera
 
 
 def _seq_order(sort: list[tuple[str, Literal["asc", "desc"]]] | None) -> Literal["asc", "desc"] | None:
-    """The direction if the sort is only on _seq (the internal id), which is paged with a keyset cursor"""
+    """The direction if the sort is only on _seq (the internal id), which is paged with a keyset cursor, else None"""
     if sort and len(sort) == 1 and sort[0][0] == SEQ:
         return sort[0][1]
     return None
@@ -107,8 +107,9 @@ async def query_documents(
     :param page: The number of the page to request (starting from zero)
     :param per_page: The number of results per page
     :param after: A cursor (the 'next' value of a previous result) to get the next batch of results. This is the
-                  efficient way to retrieve large result sets: without sort, results are then ordered by internal id,
-                  which makes retrieving the next batch fast.
+                  efficient way to retrieve large result sets: without sort and without query, or with sort on _seq,
+                  results are ordered by internal id and the cursor is "after this id", which makes retrieving the
+                  next batch fast. In other orders the cursor is an offset. The cursor also carries the total.
     :param highlight: if True, add <em> tags to query matches in fields
     :param similar: (vector field, vector): order results by (cosine) similarity to this vector
     :param queryable: the fields that may be used in queries and filters (None = all fields)
@@ -132,9 +133,10 @@ async def query_documents(
     max_offset = get_settings().max_offset
     if after is None and not keyset and max_offset and offset + per_page > max_offset:
         # A page deep in score (or field) order means sorting all hits up to that page and throwing most away: a page
-        # at offset 100,000 costs 20x a page by id. Elasticsearch has the same limit (max_result_window). The limit is
-        # for page numbers only: a cursor (after) was issued by this server, and a download that follows the 'next'
-        # cursors of a query without sort (an offset cursor) must be able to finish
+        # at offset 100,000 costs 20x a page by id (83 ms against 3.9 ms, 22 Nov 2026). Elasticsearch has the same
+        # limit (max_result_window). The limit is for page numbers only: a cursor (after) was issued by this server,
+        # and a download that follows the 'next' cursors of a query without sort (an offset cursor) must be able to
+        # finish. New in this version; AMCAT4_MAX_OFFSET=0 switches it off (no limit, as in the original)
         raise ValueError(
             f"Cannot page beyond {max_offset} results in this order (offset {offset} + per_page {per_page}). "
             'To retrieve all results, use "sort": "_seq" with the "after" cursor, which is fast at any depth.'
@@ -170,6 +172,9 @@ async def query_documents(
     return QueryResult(result.results, n=total, per_page=per_page, page=None if after else page, next=next_cursor)
 
 
+# The write functions below can touch many documents: they run with the server's settings (no API statement timeout,
+# the work pool), and afterwards ask for a vacuum of the changed partitions if the change was large (vacuum_soon:
+# pg_search's fast counts depend on the visibility map, which only VACUUM updates)
 @with_server_defaults
 async def update_tag_query(
     index: str | list[str],

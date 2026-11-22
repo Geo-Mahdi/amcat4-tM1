@@ -74,6 +74,10 @@ async def test_btree_listing_same_results(two_projects, monkeypatch, kwargs):
 
 @pytest.mark.anyio
 async def test_btree_listing_only_without_query(two_projects):
+    """
+    The plain SQL listing is only compiled when no query string and no index filter is given; otherwise the search
+    index must do the selection
+    """
     a, _ = two_projects
     fs = await get_fieldset([a])
     assert compile_search(fs, SearchQuery(), fast=True).plain_where is not None
@@ -182,6 +186,10 @@ async def _slots(index: str) -> dict[str, str | None]:
 
 @pytest.mark.anyio
 async def test_sort_slot_allocation(slot_project):
+    """
+    fast_sort takes the first free slot of the field's kind, gives a clear error when none is free or for tags and
+    text, and freeing a slot clears its column (migration 0002 slots)
+    """
     p = slot_project
     slots = await _slots(p)
     assert slots["date"] == "date" and slots["date2"] is None and slots["k1"] is None  # only the standard automatic one
@@ -304,6 +312,10 @@ async def test_sort_slot_fill_job(slot_project, monkeypatch):
 
 @pytest.mark.anyio
 async def test_sort_slot_fill_job_stops_if_slot_moves(slot_project, monkeypatch):
+    """
+    A fill job must stop, not write, if the slot was freed or given to another field while the job was waiting
+    (otherwise it would fill the wrong values into a column another field uses)
+    """
     p = slot_project
     monkeypatch.setattr(get_settings(), "sort_slot_job_rows", 0)
     await update_fields(p, {"k1": UpdateDocumentField(fast_sort=True)})
@@ -322,6 +334,10 @@ async def test_sort_slot_fill_job_stops_if_slot_moves(slot_project, monkeypatch)
 
 @pytest.mark.anyio
 async def test_sort_slot_type_change(slot_project):
+    """
+    A type change keeps the slot within the same kind (keyword/url, integer/number) and frees and clears it otherwise
+    (the column holds only that kind of value)
+    """
     p = slot_project
     await update_fields(p, {"k1": UpdateDocumentField(fast_sort=True), "n": UpdateDocumentField(fast_sort=True)})
     # keyword -> url and integer -> number keep their slot (same values)
@@ -384,6 +400,10 @@ async def _remove_quarter_keys(index: str) -> None:
 
 @pytest.mark.anyio
 async def test_quarter_key_at_upload(quarter_project):
+    """
+    The derived quarter key is written at upload with the right quarter (also at quarter ends and for year 999), and
+    the SQL version used by the backfill job gives the same keys as the Python one
+    """
     keys = await _quarter_keys(quarter_project)
     assert keys == {
         "0": "2018-01",
@@ -445,6 +465,10 @@ async def test_quarter_metrics_in_index(quarter_project):
 
 @pytest.mark.anyio
 async def test_quarter_backfill(quarter_project, monkeypatch):
+    """
+    The backfill job adds the quarter key to documents stored before migration 0002 in batches, only one job is
+    scheduled, and results are the same after it (quarter_ready, fast path)
+    """
     p = quarter_project
     expected_keys, expected_aggs = await _quarter_keys(p), await _quarter_aggs(p)
     await _remove_quarter_keys(p)
@@ -472,6 +496,10 @@ async def _vacuum_jobs() -> list[dict]:
 
 @pytest.mark.anyio
 async def test_vacuum_after_large_changes(slot_project, monkeypatch):
+    """
+    AMCAT4_VACUUM_AFTER_ROWS: a small change makes no vacuum job, a large one makes exactly one per partition, the job
+    runs VACUUM, and 0 switches it off (in-index counts need the visibility map)
+    """
     p = slot_project
     await fetch_all("DELETE FROM jobs WHERE type = 'vacuum' RETURNING id")
     monkeypatch.setattr(get_settings(), "vacuum_after_rows", 30)
@@ -503,6 +531,10 @@ async def test_vacuum_after_large_changes(slot_project, monkeypatch):
 
 @pytest.mark.anyio
 async def test_prewarm(slot_project):
+    """
+    AMCAT4_PREWARM: prewarming loads every partition's search index, or loads nothing without an error when pg_prewarm
+    is not available
+    """
     loaded = await maintenance.prewarm_indexes()
     async with connection() as conn:
         partitions = await list_partitions(conn)
@@ -539,6 +571,10 @@ async def _partition_tables(index: str) -> list[str]:
 
 @pytest.mark.anyio
 async def test_move_project_in_batches(two_projects, monkeypatch):
+    """
+    Moving a project to its own partition (migration 0003): halfway, readers see every document once and writers get a
+    conflict; the job resumes where it stopped; vectors move along; new projects never go to a project's own partition
+    """
     a, b = two_projects
     await create_or_update_documents(
         a, [{"_id": f"a{i}", "vec": [1.0, i / 10]} for i in range(5)], {"vec": "vector"}, op_type="update"

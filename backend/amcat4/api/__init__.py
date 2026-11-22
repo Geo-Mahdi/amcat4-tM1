@@ -53,7 +53,11 @@ async def lifespan(app: FastAPI):
 
 
 async def _prewarm() -> None:
-    # with the server's settings (no API statement timeout): loading a large index takes a while
+    """
+    Load the search index of every partition into postgres' cache (AMCAT4_PREWARM, default false, so off as in the
+    original): the first searches after a restart otherwise read the index from disk. Runs in the background, so the
+    server starts at once. With the server's settings (no API statement timeout): loading a large index takes a while
+    """
     with server_defaults():
         await prewarm_indexes()
 
@@ -136,7 +140,10 @@ async def data_error_handler(request: Request, exc: DataError) -> JSONResponse:
 
 @app.exception_handler(PoolTimeout)
 async def pool_timeout_handler(request: Request, exc: PoolTimeout) -> JSONResponse:
-    """All database connections are busy (see pool_timeout_s): answer quickly so the client can back off and retry"""
+    """
+    No free database connection within pool_timeout_s (AMCAT4_POOL_TIMEOUT_S, default 5 s; the original waited the
+    pool's default of 30 s and then failed with HTTP 500): answer quickly so the client can back off and retry
+    """
     return JSONResponse(
         status_code=503,
         headers={"Retry-After": "1"},
@@ -146,7 +153,11 @@ async def pool_timeout_handler(request: Request, exc: PoolTimeout) -> JSONRespon
 
 @app.exception_handler(QueryCanceled)
 async def query_canceled_handler(request: Request, exc: QueryCanceled) -> JSONResponse:
-    """A statement ran longer than statement_timeout_ms and was stopped"""
+    """
+    A statement of an API request ran longer than statement_timeout_ms (AMCAT4_STATEMENT_TIMEOUT_MS, default 30 s; 0 =
+    no limit, as in the original) and was stopped, so that a runaway search does not hold a connection for minutes.
+    Background jobs and long writes run without this limit (connections.with_server_defaults)
+    """
     seconds = get_settings().statement_timeout_ms / 1000
     return JSONResponse(
         status_code=503,
