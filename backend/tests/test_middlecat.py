@@ -9,7 +9,11 @@ from tests.tools import create_session_cookie, create_token, get_json
 
 
 @pytest.mark.anyio
-async def test_handler_responses(client: AsyncClient, admin):
+async def test_handler_responses(client: AsyncClient, admin, monkeypatch):
+    # (restore the auth setting afterwards: it left allow_authenticated_guests behind, so every test that ran after
+    # this file without a login got 401; in the usual file order no such test runs after it)
+    monkeypatch.setattr(get_settings(), "auth", get_settings().auth)
+
     async def test(expected=200, **payload):
         token = create_token(**payload)
         session_data = {"access_token": token}
