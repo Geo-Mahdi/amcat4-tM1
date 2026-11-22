@@ -14,7 +14,15 @@ from psycopg import AsyncConnection, sql
 from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
-from amcat4.postgres.fields import DATE_DERIVED, FieldInfo, FieldSet, derived_date_values, normalize_value
+from amcat4.postgres.fields import (
+    DATE_DERIVED,
+    SLOT_TYPES,
+    SORT_SLOTS,
+    FieldInfo,
+    FieldSet,
+    derived_date_values,
+    normalize_value,
+)
 from amcat4.postgres.layout import partition_of, project_filter
 
 if TYPE_CHECKING:
@@ -28,8 +36,9 @@ if TYPE_CHECKING:
 # replace: replace existing documents completely (fields that are not given are removed), or create new documents
 OpType = Literal["create", "update", "upsert", "replace"]
 
-# The standard metadata columns (see amcat4.postgres.layout)
-STANDARD_COLUMNS = ["date", "source"]
+# The sort slot columns: the standard metadata columns date and source (see amcat4.postgres.layout), and the generic
+# slots of migration 0002. Uploads fill them directly from the values of the fields that are mapped to them.
+STANDARD_COLUMNS: list[str] = list(SORT_SLOTS)
 
 
 class UploadError(ValueError):
@@ -133,22 +142,31 @@ _STAGING = """
 CREATE TEMP TABLE IF NOT EXISTS staging_documents (
     rn integer, doc_id text, new_doc_id text, dedup_hash text, target_id bigint, target_doc_id text,
     text_fields jsonb, exact_fields jsonb, stored_fields jsonb, copied_from jsonb,
-    date timestamptz, source text
+    {slots}
 ) ON COMMIT DELETE ROWS
-"""
+""".format(slots=", ".join(f"{c} {SLOT_TYPES[c]}" for c in SORT_SLOTS))  # type: ignore[index]
 
-_INSERT_COLUMNS = "partition_id, project_pk, doc_id, text_fields, exact_fields, stored_fields, copied_from, date, source"
+_INSERT_COLUMNS = (
+    f"partition_id, project_pk, doc_id, text_fields, exact_fields, stored_fields, copied_from, {', '.join(STANDARD_COLUMNS)}"
+)
 
-_MERGE = """text_fields = documents.text_fields || s.text_fields,
+_MERGE = (
+    """text_fields = documents.text_fields || s.text_fields,
             exact_fields = documents.exact_fields || s.exact_fields,
             stored_fields = coalesce(documents.stored_fields, '{}') || coalesce(s.stored_fields, '{}'),
-            date = coalesce(s.date, documents.date),
-            source = coalesce(s.source, documents.source),
+            """
+    + ", ".join(f"{c} = coalesce(s.{c}, documents.{c})" for c in STANDARD_COLUMNS)
+    + """,
             updated_at = now()"""
+)
 
-_REPLACE = """text_fields = s.text_fields, exact_fields = s.exact_fields, stored_fields = s.stored_fields,
-              date = s.date, source = s.source,
+_REPLACE = (
+    """text_fields = s.text_fields, exact_fields = s.exact_fields, stored_fields = s.stored_fields,
+              """
+    + ", ".join(f"{c} = s.{c}" for c in STANDARD_COLUMNS)
+    + """,
               updated_at = now()"""
+)
 
 
 def _examples(rows: Sequence[Any], key: str = "doc_id") -> str:
@@ -177,10 +195,10 @@ async def upload_documents(
 
     async with conn.transaction():
         project = [await partition_of(conn, project_pk), project_pk]
-        await conn.execute(_STAGING)
+        await conn.execute(_STAGING)  # type: ignore[arg-type]
         async with conn.cursor().copy(
             "COPY staging_documents (rn, doc_id, new_doc_id, text_fields, exact_fields, stored_fields, copied_from, "
-            "date, source) FROM STDIN"
+            f"{', '.join(STANDARD_COLUMNS)}) FROM STDIN"  # type: ignore[arg-type]
         ) as copy:
             for rn, (doc_id, d) in enumerate(zip(ids, split)):
                 extra = d.columns["stored_fields"]
@@ -335,6 +353,75 @@ async def delete_field_values(conn: AsyncConnection, project_pk: int, f: FieldIn
     )
 
 
+async def project_size_at_most(conn: AsyncConnection, project_pk: int, n: int) -> bool:
+    """Whether the project has at most n documents (reads at most n + 1 entries of the id index)"""
+    cur = await conn.execute(
+        sql.SQL("SELECT count(*) AS n FROM (SELECT 1 FROM documents WHERE {} LIMIT %s) x").format(
+            await project_filter(conn, project_pk)
+        ),
+        [n + 1],
+    )
+    return (await cur.fetchone())["n"] <= n  # type: ignore[index]
+
+
+def _sort_slot_lock(project_pk: int, slot: str) -> list[int]:
+    # (two-key advisory locks do not overlap with the single-key locks of layout.py and the migrations)
+    return [project_pk, SORT_SLOTS.index(slot)]  # type: ignore[arg-type]
+
+
+async def try_lock_sort_slot(conn: AsyncConnection, project_pk: int, slot: str) -> bool:
+    """Lock a sort slot of a project for filling it, until the end of the transaction (False if it is locked)"""
+    cur = await conn.execute("SELECT pg_try_advisory_xact_lock(%s, %s) AS locked", _sort_slot_lock(project_pk, slot))
+    return (await cur.fetchone())["locked"]  # type: ignore[index]
+
+
+async def lock_sort_slot(conn: AsyncConnection, project_pk: int, slot: str, unlock: bool = False) -> None:
+    """Lock (or unlock) a sort slot of a project for the session, waiting for others (for the fill job)"""
+    function = "pg_advisory_unlock" if unlock else "pg_advisory_lock"
+    await conn.execute(f"SELECT {function}(%s, %s)", _sort_slot_lock(project_pk, slot))  # type: ignore[arg-type]
+
+
+async def fill_sort_slot(
+    conn: AsyncConnection,
+    project_pk: int,
+    slot: str,
+    f: FieldInfo | None,
+    after_id: int | None = None,
+    batch_size: int | None = None,
+) -> int | None:
+    """
+    Set the sort slot column to the value of field f (or NULL if f is None) for the documents of the project. Rows that
+    already have the right value are not written (an update rewrites the row and indexes it again), so filling a slot
+    for a field that few documents have is cheap, and filling it again (e.g. after an interruption) costs nothing.
+    With batch_size: only the next batch_size documents after after_id (in id order); returns the last id of the
+    batch, or None if there were no more documents. Without: all documents (returns None).
+    """
+    value = (
+        sql.SQL("NULL::{}").format(sql.SQL(SLOT_TYPES[slot]))  # type: ignore[index]
+        if f is None
+        else sql.SQL("({}->>{})::{}").format(sql.Identifier(f.column), sql.Literal(f.key), sql.SQL(SLOT_TYPES[slot]))  # type: ignore[index]
+    )
+    column = sql.Identifier(slot)
+    where = await project_filter(conn, project_pk)
+    params: list[Any] = []
+    last_id = None
+    if batch_size is not None:
+        batch = sql.SQL("SELECT id FROM documents WHERE {} AND id > %s ORDER BY id LIMIT %s").format(where)
+        cur = await conn.execute(sql.SQL("SELECT max(id) AS last FROM ({}) b").format(batch), [after_id or 0, batch_size])
+        last_id = (await cur.fetchone())["last"]  # type: ignore[index]
+        if last_id is None:
+            return None
+        where = sql.SQL("{} AND documents.id > %s AND documents.id <= %s").format(where)
+        params = [after_id or 0, last_id]
+    await conn.execute(
+        sql.SQL("UPDATE documents SET {col} = {value} WHERE {where} AND documents.{col} IS DISTINCT FROM {value}").format(
+            col=column, value=value, where=where
+        ),
+        params,
+    )
+    return last_id
+
+
 def vector_select(f: FieldInfo) -> sql.Composable:
     """SQL expression to select the vector of a document for this field (as a json array)"""
     return sql.SQL(
@@ -414,9 +501,9 @@ async def copy_batch(
         if not source:
             return "NULL"
         s = source[0]
-        if s.sort_column:
-            return s.sort_column
-        cast = {"date": "timestamptz", "source": "text"}[slot_column]
+        cast = SLOT_TYPES[slot_column]  # type: ignore[index]
+        if s.sort_read_column and SLOT_TYPES[s.sort_read_column] == cast:  # type: ignore[index]
+            return s.sort_read_column
         return f"({s.column}->>'{s.key}')::{cast}"
 
     merge = re.sub(r"\bs\.", "EXCLUDED.", _MERGE)

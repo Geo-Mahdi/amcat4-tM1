@@ -202,10 +202,15 @@ def order_by(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "desc"]]] 
             if name not in fieldset.by_name:
                 raise QueryError(f"Cannot sort on unknown field: {name}")
             fs = fieldset.by_name[name]
-            sort_columns = {f.sort_column for f in fs}
+            sort_columns = {f.sort_read_column for f in fs}
             if len(sort_columns) == 1 and None not in sort_columns:
-                # the field is in a sort slot: a real column, which pg_search can use for a fast Top-K scan
-                items.append(sql.SQL("documents.{} {}").format(sql.Identifier(fs[0].sort_column), direction))  # type: ignore[arg-type]
+                # the field is in a sort slot: a real column, which pg_search can use for a fast Top-K scan. (Text slots
+                # have COLLATE "C", the byte order pg_search sorts in: another collation here would prevent Top-K)
+                items.append(sql.SQL("documents.{} {}").format(sql.Identifier(fs[0].sort_read_column), direction))  # type: ignore[arg-type]
+            elif get_settings().byte_order_sort and fs[0].type in ("keyword", "url", "text", "tag"):
+                # The same order as the text slot columns (COLLATE "C", byte order), so sorting does not change when a
+                # field gets a slot, or while its slot is being filled. It is also the order of Elasticsearch
+                items.append(sql.SQL('{} COLLATE "C" {}').format(_coalesce(fs), direction))
             else:
                 items.append(sql.SQL("{} {}").format(_coalesce(fs), direction))
     if not items and scored:
@@ -222,7 +227,7 @@ def _needs_late_fetch(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "
     for name in names:
         if name in ("_score", "_id") or name not in fieldset.by_name:
             continue
-        sort_columns = {f.sort_column for f in fieldset.by_name[name]}
+        sort_columns = {f.sort_read_column for f in fieldset.by_name[name]}
         if len(sort_columns) != 1 or None in sort_columns:
             return True
     return False

@@ -13,7 +13,7 @@ from typing import Any, Callable, Literal
 from psycopg import AsyncConnection
 
 StorageColumn = Literal["text_fields", "exact_fields", "stored_fields", "vector"]
-SortSlot = Literal["date", "source"]
+SortSlot = Literal["date", "source", "sort_kw1", "sort_kw2", "sort_kw3", "sort_num1", "sort_date2"]
 
 # Which jsonb column a field type is stored in. text_fields is tokenized, exact_fields is exact/columnar,
 # stored_fields is stored but not indexed. Vectors are stored in the document_vectors table.
@@ -34,15 +34,39 @@ _STORAGE: dict[str, StorageColumn] = {
     "vector": "vector",
 }
 
-# Which sort slot (standard metadata column, which makes sorting fast) a field type can use
-_SORT_SLOTS: dict[str, SortSlot] = {
-    "date": "date",
-    "keyword": "source",
+# Sort slots: real columns of the documents table that are also in the BM25 index, so pg_search can sort on them
+# with a Top-K scan (it cannot for json keys). date and source are the standard metadata columns (0001); migration
+# 0002 added five generic slots. A field of these types can be put in a free slot of its kind (fast_sort), in this
+# order. Tags have several values per document, so they cannot be sorted on a single column.
+_SORT_SLOTS: dict[str, list[SortSlot]] = {
+    "date": ["date", "sort_date2"],
+    "keyword": ["source", "sort_kw1", "sort_kw2", "sort_kw3"],
+    "url": ["source", "sort_kw1", "sort_kw2", "sort_kw3"],
+    "number": ["sort_num1"],
+    "integer": ["sort_num1"],
+}
+SORT_SLOTS: list[SortSlot] = ["date", "source", "sort_kw1", "sort_kw2", "sort_kw3", "sort_num1", "sort_date2"]
+# The SQL type of each slot column, to copy a value from its json column
+SLOT_TYPES: dict[SortSlot, str] = {
+    "date": "timestamptz",
+    "sort_date2": "timestamptz",
+    "source": "text",
+    "sort_kw1": "text",
+    "sort_kw2": "text",
+    "sort_kw3": "text",
+    "sort_num1": "numeric",
 }
 
 
+def sort_slots_for_type(field_type: str) -> list[SortSlot]:
+    """The sort slots a field of this type can use, in order of preference"""
+    return _SORT_SLOTS.get(field_type, [])
+
+
 def sort_slot_for_type(field_type: str) -> SortSlot | None:
-    return _SORT_SLOTS.get(field_type)
+    """The standard slot of a type (date for date fields, source for keywords): the one that is mapped automatically"""
+    slots = sort_slots_for_type(field_type)
+    return slots[0] if slots else None
 
 
 def storage_column(field_type: str) -> StorageColumn:
@@ -59,6 +83,9 @@ class FieldInfo:
     type: str
     unique: bool = False
     sort_slot: str | None = None
+    # False while a background job copies the values of the field into its (new) sort slot: writes already fill the
+    # slot, but reading (sorting) must not use it yet
+    sort_ready: bool = True
     subkey: str | None = None  # for sub-fields, e.g. the lat/lon of a geo_point
 
     @property
@@ -81,8 +108,13 @@ class FieldInfo:
 
     @property
     def sort_column(self) -> str | None:
-        """The standard metadata column in the documents table this field is copied to, for fast sorting (if any)"""
+        """The sort slot column in the documents table this field is copied to when it is written (if any)"""
         return self.sort_slot
+
+    @property
+    def sort_read_column(self) -> str | None:
+        """The sort slot column to sort on: only once it is filled for all documents"""
+        return self.sort_slot if self.sort_ready else None
 
     def derived_key(self, part: str) -> str:
         """json key of a derived value (e.g. the month of a date field)"""
@@ -193,11 +225,18 @@ def normalize_geo(value: Any) -> dict[str, float]:
     return {"lat": lat, "lon": lon}
 
 
-FIELD_COLUMNS = "pk, name, type, unique_field, sort_slot"
+FIELD_COLUMNS = "pk, name, type, unique_field, sort_slot, sort_slot_ready"
 
 
 def field_info_from_row(row: dict) -> FieldInfo:
-    return FieldInfo(pk=row["pk"], name=row["name"], type=row["type"], unique=row["unique_field"], sort_slot=row["sort_slot"])
+    return FieldInfo(
+        pk=row["pk"],
+        name=row["name"],
+        type=row["type"],
+        unique=row["unique_field"],
+        sort_slot=row["sort_slot"],
+        sort_ready=row.get("sort_slot_ready", True),
+    )
 
 
 async def list_field_infos(conn: AsyncConnection, project_pk: int) -> dict[str, FieldInfo]:

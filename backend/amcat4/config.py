@@ -136,6 +136,28 @@ class Settings(BaseSettings):
         ),
     ] = True
 
+    byte_order_sort: Annotated[
+        bool,
+        Field(
+            description=(
+                'Sort text values (keyword, url) that are not in a sort slot in byte order (COLLATE "C"), like the slot '
+                "columns and Elasticsearch, so the order does not change when a field gets a slot. false = the database's "
+                "collation, as before (AMCAT4_BYTE_ORDER_SORT=false)"
+            ),
+        ),
+    ] = True
+
+    sort_slot_job_rows: Annotated[
+        int,
+        Field(
+            description=(
+                "fast_sort on a field of a project with more documents than this fills (or clears) the sort slot in a "
+                "background job, in batches; until it is done the field is sorted the slower way. Smaller projects: "
+                "right away, in the request. -1 = always in the request (as before); 0 = always a job"
+            ),
+        ),
+    ] = 10000
+
     custom_plans: Annotated[
         bool,
         Field(

@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Awaitable, Callable
 
-from psycopg import sql
+from psycopg import AsyncConnection, sql
 from psycopg.types.json import Jsonb
 
 from amcat4.connections import server_defaults
@@ -33,12 +33,15 @@ from amcat4.errors import NotFoundError
 from amcat4.models import CreateDocumentField, FieldType, FilterSpec
 from amcat4.postgres import documents as storage
 from amcat4.postgres.connection import connection, execute, fetch_all, fetch_one
-from amcat4.postgres.fields import FieldSet
+from amcat4.postgres.fields import FIELD_COLUMNS, FieldSet
 from amcat4.postgres.projects import project_partitions, project_pk
 from amcat4.postgres.search import SearchQuery, compile_search
 from amcat4.projects import maintenance
 
 BATCH_SIZE = 2000
+# Documents per transaction when filling a sort slot. Every transaction adds a segment to the search index (on
+# pg_search 0.26, which does not merge them, see amcat4.projects.maintenance), so not too small
+FILL_BATCH_SIZE = 10_000
 STALE_AFTER = "2 minutes"  # running jobs that were not updated for this long are considered interrupted
 HEARTBEAT_SECONDS = 30
 
@@ -79,6 +82,18 @@ async def create_job(type: str, project: str | None, created_by: str | None, par
         [job_id, type, pk, created_by, Jsonb(params)],
     )
     return await get_job(job_id)
+
+
+async def create_job_in_transaction(conn: AsyncConnection, type: str, project_pk: int | None, params: dict) -> str:
+    """Create a job with this connection, so it only exists if the transaction it is in commits. Returns its id."""
+    if type not in HANDLERS:
+        raise ValueError(f"Unknown job type {type}")
+    job_id = uuid.uuid4().hex
+    await conn.execute(
+        "INSERT INTO jobs (id, type, status, project_pk, params) VALUES (%s, %s, 'pending', %s, %s)",
+        [job_id, type, project_pk, Jsonb(params)],
+    )
+    return job_id
 
 
 async def get_job(job_id: str) -> dict:
@@ -278,8 +293,48 @@ async def _copy_job(job: Job) -> dict[str, Any]:
     return {"copied": job.progress["copied"]}
 
 
+async def _fill_sort_slot_job(job: Job) -> dict[str, Any]:
+    """
+    Copy the values of a field into its sort slot column for all documents of the project, in batches (or clear the
+    column: field_pk None). params: project_pk, slot, field_pk. Resumable: progress is the last document id.
+    Stops early if the slot was given to another field meanwhile (that field's own fill covers every document).
+    When done, the field's sort_slot_ready is set, and sorting uses the slot.
+    """
+    from amcat4.postgres.fields import field_info_from_row
+
+    p = job.params
+    project, slot, field_pk = p["project_pk"], p["slot"], p.get("field_pk")
+    async with connection() as conn:
+        # waits for a fill or clear of the same slot that is still running (another job, or a field update)
+        await storage.lock_sort_slot(conn, project, slot)
+        try:
+            while True:
+                cur = await conn.execute(
+                    f"SELECT {FIELD_COLUMNS} FROM fields WHERE project_pk = %s AND sort_slot = %s",  # type: ignore[arg-type]
+                    [project, slot],
+                )
+                owner = await cur.fetchone()
+                if (owner["pk"] if owner else None) != field_pk:  # type: ignore[index, call-overload]
+                    return {"stopped": f"slot {slot} is now used by another field", **job.progress}
+                f = field_info_from_row(owner) if owner else None  # type: ignore[arg-type]
+                last = await storage.fill_sort_slot(
+                    conn, project, slot, f, after_id=job.progress.get("after_id"), batch_size=FILL_BATCH_SIZE
+                )
+                if last is None:
+                    break
+                await job.save_progress(after_id=last, batches=job.progress.get("batches", 0) + 1)
+            if field_pk is not None:
+                await conn.execute(
+                    "UPDATE fields SET sort_slot_ready = true WHERE pk = %s AND sort_slot = %s", [field_pk, slot]
+                )
+        finally:
+            await storage.lock_sort_slot(conn, project, slot, unlock=True)
+    return {"slot": slot, "field_pk": field_pk, "batches": job.progress.get("batches", 0)}
+
+
 HANDLERS: dict[str, Callable[[Job], Awaitable[dict[str, Any]]]] = {
     "copy": _copy_job,
+    "fill_sort_slot": _fill_sort_slot_job,
     "reindex": maintenance.reindex_job,
 }
 

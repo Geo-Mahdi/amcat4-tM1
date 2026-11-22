@@ -121,8 +121,9 @@ async def test_sort_slots(docs_index):
     assert fields["n"].sort_slot is None
     assert await order("date", "desc") == ["2", "1", "3"]
     assert await order("n") == ["1", "3", "2"]  # sorting on fields without slot also works
-    with pytest.raises(ValueError):
-        await update_fields(docs_index, {"n": UpdateDocumentField(fast_sort=True)})  # no standard number column
+    await update_fields(docs_index, {"n": UpdateDocumentField(fast_sort=True)})  # the number slot (migration 0002)
+    assert (await list_fields(docs_index))["n"].sort_slot == "sort_num1"
+    assert await order("n") == ["1", "3", "2"] and await order("n", "desc") == ["2", "3", "1"]
 
     await update_fields(docs_index, {"source": UpdateDocumentField(fast_sort=False)})
     assert (await list_fields(docs_index))["source"].sort_slot is None

@@ -11,8 +11,10 @@ from typing import Any, Mapping, get_args
 
 from fastapi import HTTPException
 from psycopg import sql
+from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
+from amcat4.config import get_settings
 from amcat4.connections import with_server_defaults
 from amcat4.errors import NotFoundError
 from amcat4.models import (
@@ -28,13 +30,28 @@ from amcat4.models import (
     User,
 )
 from amcat4.postgres.connection import connection, fetch_all
-from amcat4.postgres.documents import convert_field, delete_field_values, update_dedup_hashes
-from amcat4.postgres.fields import FieldInfo, FieldSet, field_info_from_row, sort_slot_for_type, storage_column
+from amcat4.postgres.documents import (
+    convert_field,
+    delete_field_values,
+    fill_sort_slot,
+    project_size_at_most,
+    try_lock_sort_slot,
+    update_dedup_hashes,
+)
+from amcat4.postgres.fields import (
+    FIELD_COLUMNS,
+    FieldInfo,
+    FieldSet,
+    field_info_from_row,
+    sort_slot_for_type,
+    sort_slots_for_type,
+    storage_column,
+)
 from amcat4.postgres.layout import project_filter
 from amcat4.postgres.projects import project_partitions, project_pk, project_pks
 from amcat4.systemdata.roles import get_user_project_role, role_is_at_least
 
-_COLUMNS = "pk, name, type, unique_field, metareader, reader, client_settings, sort_slot"
+_COLUMNS = "pk, name, type, unique_field, metareader, reader, client_settings, sort_slot, sort_slot_ready"
 
 
 def _document_field(row: dict) -> DocumentField:
@@ -44,7 +61,8 @@ def _document_field(row: dict) -> DocumentField:
         metareader=row["metareader"],
         reader=row["reader"],
         client_settings=row["client_settings"],
-        sort_slot=row["sort_slot"],
+        # a slot that is still being filled is not shown (sorting does not use it yet)
+        sort_slot=row["sort_slot"] if row["sort_slot_ready"] else None,
     )
 
 
@@ -93,7 +111,7 @@ async def get_fieldset(indices: str | list[str], queryable: set[str] | None = No
     indices = [indices] if isinstance(indices, str) else indices
     pks = await project_pks(indices)
     rows = await fetch_all(
-        "SELECT project_pk, pk, name, type, unique_field, sort_slot FROM fields WHERE project_pk = ANY(%s) ORDER BY pk",
+        f"SELECT project_pk, {FIELD_COLUMNS} FROM fields WHERE project_pk = ANY(%s) ORDER BY pk",  # type: ignore[arg-type]
         [list(pks.values())],
     )
     project_fields: dict[int, dict[str, FieldInfo]] = {pk: {} for pk in pks.values()}
@@ -145,8 +163,9 @@ async def create_fields(index: str, fields: Mapping[str, FieldType | CreateDocum
             used_slots = {row["sort_slot"] for row in await cur.fetchall()}  # type: ignore[index, call-overload]
             for name, f in new_fields.items():
                 # The first date field, and a keyword field called source, automatically get the standard columns
+                # (the other slots only with fast_sort)
                 slot = sort_slot_for_type(f.type)
-                if slot is None or slot in used_slots or (slot == "source" and name.lower() != "source"):
+                if slot in used_slots or not (f.type == "date" or (f.type == "keyword" and name.lower() == "source")):
                     slot = None
                 if slot:
                     used_slots.add(slot)
@@ -196,11 +215,19 @@ async def update_fields(index: str, fields: dict[str, UpdateDocumentField]):
                     new_info = FieldInfo(pk=info.pk, name=info.name, type=update.type, unique=info.unique)
                     await convert_field(conn, pk, info, new_info)
                     settings["type"] = update.type
-                    if info.sort_slot and sort_slot_for_type(update.type) != info.sort_slot:
+                    if info.sort_slot and info.sort_slot not in sort_slots_for_type(update.type):
                         await _set_sort_slot(conn, pk, info, False)
                         settings["sort_slot"] = None
+                        info = FieldInfo(pk=info.pk, name=info.name, type=info.type, unique=info.unique)
+                    # A slot of the same kind is kept as it is: within a kind the converted values are the same (keyword
+                    # and url are the same string, integer and number the same number)
                     info = FieldInfo(
-                        pk=info.pk, name=info.name, type=update.type, unique=info.unique, sort_slot=settings["sort_slot"]
+                        pk=info.pk,
+                        name=info.name,
+                        type=update.type,
+                        unique=info.unique,
+                        sort_slot=info.sort_slot,
+                        sort_ready=info.sort_ready,
                     )
                     recompute_unique = recompute_unique or info.unique
                 if update.unique is not None and update.unique != current.unique:
@@ -225,9 +252,7 @@ async def update_fields(index: str, fields: dict[str, UpdateDocumentField]):
                     ],
                 )
                 if update.fast_sort is not None:
-                    await _set_sort_slot(
-                        conn, pk, FieldInfo(pk=info.pk, name=name, type=new.type, sort_slot=info.sort_slot), update.fast_sort
-                    )
+                    await _set_sort_slot(conn, pk, info, update.fast_sort)
                 if update.name is not None and update.name != name:
                     await _rename_field(conn, pk, name, update.name)
 
@@ -256,30 +281,56 @@ async def _rename_field(conn, pk: int, old: str, new: str) -> None:
 
 
 async def _set_sort_slot(conn, project: int, f: FieldInfo, fast_sort: bool) -> None:
-    """Put a field in its sort slot (or remove it), and copy the values to the sort column"""
+    """
+    Put a field in a free sort slot of its kind (or take it out), and copy its values to the slot column (or clear it).
+    Raises ValueError if the type has no slots, or all slots of its kind are used by other fields of the project.
+    """
     if not fast_sort:
         if f.sort_slot:
-            await conn.execute("UPDATE fields SET sort_slot = NULL WHERE pk = %s", [f.pk])
-            await conn.execute(
-                sql.SQL("UPDATE documents SET {} = NULL WHERE {}").format(
-                    sql.Identifier(f.sort_slot), await project_filter(conn, project)
-                )
-            )
+            await conn.execute("UPDATE fields SET sort_slot = NULL, sort_slot_ready = true WHERE pk = %s", [f.pk])
+            await _fill_slot(conn, project, f.sort_slot, None)
         return
-    slot = sort_slot_for_type(f.type)
-    if slot is None:
+    slots = sort_slots_for_type(f.type)
+    if not slots:
         raise ValueError(f"Fields of type {f.type} cannot be used for fast sorting")
-    if f.sort_slot == slot:
+    if f.sort_slot in slots:
         return
-    await conn.execute("UPDATE fields SET sort_slot = NULL WHERE project_pk = %s AND sort_slot = %s", [project, slot])
-    await conn.execute("UPDATE fields SET sort_slot = %s WHERE pk = %s", [slot, f.pk])
-    cast = {"date": sql.SQL("timestamptz"), "source": sql.SQL("text")}[slot]
-    where = await project_filter(conn, project)
-    await conn.execute(
-        sql.SQL("UPDATE documents SET {} = ({}->>{})::{} WHERE {}").format(
-            sql.Identifier(slot), sql.Identifier(f.column), sql.Literal(f.key), cast, where
+    cur = await conn.execute("SELECT sort_slot, name FROM fields WHERE project_pk = %s AND sort_slot IS NOT NULL", [project])
+    used = {row["sort_slot"]: row["name"] for row in await cur.fetchall()}
+    free = [slot for slot in slots if slot not in used]
+    if not free:
+        taken = ", ".join(f"{slot} ({used[slot]})" for slot in slots)
+        raise ValueError(
+            f"No free sort slot for {f.type} field {f.name}: all slots for {f.type} fields are in use: {taken}. "
+            "Set fast_sort to false for one of these fields first."
         )
-    )
+    try:
+        async with conn.transaction():  # (a savepoint)
+            await conn.execute("UPDATE fields SET sort_slot = %s, sort_slot_ready = false WHERE pk = %s", [free[0], f.pk])
+    except UniqueViolation:
+        raise ValueError(f"Sort slot {free[0]} was just taken by another field, please try again")
+    await _fill_slot(conn, project, free[0], f)
+
+
+async def _fill_slot(conn, project: int, slot: str, f: FieldInfo | None) -> None:
+    """
+    Copy the values of f into the slot column for all documents of the project (f None: clear the column).
+    Small projects: right here, in the transaction of the field update. Projects with more than sort_slot_job_rows
+    documents: a background job (fill_sort_slot) that does it in batches, because it rewrites every document with a
+    value (and indexes it again); until it is done, the field is not sorted on the slot (sort_slot_ready).
+    """
+    job_rows = get_settings().sort_slot_job_rows
+    small = job_rows < 0 or await project_size_at_most(conn, project, job_rows)
+    # a fill job for this slot may still be running (e.g. after the project grew): then this becomes a job too
+    if small and await try_lock_sort_slot(conn, project, slot):
+        await fill_sort_slot(conn, project, slot, f)
+        if f is not None:
+            await conn.execute("UPDATE fields SET sort_slot_ready = true WHERE pk = %s AND sort_slot = %s", [f.pk, slot])
+        return
+    from amcat4.projects.jobs import create_job_in_transaction
+
+    params = {"project_pk": project, "slot": slot, "field_pk": f.pk if f is not None else None}
+    await create_job_in_transaction(conn, "fill_sort_slot", project, params)
 
 
 ###################### FIELD ACCESS ######################
