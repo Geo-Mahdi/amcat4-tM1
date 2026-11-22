@@ -20,6 +20,22 @@ async def _partition_index(index: str) -> tuple[int, str]:
     return partition_id, partition["index"]
 
 
+async def _only_own_partition(monkeypatch, index: str) -> int:
+    """
+    Let the maintenance check see only the partition of this project, and return its id. Other tests can leave other
+    partitions that need a rebuild too (on pg_search 0.26, which does not merge, test_phase_c leaves more than
+    MIN_SEGMENTS segments in the shared test partition); the check creates one reindex job at a time, for the partition
+    with the most segments, so these tests failed when they ran after test_phase_c (the job was for another partition).
+    """
+    partition_id, _ = await _partition_index(index)
+
+    async def own_partition(conn):
+        return [p for p in await list_partitions(conn) if p["partition_id"] == partition_id]
+
+    monkeypatch.setattr(maintenance, "list_partitions", own_partition)
+    return partition_id
+
+
 @asynccontextmanager
 async def no_background_merging(index: str):
     """
@@ -75,7 +91,7 @@ async def test_periodic_tasks(clean_jobs, monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_reindex_when_quiet(clean_jobs):
+async def test_reindex_when_quiet(clean_jobs, monkeypatch):
     """
     A partition with many segments is rebuilt by a job, but only once it has been quiet for QUIET_PERIOD (background
     merging is off here so the test is the same on pg_search 0.26 and 0.27)
@@ -84,6 +100,7 @@ async def test_reindex_when_quiet(clean_jobs):
     await delete_project_index(index, ignore_missing=True)
     try:
         await create_project_index(ProjectSettings(id=index))
+        await _only_own_partition(monkeypatch, index)
         async with no_background_merging(index):
             for i in range(maintenance.MIN_SEGMENTS + 1):  # every upload adds a segment
                 await upload(index, [{"text": f"document {i}"}], fields={"text": "text"})
@@ -130,12 +147,13 @@ async def _check_reindex_when_quiet(partition_id: int, reason: str = "segments")
 
 
 @pytest.mark.anyio
-async def test_reindex_if_never_quiet(clean_jobs):
+async def test_reindex_if_never_quiet(clean_jobs, monkeypatch):
     """A partition that keeps changing is rebuilt anyway once it needed a rebuild for MAX_WAIT"""
     index = "amcat4_unittest_maintenance"
     await delete_project_index(index, ignore_missing=True)
     try:
         await create_project_index(ProjectSettings(id=index))
+        await _only_own_partition(monkeypatch, index)
         async with no_background_merging(index):
             for i in range(maintenance.MIN_SEGMENTS + 1):
                 await upload(index, [{"text": f"document {i}"}], fields={"text": "text"})
@@ -149,12 +167,13 @@ async def test_reindex_if_never_quiet(clean_jobs):
 
 
 @pytest.mark.anyio
-async def test_reindex_deleted_documents(clean_jobs):
+async def test_reindex_deleted_documents(clean_jobs, monkeypatch):
     """Many deleted documents (e.g. after a mass update or delete) also lead to a rebuild, on every pg_search version"""
     index = "amcat4_unittest_maintenance"
     await delete_project_index(index, ignore_missing=True)
     try:
         await create_project_index(ProjectSettings(id=index))
+        await _only_own_partition(monkeypatch, index)
         async with no_background_merging(index):
             # one segment, so the segment trigger cannot fire
             await upload(index, [{"_id": str(i), "text": f"document {i}"} for i in range(200)], fields={"text": "text"})
@@ -181,6 +200,7 @@ async def test_merging_is_activity(clean_jobs, monkeypatch):
     await delete_project_index(index, ignore_missing=True)
     try:
         await create_project_index(ProjectSettings(id=index))
+        await _only_own_partition(monkeypatch, index)
         async with no_background_merging(index):
             for i in range(maintenance.MIN_SEGMENTS + 1):
                 await upload(index, [{"text": f"document {i}"}], fields={"text": "text"})
