@@ -16,7 +16,9 @@ from sqlalchemy import create_engine, text
 from amcat4.config import get_settings
 from amcat4.connections import db_schema
 
-# Arbitrary key for the advisory lock that makes sure only one process runs migrations at a time
+# Arbitrary key for the advisory lock that makes sure only one process runs migrations at a time. It is also the key
+# of amcat4.postgres.layout._PARTITION_LOCK (as in the original code), which is kept on purpose: no partition is
+# created and no move starts while migrations run (see the comment there)
 MIGRATION_LOCK = 4_000_001
 
 

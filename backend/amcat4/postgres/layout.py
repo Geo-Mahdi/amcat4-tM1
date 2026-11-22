@@ -87,7 +87,14 @@ from amcat4.config import get_settings
 from amcat4.errors import ConflictError
 
 # Keys of the advisory locks that serialize assigning partitions (so two new projects cannot both create one), and
-# rebuilding BM25 indexes (one at a time: a rebuild uses many cores)
+# rebuilding BM25 indexes (one at a time: a rebuild uses many cores).
+# _PARTITION_LOCK is the same key as MIGRATION_LOCK (amcat4/migrations/env.py), as in the original code. Kept on
+# purpose: while migrations run (they change the documents table and its partitions, e.g. 0002 builds the partition
+# indexes and 0003 adds project_partitions), no process creates a partition or starts a move; those wait until the
+# migrations are done. Distinct keys would end this. Also for a server of the older version that keeps running while
+# a newer one migrates (a rolling upgrade): with a new key on either side, it could create a partition in the middle
+# of a migration that changes the partitions. The cost of the shared key: creating a project waits while migrations
+# run (minutes for a long one, such as the index build of 0002).
 _PARTITION_LOCK = 4_000_001
 _REINDEX_LOCK = 4_000_002
 
