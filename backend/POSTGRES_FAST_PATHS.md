@@ -127,8 +127,8 @@ documents, resumable; reads are never blocked (every read path looks in both par
 refused with a conflict during the move. Setting `projects.partition_id` directly still moves everything in one
 statement, as in the original (the original test passes unchanged). Details of the fixes after the first version:
 the partition and the move target are read in one statement (before, a finishing move could give 0 documents); step 1
-is idempotent when a job stops halfway; fill and backfill jobs wait for a move (`JobPostponed`, 30 s) instead of
-failing. Files: `projects/partitions.py`, `postgres/layout.py`, `projects/jobs.py`, `__main__.py`, migration 0003.
+is idempotent when a job stops halfway; fill, backfill and copy jobs wait for a move (`JobPostponed`, 30 s) instead
+of failing (a copy waits for a move of its source and of its destination). Files: `projects/partitions.py`, `postgres/layout.py`, `projects/jobs.py`, `__main__.py`, migration 0003.
 
 ## 7. Robustness under load, and other fixes
 

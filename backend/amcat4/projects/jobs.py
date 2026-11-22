@@ -278,10 +278,12 @@ async def _copy_job(job: Job) -> dict[str, Any]:
 
     p = job.params
     from_pk, to_pk = await project_pk(p["source"]), await project_pk(p["destination"])
-    if await fetch_one("SELECT 1 FROM projects WHERE pk = %s AND moving_to IS NOT NULL", [from_pk]):
-        # (the batches below read the source's documents in its partition: they would miss the ones already moved).
-        # The job fails; start the copy again after the move
-        raise ValueError(f"Project {p['source']} is being moved to another partition; copy it when that is done")
+    # While the source or the destination is being moved to another partition, the job is postponed (JobPostponed),
+    # at the start or between batches, and continues after the move: the batches read the source's documents in its
+    # partition (they would miss the ones already moved), and the destination refuses writes (ConflictError). Before,
+    # a moving source failed the job, and a destination that started moving failed it for good with ConflictError
+    await postpone_if_moving(from_pk)
+    await postpone_if_moving(to_pk)
 
     if "field_map" not in job.progress:
         # Set up the destination fields (only once)
@@ -337,6 +339,7 @@ async def _copy_job(job: Job) -> dict[str, Any]:
     )
     c = compile_search(FieldSet({from_pk: source_infos}, partitions=await project_partitions([from_pk])), query)
     while True:
+        await postpone_if_moving(from_pk)  # (c names the source's partition from before a move)
         async with connection() as conn:
             cur = await conn.execute(
                 sql.SQL("SELECT id FROM documents WHERE {} AND documents.id > %s ORDER BY id LIMIT %s").format(c.where),
@@ -345,7 +348,10 @@ async def _copy_job(job: Job) -> dict[str, Any]:
             ids = [row["id"] for row in await cur.fetchall()]  # type: ignore[index, call-overload]
             if not ids:
                 break
-            n = await storage.copy_batch(conn, from_pk, to_pk, field_map_infos, dest_infos, ids)
+            try:
+                n = await storage.copy_batch(conn, from_pk, to_pk, field_map_infos, dest_infos, ids)
+            except ConflictError as e:  # the destination is being moved (writes to it are refused until it is done)
+                raise JobPostponed(str(e)) from e
         await job.save_progress(after_id=ids[-1], copied=job.progress["copied"] + n)
     return {"copied": job.progress["copied"]}
 
