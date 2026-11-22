@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
+import psycopg
 from psycopg import AsyncConnection
 from psycopg_pool import PoolTimeout
 
@@ -61,3 +62,14 @@ async def fetch_one(query, params=None) -> dict | None:
     async with connection() as conn:
         cur = await conn.execute(query, params)
         return await cur.fetchone()  # type: ignore[return-value]
+
+
+def must_not_fall_back(e: BaseException) -> bool:
+    """
+    Whether a failed statement must not be retried with a slower fallback statement: it was cancelled (statement
+    timeout, QueryCanceled, which psycopg classes as OperationalError), or there is a problem with the connection or
+    the server (OperationalError, e.g. a lost connection, admin shutdown, out of memory, lock timeout; InterfaceError:
+    the client side). A fallback would only run longer, or fail again. Fallbacks are for query and feature errors
+    (e.g. a shape pg_search cannot handle in its index).
+    """
+    return isinstance(e, (psycopg.OperationalError, psycopg.InterfaceError))

@@ -185,3 +185,98 @@ async def test_index_metrics_empty_bucket(two, monkeypatch):
         assert fast == slow
         assert all(row[-4:] == (None, None, None, None) for row in fast if row[0] == "B")
     assert ("A", 4, -2.0 + -1 + 0 + 1, -0.5, -2.0, 1.0) in sorted((await query_aggregate(a, [Axis("pub")], aggs)).data)
+
+
+###################### 6. No slower fallback after a statement timeout or a connection problem ######################
+
+
+class _FailingConnection:
+    """A connection that raises `error` for statements for which marker(sql) is true (and counts them)"""
+
+    def __init__(self, conn, marker, error: Exception):
+        self.conn, self.marker, self.error, self.failed = conn, marker, error, 0
+
+    async def execute(self, stmt, params=None):
+        text = stmt if isinstance(stmt, str) else stmt.as_string(self.conn)
+        if self.marker(text):
+            self.failed += 1
+            raise self.error
+        return await self.conn.execute(stmt, params)
+
+
+def _failing(monkeypatch, module, marker, error: Exception) -> list[_FailingConnection]:
+    from contextlib import asynccontextmanager
+
+    from amcat4.postgres.connection import connection
+
+    made: list[_FailingConnection] = []
+
+    @asynccontextmanager
+    async def failing_connection():
+        async with connection() as conn:
+            made.append(_FailingConnection(conn, marker, error))
+            yield made[-1]
+
+    monkeypatch.setattr(module, "connection", failing_connection)
+    return made
+
+
+@pytest.mark.anyio
+async def test_statement_timeout_is_not_a_fallback_error():
+    """A real statement timeout is QueryCanceled, which must_not_fall_back recognizes"""
+    import psycopg
+
+    from amcat4.postgres.connection import connection, must_not_fall_back
+
+    async with connection() as conn:
+        await conn.execute("SET statement_timeout = 10")
+        try:
+            with pytest.raises(psycopg.errors.QueryCanceled) as e:
+                await conn.execute("SELECT pg_sleep(1)")
+        finally:
+            await conn.execute("RESET statement_timeout")
+    assert must_not_fall_back(e.value)
+    assert must_not_fall_back(psycopg.OperationalError("connection lost"))
+    assert not must_not_fall_back(psycopg.errors.InternalError_("too many buckets"))
+    assert not must_not_fall_back(psycopg.errors.FeatureNotSupported("not in the index"))
+
+
+IN_INDEX = {
+    # pdb.agg (a keyword axis)
+    "pdb.agg": ("pub", lambda text: "pdb.agg" in text),
+    # GROUP BY on the partition table (an integer axis, which pdb.agg does not do)
+    "in-index GROUP BY": ("n", lambda text: "GROUP BY" in text and '"documents_p' in text),
+}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("path", IN_INDEX.keys())
+async def test_aggregate_fallbacks(two, monkeypatch, path):
+    """
+    The in-index aggregations (pdb.agg; GROUP BY on the partition table) fall back to slower statements after a query
+    error, but raise a statement timeout or connection error at once (no second statement)
+    """
+    import psycopg
+
+    from amcat4.postgres import search as search_module
+    from amcat4.projects import aggregate as aggregate_module
+    from amcat4.projects.aggregate import Axis, query_aggregate
+
+    monkeypatch.setattr(aggregate_module, "SMALL_RESULT", 0)
+    monkeypatch.setattr(search_module, "COUNT_STEP", 0)
+    axis, marker = IN_INDEX[path]
+    a, _ = two
+    await upload(
+        a, [{"_id": f"d{i}", "pub": "AB"[i % 2], "n": i % 3} for i in range(9)], fields={"pub": "keyword", "n": "integer"}
+    )
+    expected = sorted((await query_aggregate(a, [Axis(axis)])).data)
+    # a query error: the fallback gives the same result
+    made = _failing(monkeypatch, aggregate_module, marker, psycopg.errors.InternalError_("in-index limit"))
+    assert sorted((await query_aggregate(a, [Axis(axis)])).data) == expected
+    assert made[-1].failed == 1
+    # a statement timeout, or a lost connection: raised, without a second (slower) statement
+    for error in (psycopg.errors.QueryCanceled("statement timeout"), psycopg.OperationalError("connection lost")):
+        made = _failing(monkeypatch, aggregate_module, marker, error)
+        with pytest.raises(type(error)):
+            await query_aggregate(a, [Axis(axis)])
+        assert made[-1].failed == 1

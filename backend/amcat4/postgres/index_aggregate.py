@@ -16,7 +16,8 @@ This module handles the common shapes and returns None for everything else, so t
 The query must use the partition table (CompiledSearch.fast), because pdb.agg does not work on the parent.
 
 Correctness rules: every terms aggregation asks for all buckets (MAX_BUCKETS); if pg_search reports buckets that
-were left out (sum_other_doc_count > 0) or fails, the result is not used (None) and GROUP BY runs instead.
+were left out (sum_other_doc_count > 0) or fails, the result is not used (None) and GROUP BY runs instead (but not
+after a statement timeout or a connection problem: these errors are raised).
 Documents without a value are reported by pg_search as a bucket with key null, which is the same as the NULL group
 of GROUP BY, except for tags, where GROUP BY (a lateral join over the tag list) has no NULL group.
 """
@@ -29,6 +30,7 @@ from typing import Any
 import psycopg
 from psycopg import AsyncConnection, sql
 
+from amcat4.postgres.connection import must_not_fall_back
 from amcat4.postgres.fields import DATE_DERIVED, FieldInfo, FieldSet, use_quarter_key
 
 MAX_BUCKETS = 65_000  # paradedb.max_term_agg_buckets
@@ -168,6 +170,8 @@ async def index_aggregate(
         cur = await conn.execute(stmt, params)
         result = (await cur.fetchone())["result"]  # type: ignore[index, call-overload]
     except psycopg.Error as e:
+        if must_not_fall_back(e):
+            raise
         logging.warning(f"pdb.agg failed, using GROUP BY instead: {e}")
         return None
     if isinstance(result, str):

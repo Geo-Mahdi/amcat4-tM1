@@ -12,7 +12,7 @@ from psycopg import sql
 from amcat4.models import FilterSpec, SortSpec
 from amcat4.postgres.aggregate import Axis as StorageAxis
 from amcat4.postgres.aggregate import axis_expr, postprocess_value, sort_key
-from amcat4.postgres.connection import connection
+from amcat4.postgres.connection import connection, must_not_fall_back
 from amcat4.postgres.documents import field_select
 from amcat4.postgres.fields import FieldSet, QueryError
 from amcat4.postgres.filters import field_sql
@@ -182,7 +182,7 @@ async def _aggregate(
             try:
                 cur = await conn.execute(statement(c), c.params)
             except psycopg.Error as e:
-                if not c.fast:
+                if not c.fast or must_not_fall_back(e):
                     raise
                 # The in-index GROUP BY has limits (e.g. at most paradedb.max_term_agg_buckets = 65,000 groups, an
                 # error rather than a silent cut). The original statement on the parent table has none of these.
