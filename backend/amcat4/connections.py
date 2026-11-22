@@ -1,7 +1,8 @@
+import functools
 import logging
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from contextvars import ContextVar
-from typing import Any, AsyncGenerator, Iterator
+from typing import Any, AsyncGenerator, Awaitable, Callable, Iterator, ParamSpec, TypeVar
 
 import httpx
 from aiobotocore.config import AioConfig
@@ -81,6 +82,21 @@ def server_defaults() -> Iterator[None]:
         _SERVER_DEFAULTS.reset(token)
 
 
+P = ParamSpec("P")
+T = TypeVar("T")
+
+
+def with_server_defaults(func: Callable[P, Awaitable[T]]) -> Callable[P, Awaitable[T]]:
+    """Decorator: run this (long) database work with the server's settings, see server_defaults"""
+
+    @functools.wraps(func)
+    async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+        with server_defaults():
+            return await func(*args, **kwargs)
+
+    return wrapper
+
+
 def db() -> AsyncConnectionPool[Any]:
     """
     Access the postgres connection pool. Use amcat4.postgres.connection.connection() to get a connection.
@@ -144,10 +160,13 @@ def _api_options() -> str:
         # (a count of a normal word: 10 ms with 4 workers, 3.7 ms without; and it also costs throughput under load).
         # Only very common words get slower, which the filter form of the project clause (search.py) makes up for.
         options.append(f"-c max_parallel_workers_per_gather={workers}")
+    if settings.statement_timeout_ms:
+        # a runaway search should not hold a connection (and a CPU) for minutes; the request gets a 503
+        options.append(f"-c statement_timeout={int(settings.statement_timeout_ms)}")
     return " ".join(options)
 
 
-async def _open_pool(name: str, options: str, min_size: int, max_size: int) -> AsyncConnectionPool[Any]:
+async def _open_pool(name: str, options: str, min_size: int, max_size: int, timeout: float = 30.0) -> AsyncConnectionPool[Any]:
     settings = get_settings()
     options = f"-c search_path={db_schema()},public {options}"
     if settings.custom_plans:
@@ -161,6 +180,7 @@ async def _open_pool(name: str, options: str, min_size: int, max_size: int) -> A
         max_size=max_size,
         open=False,
         name=name,
+        timeout=timeout,
         kwargs={"row_factory": dict_row, "autocommit": True, "options": options.strip()},
     )
     try:
@@ -175,7 +195,10 @@ async def _start_db():
     logging.debug(f"Connecting with postgres, schema {db_schema()}")
     # Two pools: one for API requests (tuned for short queries), one with the server's defaults for background jobs,
     # maintenance, CLI commands and long writes (see server_defaults). The second one opens connections only when needed.
-    CONNECTIONS.db = await _open_pool("amcat4-api", _api_options(), min_size=1, max_size=20)
+    # An API request waits at most pool_timeout_s for a connection (then HTTP 503, see api/__init__.py)
+    CONNECTIONS.db = await _open_pool(
+        "amcat4-api", _api_options(), min_size=1, max_size=20, timeout=get_settings().pool_timeout_s
+    )
     try:
         CONNECTIONS.db_work = await _open_pool("amcat4-work", "", min_size=0, max_size=10)
     except Exception:

@@ -9,7 +9,8 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
-from psycopg.errors import DataError
+from psycopg.errors import DataError, QueryCanceled
+from psycopg_pool import PoolTimeout
 from starlette.middleware.sessions import SessionMiddleware
 
 from amcat4.api.api_keys import app_api_keys
@@ -121,6 +122,26 @@ async def conflict_handler(request: Request, exc: ConflictError) -> JSONResponse
 async def data_error_handler(request: Request, exc: DataError) -> JSONResponse:
     """Invalid values in the database layer, e.g. a non-numeric value in a numeric filter"""
     return JSONResponse(status_code=422, content={"detail": str(exc).split("\n")[0]})
+
+
+@app.exception_handler(PoolTimeout)
+async def pool_timeout_handler(request: Request, exc: PoolTimeout) -> JSONResponse:
+    """All database connections are busy (see pool_timeout_s): answer quickly so the client can back off and retry"""
+    return JSONResponse(
+        status_code=503,
+        headers={"Retry-After": "1"},
+        content={"detail": "The server is busy (no free database connection), please try again shortly"},
+    )
+
+
+@app.exception_handler(QueryCanceled)
+async def query_canceled_handler(request: Request, exc: QueryCanceled) -> JSONResponse:
+    """A statement ran longer than statement_timeout_ms and was stopped"""
+    seconds = get_settings().statement_timeout_ms / 1000
+    return JSONResponse(
+        status_code=503,
+        content={"detail": f"The query took longer than {seconds:g} seconds and was stopped; try a more specific query"},
+    )
 
 
 @app.exception_handler(ValueError)

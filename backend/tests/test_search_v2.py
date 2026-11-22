@@ -4,6 +4,7 @@ Tests for the version 2 read paths:
 - the project and filters as unscored clauses (AMCAT4_FILTER_CLAUSES)
 - paging by id and the offset limit (AMCAT4_MAX_OFFSET)
 - one count, next to the page (AMCAT4_CAPPED_COUNT, AMCAT4_PARALLEL_COUNT)
+- behaviour under overload: statement timeout and quick 503 (AMCAT4_STATEMENT_TIMEOUT_MS, AMCAT4_POOL_TIMEOUT_S)
 
 The fixtures come from test_fast_path.py: two projects in the same partition, with overlapping words and values.
 """
@@ -11,11 +12,13 @@ The fixtures come from test_fast_path.py: two projects in the same partition, wi
 # ruff: noqa: F811 (the fixtures are imported from test_fast_path)
 
 import asyncio
+import time
 
 import pytest
 
+from amcat4.api import index_query as index_query_module
 from amcat4.config import Settings, get_settings
-from amcat4.connections import _api_options, db, server_defaults
+from amcat4.connections import CONNECTIONS, _api_options, db, server_defaults, with_server_defaults
 from amcat4.models import FieldSpec, FilterSpec, Roles, SortSpec
 from amcat4.postgres import search as search_module
 from amcat4.postgres.connection import connection, fetch_one, spare_connection
@@ -25,7 +28,7 @@ from amcat4.systemdata.fields import get_fieldset
 from amcat4.systemdata.roles import create_project_role
 from tests.conftest import upload
 from tests.test_fast_path import _same_partition, _search, index_paths, two_projects  # noqa: F401
-from tests.tools import post_json
+from tests.tools import auth_cookie, post_json
 
 
 @pytest.mark.anyio
@@ -282,3 +285,55 @@ async def test_parallel_count_busy_pool(two_projects):
             finally:
                 for c in held:
                     await pool.putconn(c)
+
+
+@pytest.mark.anyio
+async def test_statement_timeout_only_for_api(monkeypatch):
+    """API connections have the statement timeout; jobs, maintenance and long writes (server_defaults) do not"""
+    monkeypatch.setattr(get_settings(), "statement_timeout_ms", 0)
+    assert "statement_timeout" not in _api_options()
+    monkeypatch.setattr(get_settings(), "statement_timeout_ms", 1500)
+    assert "-c statement_timeout=1500" in _api_options()
+    query = "SELECT source FROM pg_settings WHERE name = 'statement_timeout'"
+    with server_defaults():
+        assert (await fetch_one(query))["source"] != "client"  # type: ignore[index]
+
+    @with_server_defaults
+    async def long_write():
+        return db()
+
+    assert await long_write() is not db()  # the decorated function uses the work pool
+    assert db() is CONNECTIONS.db
+
+
+@pytest.mark.anyio
+async def test_statement_timeout_gives_503(client, index, user, monkeypatch):
+    async def slow_query(*args, **kwargs):
+        async with connection() as conn, conn.transaction():
+            await conn.execute("SET LOCAL statement_timeout = 50")
+            await conn.execute("SELECT pg_sleep(2)")
+
+    await create_project_role(user, index, Roles.READER)
+    monkeypatch.setattr(index_query_module, "query_documents", slow_query)
+    r = await post_json(client, f"/index/{index}/query", user=user, json={}, expected=503)
+    assert "longer than" in r["detail"]
+
+
+@pytest.mark.anyio
+async def test_pool_exhausted_gives_quick_503(client, index, user, monkeypatch):
+    """When all API connections are busy, a request gets 503 with Retry-After after pool_timeout_s, not a long wait"""
+    await create_project_role(user, index, Roles.READER)
+    pool = db()
+    monkeypatch.setattr(pool, "timeout", 0.3)
+    held = []
+    try:
+        while (stats := pool.get_stats())["pool_available"] or stats["pool_size"] < pool.max_size:
+            held.append(await pool.getconn())
+        start = time.perf_counter()
+        r = await client.post(f"/index/{index}/query", json={}, cookies=auth_cookie(user, None))
+        assert r.status_code == 503 and r.headers["Retry-After"] == "1"
+        assert time.perf_counter() - start < 3
+    finally:
+        for c in held:
+            await pool.putconn(c)
+    await post_json(client, f"/index/{index}/query", user=user, json={}, expected=200)

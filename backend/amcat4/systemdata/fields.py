@@ -13,6 +13,7 @@ from fastapi import HTTPException
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
+from amcat4.connections import with_server_defaults
 from amcat4.errors import NotFoundError
 from amcat4.models import (
     CreateDocumentField,
@@ -53,6 +54,7 @@ async def delete_all_project_fields(index: str):
         await conn.execute("DELETE FROM fields WHERE project_pk = (SELECT pk FROM projects WHERE id = %s)", [index])
 
 
+@with_server_defaults
 async def delete_fields(index: str, names: list[str]) -> None:
     """Delete fields and their values from all documents of the project"""
     pk = await project_pk(index)
@@ -170,6 +172,7 @@ async def create_fields(index: str, fields: Mapping[str, FieldType | CreateDocum
                 await update_dedup_hashes(conn, pk, infos)
 
 
+@with_server_defaults
 async def update_fields(index: str, fields: dict[str, UpdateDocumentField]):
     """
     Update field settings. Changing the type converts the existing values (or raises an error, changing nothing).

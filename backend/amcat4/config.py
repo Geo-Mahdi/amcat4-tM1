@@ -146,6 +146,27 @@ class Settings(BaseSettings):
         ),
     ] = 0
 
+    statement_timeout_ms: Annotated[
+        int,
+        Field(
+            description=(
+                "Stop a statement of an API request that runs longer than this (milliseconds); the request gets HTTP 503. "
+                "0 = no limit. Background jobs, maintenance, CLI commands and long writes (uploads, update or delete by "
+                "query, field changes) have no limit"
+            ),
+        ),
+    ] = 30000
+
+    pool_timeout_s: Annotated[
+        float,
+        Field(
+            description=(
+                "How long an API request waits for a free database connection (seconds). After that it gets HTTP 503 "
+                "with Retry-After, so an overloaded server answers quickly instead of letting requests queue"
+            ),
+        ),
+    ] = 5
+
     auth: Annotated[AuthOptions, Field(description="Do we require authorization?")] = AuthOptions.no_auth
 
     cookie_secret: Annotated[

@@ -7,7 +7,7 @@ from botocore.exceptions import BotoCoreError
 from psycopg import sql
 
 from amcat4.config import get_settings
-from amcat4.connections import s3_enabled
+from amcat4.connections import s3_enabled, with_server_defaults
 from amcat4.errors import NotFoundError
 from amcat4.models import IndexId, ProjectSettings, RoleRule, Roles, User
 from amcat4.objectstorage.multimedia import delete_project_multimedia
@@ -58,6 +58,7 @@ async def archive_project_index(index_id: str, archived: bool):
     await set_project_archived(index_id, datetime.now(UTC) if archived else None)
 
 
+@with_server_defaults
 async def clear_project_index(index_id: str):
     """
     Clear all documents and fields from a project, keeping settings and roles intact.

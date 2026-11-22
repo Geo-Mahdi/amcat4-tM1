@@ -1,5 +1,6 @@
 from psycopg.types.json import Jsonb
 
+from amcat4.connections import with_server_defaults
 from amcat4.errors import NotFoundError
 from amcat4.models import ImageObject, IndexId, ProjectSettings, Roles, ServerSettings
 from amcat4.postgres.connection import connection, execute, fetch_one
@@ -70,6 +71,7 @@ async def set_project_archived(index_id: str, archived) -> None:
         raise NotFoundError(f"Project {index_id} does not exist")
 
 
+@with_server_defaults
 async def delete_project_settings(index_id: str, ignore_missing: bool = False):
     """Delete the project (including its fields and documents) and its roles"""
     async with connection() as conn:

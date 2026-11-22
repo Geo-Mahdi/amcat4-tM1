@@ -3,6 +3,7 @@ from typing import Any, Literal, Mapping
 from psycopg import sql
 from psycopg.errors import UniqueViolation
 
+from amcat4.connections import with_server_defaults
 from amcat4.errors import NotFoundError
 from amcat4.models import CreateDocumentField, DocumentFieldDefinition, FieldType
 from amcat4.postgres import documents as storage
@@ -13,6 +14,7 @@ from amcat4.postgres.projects import project_pk
 from amcat4.systemdata.fields import create_fields, field_infos
 
 
+@with_server_defaults
 async def create_or_update_documents(
     index: str,
     documents: list[dict[str, Any]],

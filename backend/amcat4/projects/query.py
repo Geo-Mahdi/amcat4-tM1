@@ -8,6 +8,7 @@ from math import ceil
 from typing import Any, Literal, Union
 
 from amcat4.config import get_settings
+from amcat4.connections import with_server_defaults
 from amcat4.models import FieldSpec, FilterSpec, SnippetParams, SortSpec
 from amcat4.postgres import documents as storage
 from amcat4.postgres.connection import connection
@@ -164,6 +165,7 @@ async def query_documents(
     return QueryResult(result.results, n=total, per_page=per_page, page=None if after else page, next=next_cursor)
 
 
+@with_server_defaults
 async def update_tag_query(
     index: str | list[str],
     action: Literal["add", "remove"],
@@ -185,6 +187,7 @@ async def update_tag_query(
     return dict(updated=updated, total=total)
 
 
+@with_server_defaults
 async def update_query(
     index: str | list[str],
     field: str,
@@ -201,6 +204,7 @@ async def update_query(
     return dict(updated=updated, total=updated)
 
 
+@with_server_defaults
 async def delete_query(
     index: str | list[str],
     queries: dict[str, str] | None = None,
