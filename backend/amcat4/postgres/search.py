@@ -186,6 +186,21 @@ def _coalesce(fs: list[FieldInfo]) -> sql.Composable:
     return exprs[0] if len(exprs) == 1 else sql.SQL("coalesce({})").format(sql.SQL(", ").join(exprs))
 
 
+def slot_sort_column(fieldset: FieldSet, name: str) -> str | None:
+    """
+    The sort slot column to sort on for a field, or None if the slot cannot be used (then the json value is sorted on).
+
+    A slot column holds, per project, whichever field that project put in the slot: in another project the same column
+    can hold another (maybe hidden) field. So the column is only used if every project of the query has this field
+    in the same slot, and the slot is filled (sort_read_column). This holds for the standard date and source slots too.
+    """
+    fs = fieldset.by_name[name]
+    columns = {f.sort_read_column for f in fs}
+    if len(fs) != len(fieldset.project_fields) or len(columns) != 1 or None in columns:
+        return None
+    return fs[0].sort_read_column
+
+
 def order_by(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "desc"]]] | None, scored: bool) -> sql.Composable:
     items: list[sql.Composable] = []
     for name, order in sort or []:
@@ -202,11 +217,11 @@ def order_by(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "desc"]]] 
             if name not in fieldset.by_name:
                 raise QueryError(f"Cannot sort on unknown field: {name}")
             fs = fieldset.by_name[name]
-            sort_columns = {f.sort_read_column for f in fs}
-            if len(sort_columns) == 1 and None not in sort_columns:
+            slot = slot_sort_column(fieldset, name)
+            if slot is not None:
                 # the field is in a sort slot: a real column, which pg_search can use for a fast Top-K scan. (Text slots
                 # have COLLATE "C", the byte order pg_search sorts in: another collation here would prevent Top-K)
-                items.append(sql.SQL("documents.{} {}").format(sql.Identifier(fs[0].sort_read_column), direction))  # type: ignore[arg-type]
+                items.append(sql.SQL("documents.{} {}").format(sql.Identifier(slot), direction))
             elif get_settings().byte_order_sort and fs[0].type in ("keyword", "url", "text", "tag"):
                 # The same order as the text slot columns (COLLATE "C", byte order), so sorting does not change when a
                 # field gets a slot, or while its slot is being filled. It is also the order of Elasticsearch
@@ -227,8 +242,7 @@ def _needs_late_fetch(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "
     for name in names:
         if name in ("_score", "_id") or name not in fieldset.by_name:
             continue
-        sort_columns = {f.sort_read_column for f in fieldset.by_name[name]}
-        if len(sort_columns) != 1 or None in sort_columns:
+        if slot_sort_column(fieldset, name) is None:
             return True
     return False
 
