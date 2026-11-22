@@ -80,7 +80,8 @@ class Settings(BaseSettings):
                 "Use the faster read paths: counts and aggregations inside the BM25 index of a single partition, "
                 "without a duplicate project term. "
                 "Why: aggregating on the partition table instead of the parent table took 37 ms instead of 1,640 ms, "
-                "with the same result (2.7 M documents, pg_search 0.26). "
+                "with the same result (the original statement, a 2.68 M document project in a partition of 13.4 M "
+                "documents, pg_search 0.26.0, 16 Nov 2026; not re-measured on this code). "
                 "Set to false to use the original SQL, e.g. to compare results "
                 "or if a result looks wrong (AMCAT4_FAST_PATH=false)"
             ),
@@ -135,7 +136,8 @@ class Settings(BaseSettings):
                 "Maximum depth (offset + per_page) of a request for a page number (page); deeper pages get HTTP 400, "
                 'with the advice to use "sort": "_seq" (paging by id, fast at any depth). Why: offset paging '
                 "computes and throws away all earlier hits, "
-                "so a download got slower with every page (a download by offset: 25,500 documents/s, by id: 107,600; "
+                "so a download got slower with every page (a download by offset: 25,500 documents/s, by id: 107,600, "
+                "on a synthetic 156k document partition with an earlier version of this branch; "
                 "like max_result_window in Elasticsearch). "
                 "Cursors (after) that the server issued are never limited. 0 = no limit, as in the original"
             ),
@@ -234,7 +236,8 @@ class Settings(BaseSettings):
                 "generic plan that ignores the project "
                 "and query. Why: psycopg prepares a statement after 5 uses on a connection; the generic plan made "
                 "counts 5-10x slower (469 ms against 84 ms "
-                "for a very common word, from the 11th request on); planning each statement costs 1-3 ms. false = "
+                "for a very common word, from the 11th request on, in the benchmark of the original code on 2.68 M "
+                "documents, pg_search 0.26.0, 15-16 Nov 2026); planning each statement costs 1-3 ms. false = "
                 "the postgres default (AMCAT4_CUSTOM_PLANS=false)"
             ),
         ),

@@ -13,8 +13,9 @@ Migrations 0002 and 0003 are new files; `0001_initial.py` is not changed.
 
 **Fast read path** (`AMCAT4_FAST_PATH`, default true). When all projects of a query are in one partition, the
 statement runs on that partition's table and not on the parent table, without the duplicate project term. Why:
-aggregating on the partition table instead of the parent took 37 ms instead of 1,640 ms with the same result (2.7 M
-documents, pg_search 0.26). Off: the original SQL. Files: `postgres/search.py`, `projects/aggregate.py`,
+aggregating on the partition table instead of the parent took 37 ms instead of 1,640 ms with the same result (the
+original statement on a 2.68 M document project in a partition of 13.4 M documents, pg_search 0.26.0, 16 Nov 2026; not
+re-measured on this code). Off: the original SQL. Files: `postgres/search.py`, `projects/aggregate.py`,
 `projects/index.py` (estimated project size, see 7).
 
 **Project and filters as unscored clauses** (`AMCAT4_FILTER_CLAUSES`, default true). The project condition and the
@@ -38,13 +39,14 @@ thirds of the work of a download; the exact share is from the commit message, no
 API connections run with `max_parallel_workers_per_gather = 0` (a count of a normal word: 10 ms with 4 workers, 3.7 ms
 without) and with `plan_cache_mode = force_custom_plan` (after 5 uses psycopg prepares a statement and postgres may
 use a generic plan that is 5-10x slower for pg_search: 84 ms for the first requests, 469 ms from the 11th on, for a very
-common word). Off: empty value for the first (the server's setting), `false` for the second. Files: `connections.py`,
+common word, in the benchmark of the original code on 2.68 M documents, pg_search 0.26.0, 15-16 Nov 2026). Off: empty value for the first (the server's setting), `false` for the second. Files: `connections.py`,
 `config.py`.
 
 **Listing without a query over a B-tree index** (`AMCAT4_BTREE_LISTING`, default true). A search without query string
 and without index filters, in id order, is plain SQL over the new index (partition_id, project_pk, id) of migration
-0002 and reads only the rows of the page (first page of the 2.7 M document project in a shared partition: 13.5 ms to
-0.14 ms in SQL, from research notes). Counts stay in the search index. Off: through the search index. Files:
+0002 and reads only the rows of the page (first 10 documents in psql, before migration 0002, on a copy of the 2.68 M
+document project alone in its partition: 13.5 ms through the search index, 0.14 ms over the primary key; pg_search
+0.26.0, 22 Nov 2026). Counts stay in the search index. Off: through the search index. Files:
 `postgres/search.py`, migration 0002.
 
 **Late fetch for sorts on json fields.** When the sort is on a json value (no sort slot), pg_search cannot do a Top-K
@@ -60,9 +62,11 @@ end of a phrase keeps a bound of 1000 expansions (10,000 took 5-20 s). A correct
 
 **New sort key `_seq`, depth limit** (`AMCAT4_MAX_OFFSET`, default 10000, 0 = off). `"sort": "_seq"` orders by the
 internal id (the order of storage) with an "after this document" cursor that stays fast at any depth (download by
-offset 25,500 documents/s, by id 107,600, query with 58k hits, synthetic). `_id` keeps its original meaning (the
-document id). Offset pages deeper than the limit get HTTP 400 with the advice to use `_seq`; cursors issued by the
-server are never limited. Off: `AMCAT4_MAX_OFFSET=0`. Files: `postgres/search.py`, `projects/query.py`.
+offset 25,500 documents/s, by id 107,600, query with 58k hits, synthetic 156k document partition, an earlier version
+of this branch). `_id` keeps its original meaning (the document id). Offset pages deeper than the limit get HTTP 400
+with the advice to use `_seq`; cursors issued by the server are never limited. Cursors are not signed, so a hand-made
+offset cursor is not limited either: the limit is a performance guard, not a security boundary. Every cursor value is
+checked (known keys, non-negative integers), so a hand-made cursor gives HTTP 400, not a database error. Off: `AMCAT4_MAX_OFFSET=0`. Files: `postgres/search.py`, `projects/query.py`.
 
 ## 3. Aggregations
 

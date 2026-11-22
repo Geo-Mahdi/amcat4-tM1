@@ -386,8 +386,9 @@ async def search(
     late_fetch = get_settings().fast_path and not keyset and not similar and _needs_late_fetch(fieldset, sort)
     if get_settings().btree_listing and c.plain_where is not None and not similar and (keyset or not sort):
         # No query string and no index filters, in id order: a plain SQL list over the B-tree index (partition_id,
-        # project_pk, id), which reads just the rows of the page (in SQL, first page of the 2.7M document project in a
-        # shared partition: 13.5 ms -> 0.14 ms, 22 Nov 2026). The total is still counted in the index.
+        # project_pk, id), which reads just the rows of the page (first 10 documents, in psql, on a copy of the 2.68 M
+        # document project alone in its partition, before migration 0002: 13.5 ms through the search index, 0.14 ms over
+        # the primary key B-tree; pg_search 0.26.0, 22 Nov 2026). The total is still counted in the index.
         # AMCAT4_BTREE_LISTING=false: list through the search index, as in the original
         where, params = c.plain_where, list(c.plain_params)
         if keyset and after_id is not None:

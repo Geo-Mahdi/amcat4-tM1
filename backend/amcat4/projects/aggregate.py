@@ -161,7 +161,8 @@ async def _aggregate(
     3. the same GROUP BY on the partition table, which pg_search can partly do inside the index;
     4. if 3 fails with a query or feature error: the original GROUP BY on the parent table.
     All give the same rows. Measured: a whole-project aggregation on the partition table took 37 ms against 1,640 ms on
-    the parent (2.7 M documents, pg_search 0.26); pdb.agg takes 30-50 ms per million documents for tag, quarter and
+    the parent (the original statement, a 2.68 M document project in a partition of 13.4 M documents, pg_search 0.26.0,
+    16 Nov 2026; not re-measured on this code); pdb.agg takes 30-50 ms per million documents for tag, quarter and
     metric axes, where GROUP BY fetches every row (0.6-0.8 s per million).
     A statement timeout or connection problem is raised at once, without a slower second statement.
     """

@@ -182,7 +182,8 @@ async def _open_pool(name: str, options: str, min_size: int, max_size: int, time
     if settings.custom_plans:
         # psycopg prepares a statement after 5 uses on a connection, and postgres may then switch to a generic plan
         # that does not know the project or query. For pg_search that plan is 5-10x slower (row estimate 1, no
-        # parallel workers); measured: the first 5 requests took 84 ms, from the 11th on 469 ms, for a very common word.
+        # parallel workers); measured in the benchmark of the original code (2.68 M documents, pg_search 0.26.0, 15-16 Nov
+        # 2026, through the API): the first 5 requests took 84 ms, from the 11th on 469 ms, for a very common word.
         # Planning each statement costs 1-3 ms, which is much less. settings.custom_plans = false restores the default.
         options += " -c plan_cache_mode=force_custom_plan"
     pool = AsyncConnectionPool(

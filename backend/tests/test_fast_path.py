@@ -79,7 +79,8 @@ async def _agg(index, axes, **kwargs):
 async def test_fast_path_uses_partition_table(two_projects):
     """
     The fast read path uses the partition table; writes and document id filters keep the parent table (aggregating on the
-    partition table instead of the parent: 37 ms instead of 1,640 ms)
+    partition table instead of the parent: 37 ms instead of 1,640 ms, measured with the original statement on 2.68 M
+    documents, pg_search 0.26.0, 16 Nov 2026)
     """
     if not get_settings().fast_path:
         pytest.skip("fast path switched off (AMCAT4_FAST_PATH=false)")
