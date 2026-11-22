@@ -169,7 +169,9 @@ def order_by(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "desc"]]] 
         elif name == "?":
             items.append(sql.SQL("random()"))
         elif name == "_id":
-            items.append(sql.SQL("documents.doc_id {}").format(direction))
+            # the internal id: the order in which documents were stored. Same order as id-ordered (keyset) paging, and
+            # pg_search can use it for a fast Top-K scan (the doc_id column is not in the search index)
+            items.append(sql.SQL("documents.id {}").format(direction))
         else:
             if name not in fieldset.by_name:
                 raise QueryError(f"Cannot sort on unknown field: {name}")
@@ -243,6 +245,7 @@ async def search(
     with_total: bool = True,
     keyset: bool = False,
     after_id: int | None = None,
+    descending: bool = False,
     offset: int | None = None,
     similar: tuple[str, list[float]] | None = None,
 ) -> SearchResult:
@@ -251,7 +254,7 @@ async def search(
     Access control on which fields may be returned (or only as snippets) is the responsibility of the caller.
 
     If keyset is True, results are ordered by internal id and only results after after_id are returned
-    (efficient pagination through large result sets; sort and page are ignored).
+    (efficient pagination through large result sets; sort and page are ignored). descending: keyset in reverse order.
     offset overrides page * per_page.
     similar: (vector field, vector): order by cosine distance to the vector (documents without vector are skipped)
     """
@@ -293,9 +296,9 @@ async def search(
         )
     if keyset:
         if after_id is not None:
-            where = sql.SQL("{} AND documents.id > %s").format(where)
+            where = sql.SQL("{} AND documents.id {} %s").format(where, sql.SQL("<" if descending else ">"))
             params.append(after_id)
-        ordering: sql.Composable = sql.SQL("documents.id")
+        ordering: sql.Composable = sql.SQL("documents.id DESC" if descending else "documents.id")
         offset = 0
     elif similar:
         ordering = sql.SQL("_similarity DESC, documents.id")

@@ -95,6 +95,16 @@ class Settings(BaseSettings):
         ),
     ] = True
 
+    max_offset: Annotated[
+        int,
+        Field(
+            description=(
+                "Maximum depth (offset + per_page) of offset paging in score or field order; deeper pages get HTTP 400, "
+                'with the advice to use "sort": "_id" (paging by id, fast at any depth). 0 = no limit'
+            ),
+        ),
+    ] = 10000
+
     custom_plans: Annotated[
         bool,
         Field(

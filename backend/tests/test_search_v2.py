@@ -1,6 +1,6 @@
 """
-Tests for the version 2 read paths: no parallel workers for API connections (AMCAT4_API_PARALLEL_WORKERS) and the
-project and filters as unscored clauses (AMCAT4_FILTER_CLAUSES).
+Tests for the version 2 read paths: no parallel workers for API connections (AMCAT4_API_PARALLEL_WORKERS), the
+project and filters as unscored clauses (AMCAT4_FILTER_CLAUSES), paging by id and the offset limit (AMCAT4_MAX_OFFSET).
 
 The fixtures come from test_fast_path.py: two projects in the same partition, with overlapping words and values.
 """
@@ -11,12 +11,15 @@ import pytest
 
 from amcat4.config import Settings, get_settings
 from amcat4.connections import _api_options, server_defaults
-from amcat4.models import FieldSpec, FilterSpec
+from amcat4.models import FieldSpec, FilterSpec, Roles, SortSpec
 from amcat4.postgres.connection import fetch_one
 from amcat4.postgres.search import SearchQuery, compile_search
-from amcat4.projects.query import delete_query, query_documents, update_tag_query
+from amcat4.projects.query import _decode_cursor, delete_query, query_documents, update_tag_query
 from amcat4.systemdata.fields import get_fieldset
+from amcat4.systemdata.roles import create_project_role
+from tests.conftest import upload
 from tests.test_fast_path import _same_partition, _search, index_paths, two_projects  # noqa: F401
+from tests.tools import post_json
 
 
 @pytest.mark.anyio
@@ -141,3 +144,77 @@ async def test_filter_form_writes(two_projects, monkeypatch):
     assert result["updated"] == len([i for i in range(40) if i % 7 == 1])
     assert (await _search(b))[0] == 25
     assert (await _search(a))[0] == 40 - result["updated"]
+
+
+async def _pages(client, user, url, body) -> tuple[list[int], list[dict]]:
+    r = await post_json(client, url, user=user, json=body, expected=200)
+    seen, metas = [h["i"] for h in r["results"]], [r["meta"]]
+    while r["meta"]["next"]:
+        r = await post_json(client, url, user=user, json={**body, "after": r["meta"]["next"]}, expected=200)
+        seen += [h["i"] for h in r["results"]]
+        metas.append(r["meta"])
+    return seen, metas
+
+
+@pytest.mark.anyio
+async def test_sort_id_keyset(client, index, user):
+    """sort _id pages a query by internal id with an 'after this id' cursor, in both directions"""
+    await create_project_role(user, index, Roles.READER)
+    await upload(
+        index,
+        docs=[{"i": i, "text": "even" if i % 2 == 0 else "odd"} for i in range(66)],
+        fields={"i": "integer", "text": "text"},
+    )
+    url = f"/index/{index}/query"
+    for direction in ("asc", "desc"):
+        body = {"queries": ["even"], "sort": [{"_id": {"order": direction}}], "per_page": 10, "fields": ["i"]}
+        seen, metas = await _pages(client, user, url, body)
+        assert sorted(seen) == list(range(0, 66, 2)) and len(seen) == 33
+        assert all(m["total_count"] == 33 for m in metas)
+        assert "id" in _decode_cursor(metas[0]["next"])  # a keyset cursor, not an offset
+        # the same order as one big page
+        r = await post_json(client, url, user=user, json={**body, "per_page": 1000}, expected=200)
+        assert seen == [h["i"] for h in r["results"]]
+        if direction == "asc":
+            ascending = seen
+        else:
+            assert seen == list(reversed(ascending))
+    # "sort": "_id" as a plain string works too
+    seen, _ = await _pages(client, user, url, {"queries": ["odd"], "sort": "_id", "per_page": 10, "fields": ["i"]})
+    assert sorted(seen) == list(range(1, 66, 2))
+
+
+@pytest.mark.anyio
+async def test_default_cursors_unchanged(index):
+    """Without sort, a query keeps the offset cursor and no query keeps the id cursor"""
+    await upload(index, docs=[{"i": i, "text": "word"} for i in range(30)], fields={"i": "integer", "text": "text"})
+    r = await query_documents(index, fields=[FieldSpec(name="i")], queries={"q": "word"}, per_page=10)
+    assert r.next is not None and "offset" in _decode_cursor(r.next)
+    r = await query_documents(index, fields=[FieldSpec(name="i")], per_page=10)
+    assert r.next is not None and "id" in _decode_cursor(r.next)
+
+
+@pytest.mark.anyio
+async def test_max_offset(client, index, user, monkeypatch):
+    """Offset paging stops at AMCAT4_MAX_OFFSET with a 400 that names sort _id; id paging has no limit"""
+    monkeypatch.setattr(get_settings(), "max_offset", 20)
+    await create_project_role(user, index, Roles.READER)
+    await upload(index, docs=[{"i": i, "text": "word"} for i in range(50)], fields={"i": "integer", "text": "text"})
+    url = f"/index/{index}/query"
+    body = {"queries": ["word"], "per_page": 10, "fields": ["i"]}
+    await post_json(client, url, user=user, json={**body, "page": 1}, expected=200)  # offset 10 + 10 = 20: allowed
+    r = await post_json(client, url, user=user, json={**body, "page": 2}, expected=400)
+    assert '"sort": "_id"' in r["message"]
+    # a cursor that walks past the limit fails the same way
+    r = await post_json(client, url, user=user, json=body, expected=200)
+    r = await post_json(client, url, user=user, json={**body, "after": r["meta"]["next"]}, expected=200)
+    await post_json(client, url, user=user, json={**body, "after": r["meta"]["next"]}, expected=400)
+    with pytest.raises(ValueError, match="_id"):
+        await query_documents(index, queries={"q": "word"}, sort=[{"i": SortSpec(order="desc")}], page=5, per_page=10)
+    # paging by id and paging without query are not limited
+    seen, _ = await _pages(client, user, url, {**body, "sort": "_id"})
+    assert sorted(seen) == list(range(50))
+    seen, _ = await _pages(client, user, url, {"per_page": 10, "fields": ["i"]})
+    assert sorted(seen) == list(range(50))
+    monkeypatch.setattr(get_settings(), "max_offset", 0)  # 0 = no limit
+    await post_json(client, url, user=user, json={**body, "page": 4}, expected=200)
