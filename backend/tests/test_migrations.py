@@ -1,6 +1,7 @@
 """
-Migration 0002 on a database that has data from 0001: rows are kept, the new columns and indexes exist, the search
-index is rebuilt with the slot columns, searching still works, and the downgrade gives back the 0001 schema.
+Migrations 0002 and 0003 on a database that has data from 0001: rows are kept, the new columns and indexes exist, the
+search index is rebuilt with the slot columns, searching still works, documents reference project_partitions (0003),
+and the downgrade gives back the 0001 schema.
 Runs in its own schema, next to the test schema.
 """
 
@@ -61,6 +62,16 @@ async def _indexdefs(conn, **where) -> list[str]:
     return [row["indexdef"] for row in await cur.fetchall()]
 
 
+async def _references(conn) -> str:
+    """The table that the foreign key of documents (project_pk, partition_id) references"""
+    row = await _one(
+        conn,
+        """SELECT confrelid::regclass::text AS t FROM pg_constraint
+           WHERE conrelid = 'documents'::regclass AND contype = 'f' AND convalidated""",
+    )
+    return row["t"]
+
+
 async def _columns(conn, table: str) -> set[str]:
     cur = await conn.execute(
         "SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = %s", [SCHEMA, table]
@@ -105,6 +116,10 @@ async def test_migration_0002_with_data():
 
         await asyncio.to_thread(_migrate, "upgrade", "head")
         assert (await _one(conn, "SELECT count(*) AS n FROM documents"))["n"] == 300
+        # 0003: documents reference project_partitions, which has a row for the project
+        assert await _references(conn) == "project_partitions"
+        row = await _one(conn, "SELECT project_pk, partition_id FROM project_partitions")
+        assert row == {"project_pk": project, "partition_id": 1}
         assert {"sort_kw1", "sort_kw2", "sort_kw3", "sort_num1", "sort_date2"} <= await _columns(conn, "documents")
         assert {"sort_kw1", "sort_num1"} <= await _columns(conn, "documents_p1")
         assert {"sort_slot_ready", "quarter_ready"} <= await _columns(conn, "fields")
@@ -146,6 +161,7 @@ async def test_migration_0002_with_data():
 
         await asyncio.to_thread(_migrate, "downgrade", "0001")
         assert (await _one(conn, "SELECT count(*) AS n FROM documents"))["n"] == 300
+        assert await _references(conn) == "projects"
         assert not {"sort_kw1", "sort_num1", "sort_date2"} & await _columns(conn, "documents")
         assert not {"sort_slot_ready", "quarter_ready"} & await _columns(conn, "fields")
         assert await _bm25(conn, "documents_p1") == bm25_0001

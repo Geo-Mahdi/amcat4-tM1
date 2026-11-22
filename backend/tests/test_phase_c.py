@@ -4,6 +4,7 @@ Tests for the version 2 changes that come with migration 0002:
 - the five extra sort slots, filling them in a job for large projects (AMCAT4_SORT_SLOT_JOB_ROWS), Top-K sorting
 - the derived quarter key of date fields, and its backfill job for older documents (AMCAT4_QUARTER_KEY)
 - vacuum after large changes (AMCAT4_VACUUM_AFTER_ROWS) and prewarming the search indexes (AMCAT4_PREWARM)
+- moving a project to a partition of its own, in batches (migration 0003, the move_project job)
 
 The fixtures come from test_fast_path.py: two projects in the same partition, with overlapping words and values.
 """
@@ -16,23 +17,25 @@ import pytest
 from psycopg import sql
 
 from amcat4.config import get_settings
-from amcat4.models import FilterSpec, ProjectSettings, SortSpec, UpdateDocumentField
+from amcat4.errors import ConflictError
+from amcat4.models import FieldSpec, FilterSpec, ProjectSettings, SortSpec, UpdateDocumentField
 from amcat4.postgres import index_aggregate
 from amcat4.postgres import search as search_module
 from amcat4.postgres.connection import connection, execute, fetch_all
 from amcat4.postgres.fields import normalize_date, quarter_sql
-from amcat4.postgres.layout import list_partitions, partition_of
+from amcat4.postgres.layout import list_partitions, partition_of, partition_table
 from amcat4.postgres.projects import project_pk
 from amcat4.postgres.search import SearchQuery, compile_search, order_by
 from amcat4.projects import aggregate as aggregate_module
-from amcat4.projects import jobs, maintenance
+from amcat4.projects import jobs, maintenance, partitions
 from amcat4.projects.aggregate import Aggregation, Axis, query_aggregate
-from amcat4.projects.documents import create_or_update_documents
+from amcat4.projects.documents import create_or_update_documents, fetch_document
 from amcat4.projects.index import create_project_index, delete_project_index
 from amcat4.projects.query import delete_query, query_documents, update_tag_query
 from amcat4.systemdata.fields import field_infos, get_fieldset, list_fields, update_fields
 from tests.conftest import upload
 from tests.test_fast_path import _same_partition, two_projects  # noqa: F401
+from tests.tools import amcat_settings
 
 
 async def _pages(index, per_page=7, **kwargs) -> list[str]:
@@ -502,3 +505,111 @@ async def test_prewarm(slot_project):
         partitions = await list_partitions(conn)
     # (if the server has no pg_prewarm, nothing is loaded, without an error)
     assert loaded in ([], [p["index"] for p in partitions])
+
+
+################ moving a project to its own partition ################
+
+
+async def _state(index: str) -> tuple:
+    """What readers see of a project: totals, hits, aggregations, single documents, vectors"""
+    r = await query_documents(index, fields=[FieldSpec(name="pub")], per_page=100, queries={"q": "common"})
+    listing = await _pages(index, per_page=9)
+    agg = await query_aggregate(index, [Axis("pub")], [Aggregation("n", "avg")])
+    first = listing[0]
+    return (
+        r.total_count,
+        sorted(d["_id"] for d in r.data),
+        listing,
+        sorted(map(str, agg.data)),
+        await fetch_document(index, first),
+        await fetch_document(index, listing[-1]),
+    )
+
+
+async def _partition_tables(index: str) -> list[str]:
+    rows = await fetch_all(
+        "SELECT DISTINCT tableoid::regclass::text AS t FROM documents WHERE project_pk = %s ORDER BY 1",
+        [await project_pk(index)],
+    )
+    return [row["t"] for row in rows]
+
+
+@pytest.mark.anyio
+async def test_move_project_in_batches(two_projects, monkeypatch):
+    a, b = two_projects
+    await create_or_update_documents(
+        a, [{"_id": f"a{i}", "vec": [1.0, i / 10]} for i in range(5)], {"vec": "vector"}, op_type="update"
+    )
+    before_a, before_b = await _state(a), await _state(b)
+    [source] = await _partition_tables(a)
+    monkeypatch.setattr(partitions, "MOVE_BATCH_SIZE", 15)
+
+    # run the job, and stop it after the first batch (as if the server stopped)
+    original = jobs.Job.save_progress
+
+    async def stop_after_first_batch(self, **progress):
+        await original(self, **progress)
+        if progress.get("moved"):
+            raise jobs.JobCancelled()
+
+    monkeypatch.setattr(jobs.Job, "save_progress", stop_after_first_batch)
+    job = await partitions.start_move(a)
+    await jobs.run_pending_jobs()
+    monkeypatch.setattr(jobs.Job, "save_progress", original)
+    progress = (await jobs.get_job(job["id"]))["progress"]
+    assert progress["moved"] == 15
+    target = partition_table(progress["target"])
+    assert await _partition_tables(a) == sorted([source, target])  # in two partitions
+
+    # halfway: readers see every document once, writers are refused, no second move, no new projects in the target
+    assert await _state(a) == before_a and await _state(b) == before_b
+    with pytest.raises(ConflictError):
+        await upload(a, [{"_id": "new", "text": "new"}])
+    with pytest.raises(ConflictError):
+        await update_tag_query(a, "add", "tags", "z")
+    with pytest.raises(ConflictError):
+        await delete_query(a, ids=["a1"])
+    await upload(b, [{"_id": "bnew", "text": "common b"}])  # other projects can still be written
+    await delete_query(b, ids=["bnew"])
+    with pytest.raises(ValueError, match="already being moved"):
+        await partitions.start_move(a)
+    other = "amcat4_unittest_move_other"
+    await delete_project_index(other, ignore_missing=True)
+    try:
+        await create_project_index(ProjectSettings(id=other))
+        assert await _project_partition(other) != progress["target"]
+
+        # resume: the job continues where it stopped
+        await execute("UPDATE jobs SET status = 'pending' WHERE id = %s", [job["id"]])
+        await jobs.run_pending_jobs()
+        done = await jobs.get_job(job["id"])
+        assert done["status"] == "done" and done["result"]["moved"] == 40 and done["result"]["target"] == target
+        assert await _partition_tables(a) == [target]
+        assert await _project_partition(a) == progress["target"]
+        assert await _state(a) == before_a and await _state(b) == before_b
+        rows = await fetch_all(
+            """SELECT DISTINCT partition_id FROM document_vectors v JOIN fields f ON f.pk = v.field_pk
+               WHERE f.name = 'vec' AND f.project_pk = %s""",
+            [await project_pk(a)],
+        )
+        assert [row["partition_id"] for row in rows] == [progress["target"]]  # the vectors moved along
+        # writes work again, and new projects still do not go to the project's own partition
+        await upload(a, [{"_id": "new", "text": "common new"}])
+        assert (await query_documents(a, queries={"q": "new"})).total_count == 1
+        with pytest.raises(ValueError, match="own"):
+            await partitions.start_move(a)
+        await delete_project_index(other)
+        await create_project_index(ProjectSettings(id=other))
+        assert await _project_partition(other) != progress["target"]
+        with amcat_settings(partition_max_gb=0):  # a full shared partition: a new one, not the project's own
+            await delete_project_index(other)
+            await create_project_index(ProjectSettings(id=other))
+            assert await _project_partition(other) > progress["target"]
+    finally:
+        await delete_project_index(other, ignore_missing=True)
+        await fetch_all("DELETE FROM jobs WHERE type IN ('move_project', 'vacuum') RETURNING id")
+
+
+async def _project_partition(index: str) -> int:
+    async with connection() as conn:
+        return await partition_of(conn, await project_pk(index))

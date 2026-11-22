@@ -23,11 +23,13 @@ Documents:
 - The documents table is list partitioned on partition_id, and every partition has its own BM25 index. Every project
   is assigned to a partition when it is created (projects.partition_id): the newest partition, until its BM25 index
   reaches partition_max_gb, after which a new partition is created. So the long tail of small projects shares
-  partitions, and a big project fills (most of) a partition. (Later: moving big projects to their own partition.)
+  partitions, and a big project fills (most of) a partition. A big project can be moved to a partition of its own
+  (amcat4.projects.partitions, in batches; projects.own_partition).
   Queries on a project only use its own partition, but only if they have a SQL condition on partition_id: postgres
   does not know that a project is in one partition (see project_filter). partition_id is also in the BM25 index:
   pg_search checks SQL conditions on columns outside the index against the table, for every match. A foreign key
-  keeps the documents of a project in its partition: updating projects.partition_id moves the documents.
+  keeps the documents of a project in its partition(s) (project_partitions, migration 0003: one row per project,
+  two while it is being moved): updating projects.partition_id moves the documents (a trigger, in one statement).
   Every upload adds segments to the BM25 index, and updates leave deleted documents in it. pg_search 0.26 does not
   merge segments (in our tests), so the number of segments grows with every upload; from 0.27 on, pg_search merges
   small segments in the background (index option background_layer_sizes), so it stays low. A periodic task rebuilds
@@ -55,13 +57,18 @@ TODO (later): read-only *reference* projects, that reference documents owned by 
 project ids inside the BM25 index and then joins on the referenced document ids. Not implemented yet.
 """
 
+import functools
 import logging
 import re
+from contextlib import AsyncExitStack, asynccontextmanager
+from typing import AsyncGenerator, Callable
 
 from psycopg import AsyncConnection, sql
 from psycopg.errors import LockNotAvailable
+from psycopg.pq import TransactionStatus
 
 from amcat4.config import get_settings
+from amcat4.errors import ConflictError
 
 # Keys of the advisory locks that serialize assigning partitions (so two new projects cannot both create one), and
 # rebuilding BM25 indexes (one at a time: a rebuild uses many cores)
@@ -85,11 +92,73 @@ async def partition_of(conn: AsyncConnection, project_pk: int) -> int:
 async def project_filter(conn: AsyncConnection, project_pk: int, table: str = "documents") -> sql.Composable:
     """
     SQL condition that selects the documents of a project. This includes the partition: postgres can only skip the
-    other partitions if the query has a condition on the partition key.
+    other partitions if the query has a condition on the partition key. While the project is being moved to another
+    partition (see amcat4.projects.partitions), its documents are in both.
     """
-    return sql.SQL("{t}.partition_id = {part} AND {t}.project_pk = {pk}").format(
-        t=sql.Identifier(table), part=sql.Literal(await partition_of(conn, project_pk)), pk=sql.Literal(project_pk)
-    )
+    cur = await conn.execute("SELECT partition_id, moving_to FROM projects WHERE pk = %s", [project_pk])
+    row: dict | None = await cur.fetchone()  # type: ignore[assignment]
+    if row is None:
+        raise ValueError(f"Project {project_pk} does not exist")
+    if row["moving_to"] is None:
+        part = sql.SQL("{t}.partition_id = {p}").format(t=sql.Identifier(table), p=sql.Literal(row["partition_id"]))
+    else:
+        part = sql.SQL("{t}.partition_id IN ({a}, {b})").format(
+            t=sql.Identifier(table), a=sql.Literal(row["partition_id"]), b=sql.Literal(row["moving_to"])
+        )
+    return sql.SQL("{part} AND {t}.project_pk = {pk}").format(part=part, t=sql.Identifier(table), pk=sql.Literal(project_pk))
+
+
+# Second key of the advisory lock (project_pk, _WRITE_LOCK) between writes to a project (shared) and moving it
+_WRITE_LOCK = 100
+
+
+@asynccontextmanager
+async def writing(conn: AsyncConnection, project_pk: int) -> AsyncGenerator[None, None]:
+    """
+    Wrap every write to the documents of a project. While the project is being moved to another partition, writes are
+    refused (ConflictError): uploads look up existing documents in the project's partition, and the move job relies on
+    the documents not changing. The shared lock makes the move wait for writes that already started.
+    """
+    # In a transaction: a transaction lock (released at commit or rollback, also after an error). Otherwise (autocommit
+    # statements) a session lock, released afterwards
+    in_transaction = conn.info.transaction_status != TransactionStatus.IDLE
+    function = "pg_advisory_xact_lock_shared" if in_transaction else "pg_advisory_lock_shared"
+    await conn.execute(f"SELECT {function}(%s, %s)", [project_pk, _WRITE_LOCK])  # type: ignore[arg-type]
+    try:
+        cur = await conn.execute("SELECT moving_to FROM projects WHERE pk = %s", [project_pk])
+        row = await cur.fetchone()
+        if row is not None and row["moving_to"] is not None:  # type: ignore[index, call-overload]
+            raise ConflictError("This project is being moved to another partition; please try again later")
+        yield
+    finally:
+        if not in_transaction:
+            await conn.execute("SELECT pg_advisory_unlock_shared(%s, %s)", [project_pk, _WRITE_LOCK])
+
+
+def guard_writes(project: Callable[..., int | list[int]]):
+    """
+    Decorator for the write functions of the storage layer (first argument: the connection): run the function inside
+    writing() for the project(s) that project(*args, **kwargs) returns.
+    """
+
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(conn, *args, **kwargs):
+            pks = project(conn, *args, **kwargs)
+            async with AsyncExitStack() as stack:
+                for pk in [pks] if isinstance(pks, int) else pks:
+                    await stack.enter_async_context(writing(conn, pk))
+                return await func(conn, *args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+async def lock_writes(conn: AsyncConnection, project_pk: int, unlock: bool = False) -> None:
+    """Wait for the writes to a project that are running (and keep new ones waiting), for the move job"""
+    function = "pg_advisory_unlock" if unlock else "pg_advisory_lock"
+    await conn.execute(f"SELECT {function}(%s, %s)", [project_pk, _WRITE_LOCK])  # type: ignore[arg-type]
 
 
 async def list_partitions(conn: AsyncConnection) -> list[dict]:
@@ -243,19 +312,38 @@ async def assign_partition(conn: AsyncConnection) -> int:
     """
     The partition for a new project: the newest partition, or a new one if the BM25 index of the newest partition
     has reached partition_max_gb. Call this in the transaction that creates the project.
-    Projects are never moved automatically: moving rewrites all documents of the project (and locks them).
+    Projects are never moved automatically: a big project can be moved to a partition of its own with the move_project
+    job (amcat4.projects.partitions). Partitions that projects have for themselves are not used for new projects.
     """
     await conn.execute("SELECT pg_advisory_xact_lock(%s)", [_PARTITION_LOCK])
-    newest = (await list_partitions(conn))[-1]
-    if newest["index_bytes"] < get_settings().partition_max_gb * 1024**3:
-        return newest["partition_id"]
-    partition_id = newest["partition_id"] + 1
+    partitions = await list_partitions(conn)
+    # not the partitions that a project has (or is getting) for itself
+    cur = await conn.execute(
+        """SELECT partition_id FROM projects WHERE own_partition
+           UNION SELECT moving_to FROM projects WHERE moving_to IS NOT NULL"""
+    )
+    own = {row["partition_id"] for row in await cur.fetchall()}  # type: ignore[index, call-overload]
+    shared = [p for p in partitions if p["partition_id"] not in own]
+    if shared and shared[-1]["index_bytes"] < get_settings().partition_max_gb * 1024**3:
+        return shared[-1]["partition_id"]
+    partition_id = await next_partition_id(conn)
     try:
         await create_partition(conn, partition_id)
     except LockNotAvailable:
+        if not shared:
+            raise
         logging.warning(f"Could not create documents partition {partition_id} (lock timeout), using the current one")
-        return newest["partition_id"]
+        return shared[-1]["partition_id"]
     return partition_id
+
+
+async def next_partition_id(conn: AsyncConnection) -> int:
+    """The id for a new partition (one more than the highest, also counting partitions without a valid index)"""
+    cur = await conn.execute(
+        r"""SELECT coalesce(max((regexp_match(pg_get_expr(c.relpartbound, c.oid), 'IN \((\d+)\)'))[1]::int), 0) AS n
+            FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid WHERE i.inhparent = 'documents'::regclass"""
+    )
+    return (await cur.fetchone())["n"] + 1  # type: ignore[index]
 
 
 async def drop_schema(conn: AsyncConnection, schema: str) -> None:

@@ -276,6 +276,7 @@ class FieldSet:
     queryable: names of fields that the user may search/filter on (None = all fields). This is where field-level
     access control plugs in. (Later we may distinguish visible, queryable-but-invisible, and invisible fields.)
     partitions: the documents partition of each project (needed for searching, see amcat4.postgres.layout)
+    moving: the partition a project is being moved to, for projects that are being moved (their documents are in both)
     """
 
     def __init__(
@@ -283,10 +284,12 @@ class FieldSet:
         project_fields: dict[int, dict[str, FieldInfo]],
         queryable: set[str] | None = None,
         partitions: dict[int, int] | None = None,
+        moving: dict[int, int] | None = None,
     ):
         self.project_fields = project_fields
         self.queryable = queryable
         self.partitions = partitions or {}
+        self.moving = moving or {}
         self.by_name: dict[str, list[FieldInfo]] = {}
         for fields in project_fields.values():
             for name, f in fields.items():
@@ -303,6 +306,11 @@ class FieldSet:
         if project_pk not in self.partitions:
             raise ValueError(f"Partition of project {project_pk} is unknown")
         return self.partitions[project_pk]
+
+    def all_partitions(self, project_pk: int) -> list[int]:
+        """The partitions that hold documents of the project: one, or two while it is being moved"""
+        moving = self.moving.get(project_pk)
+        return [self.partition(project_pk)] + ([moving] if moving is not None else [])
 
     def type(self, name: str) -> str:
         return self.by_name[name][0].type

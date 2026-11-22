@@ -221,6 +221,22 @@ async def optimize(args):
     logging.info("Done")
 
 
+async def move_project(args):
+    """
+    Move a project to a documents partition of its own, in batches (see amcat4.projects.partitions). Creates a job,
+    which the job worker of the server runs; with --now, it runs here (and waits until it is done).
+    """
+    from amcat4.projects.jobs import run_pending_jobs
+    from amcat4.projects.partitions import start_move
+
+    async with amcat_connections():
+        job = await start_move(args.project, created_by="cli")
+        logging.info(f"Created job {job['id']} to move project {args.project} to a partition of its own")
+        if args.now:
+            await run_pending_jobs()
+            logging.info("Done")
+
+
 async def create_test_index(_args):
     logging.info("**** Creating test index {} ****".format(SOTU_INDEX))
     async with amcat_connections():
@@ -333,6 +349,11 @@ def main():
     p.add_argument("--reindex", action="store_true", help="Also rebuild the full-text search index (online)")
     p.add_argument("--project", help="Only optimize the partition (1/64th of the documents table) that contains this project")
     p.set_defaults(func=optimize)
+
+    p = subparsers.add_parser("move-project", help="Move a (big) project to a documents partition of its own, in batches")
+    p.add_argument("--project", required=True, help="The project (index) id")
+    p.add_argument("--now", action="store_true", help="Run the job here, instead of leaving it to the server")
+    p.set_defaults(func=move_project)
 
     p = subparsers.add_parser("create-test-index", help=f"Create the {SOTU_INDEX} test index")
     p.set_defaults(func=create_test_index)

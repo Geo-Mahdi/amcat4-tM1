@@ -23,7 +23,7 @@ from amcat4.postgres.fields import (
     derived_date_values,
     normalize_value,
 )
-from amcat4.postgres.layout import partition_of, project_filter
+from amcat4.postgres.layout import guard_writes, partition_of, project_filter
 
 if TYPE_CHECKING:
     from amcat4.postgres.search import SearchQuery
@@ -100,6 +100,7 @@ def dedup_expression(unique_fields: list[FieldInfo], table: str = "documents") -
     return sql.SQL("md5(jsonb_build_array({})::text)").format(values)
 
 
+@guard_writes(lambda conn, project_pk, *a, **k: project_pk)
 async def update_dedup_hashes(
     conn: AsyncConnection, project_pk: int, fields: dict[str, FieldInfo], ids: list[int] | None = None
 ):
@@ -174,6 +175,7 @@ def _examples(rows: Sequence[Any], key: str = "doc_id") -> str:
     return ", ".join(ids) + (f" (and {len(rows) - 5} more)" if len(rows) > 5 else "")
 
 
+@guard_writes(lambda conn, project_pk, *a, **k: project_pk)
 async def upload_documents(
     conn: AsyncConnection,
     project_pk: int,
@@ -337,6 +339,7 @@ async def ensure_vector_index(conn: AsyncConnection, field_pk: int, dims: int) -
     )
 
 
+@guard_writes(lambda conn, project_pk, *a, **k: project_pk)
 async def delete_field_values(conn: AsyncConnection, project_pk: int, f: FieldInfo) -> None:
     """Remove the values of a field from all documents of the project"""
     if f.column == "vector":
@@ -381,6 +384,7 @@ async def lock_sort_slot(conn: AsyncConnection, project_pk: int, slot: str, unlo
     await conn.execute(f"SELECT {function}(%s, %s)", _sort_slot_lock(project_pk, slot))  # type: ignore[arg-type]
 
 
+@guard_writes(lambda conn, project_pk, *a, **k: project_pk)
 async def fill_sort_slot(
     conn: AsyncConnection,
     project_pk: int,
@@ -460,6 +464,7 @@ async def get_document(
     return out
 
 
+@guard_writes(lambda conn, project_pk, *a, **k: project_pk)
 async def delete_document(conn: AsyncConnection, project_pk: int, doc_id: str) -> bool:
     cur = await conn.execute(
         sql.SQL("DELETE FROM documents WHERE {} AND doc_id = %s").format(await project_filter(conn, project_pk)), [doc_id]
@@ -467,6 +472,7 @@ async def delete_document(conn: AsyncConnection, project_pk: int, doc_id: str) -
     return cur.rowcount > 0
 
 
+@guard_writes(lambda conn, from_project_pk, to_project_pk, *a, **k: to_project_pk)
 async def copy_batch(
     conn: AsyncConnection,
     from_project_pk: int,
@@ -551,6 +557,7 @@ def _project_condition(fieldset: FieldSet, f: FieldInfo) -> sql.Composable:
     )
 
 
+@guard_writes(lambda conn, fieldset, *a, **k: fieldset.project_pks)
 async def update_tag_by_query(
     conn: AsyncConnection,
     fieldset: FieldSet,
@@ -593,6 +600,7 @@ async def update_tag_by_query(
     return updated
 
 
+@guard_writes(lambda conn, fieldset, *a, **k: fieldset.project_pks)
 async def update_by_query(conn: AsyncConnection, fieldset: FieldSet, query: "SearchQuery", field: str, value: Any) -> int:
     """Set (or with value=None: remove) a field on all documents matching the query. Returns the number updated."""
     from amcat4.postgres.search import compile_search
@@ -634,6 +642,7 @@ async def update_by_query(conn: AsyncConnection, fieldset: FieldSet, query: "Sea
     return updated
 
 
+@guard_writes(lambda conn, fieldset, *a, **k: fieldset.project_pks)
 async def delete_by_query(conn: AsyncConnection, fieldset: FieldSet, query: "SearchQuery") -> int:
     from amcat4.postgres.search import compile_search
 
@@ -656,6 +665,7 @@ def convert_value(value: Any, old_type: str, new_type: str) -> Any:
     return normalize_value(value, new_type)
 
 
+@guard_writes(lambda conn, project_pk, *a, **k: project_pk)
 async def convert_field(conn: AsyncConnection, project_pk: int, old: FieldInfo, new: FieldInfo, batch_size: int = 5000):
     """
     Convert the stored values of a field to a new type (old and new have the same pk, but a different type).

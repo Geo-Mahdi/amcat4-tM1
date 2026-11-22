@@ -121,7 +121,7 @@ def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False) -
         scored.append(qs[0] if len(qs) == 1 else {"boolean": {"should": qs}})
     # The project condition is also in the json query, but postgres needs the partitions in SQL to only scan the
     # partitions of these projects
-    partitions = sorted({fieldset.partition(pk) for pk in fieldset.project_pks})
+    partitions = sorted({part for pk in fieldset.project_pks for part in fieldset.all_partitions(pk)})
     filters = dict(query.filters or {})
     use_partition_table = fast and get_settings().fast_path and len(partitions) == 1 and "_id" not in filters and not query.ids
     project_cond, project_param = _equals_any("documents.project_pk", list(fieldset.project_pks))

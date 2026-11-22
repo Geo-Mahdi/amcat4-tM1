@@ -36,7 +36,7 @@ from amcat4.postgres.connection import connection, execute, fetch_all, fetch_one
 from amcat4.postgres.fields import FIELD_COLUMNS, FieldSet
 from amcat4.postgres.projects import project_partitions, project_pk
 from amcat4.postgres.search import SearchQuery, compile_search
-from amcat4.projects import maintenance
+from amcat4.projects import maintenance, partitions
 
 BATCH_SIZE = 2000
 # Documents per transaction when filling a sort slot. Every transaction adds a segment to the search index (on
@@ -234,6 +234,9 @@ async def _copy_job(job: Job) -> dict[str, Any]:
 
     p = job.params
     from_pk, to_pk = await project_pk(p["source"]), await project_pk(p["destination"])
+    if await fetch_one("SELECT 1 FROM projects WHERE pk = %s AND moving_to IS NOT NULL", [from_pk]):
+        # (the batches below read the source's documents in its partition: they would miss the ones already moved)
+        raise ValueError(f"Project {p['source']} is being moved to another partition; copy it when that is done")
 
     if "field_map" not in job.progress:
         # Set up the destination fields (only once)
@@ -413,6 +416,7 @@ HANDLERS: dict[str, Callable[[Job], Awaitable[dict[str, Any]]]] = {
     "backfill_quarter": _backfill_quarter_job,
     "reindex": maintenance.reindex_job,
     "vacuum": maintenance.vacuum_job,
+    "move_project": partitions.move_project_job,
 }
 
 PERIODIC: dict[str, PeriodicTask] = {
