@@ -340,6 +340,9 @@ async def _fill_sort_slot_job(job: Job) -> dict[str, Any]:
                 )
         finally:
             await storage.lock_sort_slot(conn, project, slot, unlock=True)
+    # a mass update: without a vacuum, the next counts and sorts must check every rewritten row (measured on 270k
+    # rewritten documents: a sort on the slot 187 ms before, 3.4 ms after VACUUM)
+    await maintenance.vacuum_soon((await project_partitions([project])).values())
     return {"slot": slot, "field_pk": field_pk, "batches": job.progress.get("batches", 0)}
 
 
@@ -390,6 +393,7 @@ async def _backfill_quarter_job(job: Job) -> dict[str, Any]:
             done[str(f.pk)] = last
             await job.save_progress(fields=done)
         await execute("UPDATE fields SET quarter_ready = true WHERE pk = %s", [f.pk])
+    await maintenance.vacuum_soon((await project_partitions([project])).values())  # (a mass update, see above)
     return {"fields": [row["name"] for row in rows]}
 
 
