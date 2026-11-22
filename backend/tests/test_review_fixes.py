@@ -11,6 +11,7 @@ from amcat4.projects.index import create_project_index, delete_project_index
 from amcat4.projects.query import query_documents
 from amcat4.systemdata.fields import get_fieldset, list_fields, update_fields
 from tests.conftest import upload
+from tests.test_fast_path import two_projects  # noqa: F401
 
 
 @pytest.fixture()
@@ -304,3 +305,69 @@ async def test_create_unique_field_uses_server_defaults(two, monkeypatch):
 
     await fields_module.create_fields(a, {"u": CreateDocumentField(type="keyword", unique=True)})
     assert seen == [True]
+
+
+###################### 9 and 10. Reading the partitions of a project during a move; resuming step 1 ######################
+
+
+async def _stop_move_after_first_batch(monkeypatch, project: str) -> dict:
+    """Start a move of the project, and stop the job after its first batch (as if the server stopped)"""
+    from amcat4.projects import jobs, partitions
+
+    monkeypatch.setattr(partitions, "MOVE_BATCH_SIZE", 15)
+    original = jobs.Job.save_progress
+
+    async def stop_after_first_batch(self, **progress):
+        await original(self, **progress)
+        if progress.get("moved"):
+            raise jobs.JobCancelled()
+
+    monkeypatch.setattr(jobs.Job, "save_progress", stop_after_first_batch)
+    job = await partitions.start_move(project)
+    await jobs.run_pending_jobs()
+    monkeypatch.setattr(jobs.Job, "save_progress", original)
+    return job
+
+
+async def _finish_job(job_id: str) -> dict:
+    from amcat4.postgres.connection import execute
+    from amcat4.projects import jobs
+
+    await execute("UPDATE jobs SET status = 'pending' WHERE id = %s", [job_id])
+    await jobs.run_pending_jobs()
+    return await jobs.get_job(job_id)
+
+
+@pytest.fixture()
+async def moving_projects(two_projects):  # noqa: F811
+    from amcat4.postgres.connection import fetch_all
+
+    yield two_projects
+    await fetch_all("DELETE FROM jobs WHERE type IN ('move_project', 'vacuum') RETURNING id")
+
+
+@pytest.mark.anyio
+async def test_fieldset_partitions_one_snapshot(moving_projects, monkeypatch):
+    """A move that finishes while the fieldset is read: the request still sees every document of the project"""
+    from amcat4.postgres import projects as projects_module
+    from amcat4.postgres.connection import connection
+    from amcat4.postgres.search import SearchQuery, count
+
+    a, _ = moving_projects
+    job = await _stop_move_after_first_batch(monkeypatch, a)
+    original = projects_module.fetch_all
+    finished: list = []
+
+    async def finish_move_after_reading_partitions(query, params=None):
+        rows = await original(query, params)
+        if "partition_id" in query and not finished:
+            finished.append(True)
+            monkeypatch.setattr(projects_module, "fetch_all", original)  # (the job reads partitions too)
+            assert (await _finish_job(job["id"]))["status"] == "done"
+        return rows
+
+    monkeypatch.setattr(projects_module, "fetch_all", finish_move_after_reading_partitions)
+    fieldset = await get_fieldset([a])
+    assert finished
+    async with connection() as conn:
+        assert await count(conn, fieldset, SearchQuery()) == 40

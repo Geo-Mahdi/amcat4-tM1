@@ -48,7 +48,7 @@ from amcat4.postgres.fields import (
     storage_column,
 )
 from amcat4.postgres.layout import project_filter
-from amcat4.postgres.projects import project_moves, project_partitions, project_pk, project_pks
+from amcat4.postgres.projects import project_layout, project_pk, project_pks
 from amcat4.systemdata.roles import get_user_project_role, role_is_at_least
 
 _COLUMNS = "pk, name, type, unique_field, metareader, reader, client_settings, sort_slot, sort_slot_ready, quarter_ready"
@@ -117,10 +117,8 @@ async def get_fieldset(indices: str | list[str], queryable: set[str] | None = No
     project_fields: dict[int, dict[str, FieldInfo]] = {pk: {} for pk in pks.values()}
     for row in rows:
         project_fields[row["project_pk"]][row["name"]] = field_info_from_row(row)
-    pk_list = list(pks.values())
-    return FieldSet(
-        project_fields, queryable=queryable, partitions=await project_partitions(pk_list), moving=await project_moves(pk_list)
-    )
+    partitions, moving = await project_layout(list(pks.values()))
+    return FieldSet(project_fields, queryable=queryable, partitions=partitions, moving=moving)
 
 
 def _standardize_createfields(fields: Mapping[str, FieldType | CreateDocumentField]) -> dict[str, CreateDocumentField]:
