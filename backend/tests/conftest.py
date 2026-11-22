@@ -1,3 +1,4 @@
+import os
 from typing import Any
 
 import pytest
@@ -67,6 +68,17 @@ async def my_setup():
         await create_or_update_systemdata()
         yield
         await delete_systemdata()
+
+
+@pytest.fixture(autouse=True)
+def index_paths_everywhere(monkeypatch):
+    """With AMCAT4_TEST_INDEX_PATHS=1, every count and aggregation uses the in-index paths (see test_fast_path.py)"""
+    if os.environ.get("AMCAT4_TEST_INDEX_PATHS"):
+        from amcat4.postgres import search
+        from amcat4.projects import aggregate
+
+        monkeypatch.setattr(aggregate, "SMALL_RESULT", 0)
+        monkeypatch.setattr(search, "COUNT_STEP", 0)
 
 
 @pytest.fixture(autouse=True)
