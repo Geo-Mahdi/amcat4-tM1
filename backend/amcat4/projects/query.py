@@ -70,11 +70,29 @@ def _encode_cursor(d: dict) -> str:
     return base64.urlsafe_b64encode(json.dumps(d).encode()).decode()
 
 
+# The keys a cursor can have: "id" (keyset: after this internal id) or "offset", plus "total" and "desc" (keyset only).
+# Cursors are plain base64 json, not signed: a client can make one by hand. So every value is checked (types, ranges,
+# known keys) before it reaches SQL, and a hand-made cursor gives HTTP 400, not a database error. Not signed on
+# purpose: the only thing a forged cursor can do is page deeper than max_offset (an offset cursor is not limited, see
+# query_documents), and that limit is a performance guard, not a security boundary: what the user may see is
+# decided by the fields and roles, as for any other page. (A forged total only changes the reported total.)
+_MAX_BIGINT = 2**63 - 1
+
+
 def _decode_cursor(cursor: str) -> dict:
     try:
-        return json.loads(base64.urlsafe_b64decode(cursor.encode()))
+        d = json.loads(base64.urlsafe_b64decode(cursor.encode()))
     except Exception:
         raise ValueError(f"Invalid cursor: {cursor}")
+    valid = isinstance(d, dict) and set(d) <= {"id", "offset", "total", "desc"} and ("id" in d) != ("offset" in d)
+    for key, value in d.items() if valid else []:
+        if key == "desc":
+            valid = valid and isinstance(value, bool) and "id" in d
+        else:  # (bool is an int in python)
+            valid = valid and isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= _MAX_BIGINT
+    if not valid:
+        raise ValueError(f"Invalid cursor: {cursor}")
+    return d
 
 
 async def query_documents(
@@ -134,9 +152,11 @@ async def query_documents(
     if after is None and not keyset and max_offset and offset + per_page > max_offset:
         # A page deep in score (or field) order means sorting all hits up to that page and throwing most away: a page
         # at offset 100,000 costs 20x a page by id (83 ms against 3.9 ms, 22 Nov 2026). Elasticsearch has the same
-        # limit (max_result_window). The limit is for page numbers only: a cursor (after) was issued by this server,
-        # and a download that follows the 'next' cursors of a query without sort (an offset cursor) must be able to
-        # finish. New in this version; AMCAT4_MAX_OFFSET=0 switches it off (no limit, as in the original)
+        # limit (max_result_window). The limit is for page numbers only: a cursor (after) is assumed to be issued by
+        # this server, and a download that follows the 'next' cursors of a query without sort (an offset cursor) must
+        # be able to finish. A hand-made offset cursor therefore passes too: the limit guards against slow requests by
+        # mistake, it is not a security boundary (see _decode_cursor). New in this version; AMCAT4_MAX_OFFSET=0
+        # switches it off (no limit, as in the original)
         raise ValueError(
             f"Cannot page beyond {max_offset} results in this order (offset {offset} + per_page {per_page}). "
             'To retrieve all results, use "sort": "_seq" with the "after" cursor, which is fast at any depth.'

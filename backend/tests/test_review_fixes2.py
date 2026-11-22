@@ -413,3 +413,51 @@ async def test_spare_connection_pool_stats(monkeypatch):
     monkeypatch.setattr(connection_module, "db", lambda: NoStats())
     async with connection_module.spare_connection() as conn:
         assert conn is None
+
+
+###################### 17. Hand-made cursors ######################
+
+
+@pytest.mark.anyio
+async def test_forged_cursors(two_projects):  # noqa: F811
+    """
+    Cursors are unsigned base64 json. A hand-made cursor with a wrong type, a negative or huge number or an unknown key
+    reached SQL (a database error, HTTP 500). Now every cursor is checked and an invalid one is a ValueError (HTTP 400)
+    """
+    import base64
+    import json
+
+    a, _ = two_projects
+
+    def cursor(value) -> str:
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).decode()
+
+    forged = [
+        [1, 2],
+        {},
+        {"offset": -5},
+        {"id": -1},
+        {"id": "1; DROP TABLE documents"},
+        {"id": 1.5},
+        {"offset": True},
+        {"id": 2**64},
+        {"id": 1, "offset": 10},
+        {"offset": 10, "desc": True},
+        {"id": 1, "desc": "yes"},
+        {"id": 1, "total": -1},
+        {"id": 1, "sql": "x"},
+    ]
+    for value in forged:
+        with pytest.raises(ValueError, match="Invalid cursor"):
+            await query_documents(a, per_page=5, after=cursor(value))
+    with pytest.raises(ValueError, match="Invalid cursor"):
+        await query_documents(a, per_page=5, after="not base64 json")
+    # issued cursors still work, keyset and offset
+    first = await query_documents(a, per_page=5)
+    assert first.next and len((await query_documents(a, per_page=5, after=first.next)).data) == 5
+    first = await query_documents(a, per_page=5, queries={"q": "common"})
+    assert first.next and json.loads(base64.urlsafe_b64decode(first.next))["offset"] == 5
+    assert len((await query_documents(a, per_page=5, queries={"q": "common"}, after=first.next)).data) == 5
+    desc = await query_documents(a, per_page=5, sort=[{"_seq": {"order": "desc"}}])  # type: ignore[list-item]
+    assert desc.next and json.loads(base64.urlsafe_b64decode(desc.next))["desc"] is True
+    assert len((await query_documents(a, per_page=5, after=desc.next)).data) == 5
