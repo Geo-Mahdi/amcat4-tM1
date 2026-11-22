@@ -9,7 +9,8 @@ other projects, and its index cannot be rebuilt on its own. Moving it gives it i
 Setting projects.partition_id moves all documents in one statement: one huge transaction that locks every document
 of the project until the end. The move_project job moves them in batches instead (migration 0003 lets a project's
 documents be in two partitions):
-1. create a new partition, register it in project_partitions, set projects.moving_to and own_partition. This waits
+1. create a new partition, register it in project_partitions, set projects.moving_to and own_partition, and store
+   the target in the job's progress (one transaction, so a resumed job never creates a second partition). This waits
    for the writes to the project that are running; from then on writes are refused (ConflictError: uploads look up
    existing documents in one partition); reads look in both partitions and see every document exactly once (a
    document moves in one statement)
@@ -25,6 +26,8 @@ Start it with `amcat4 move-project --project <id>` (an admin command; the job wo
 
 import logging
 from typing import TYPE_CHECKING, Any
+
+from psycopg.types.json import Jsonb
 
 from amcat4.postgres.connection import connection, fetch_one
 from amcat4.postgres.layout import _PARTITION_LOCK, create_partition, lock_writes, next_partition_id, partition_table
@@ -65,24 +68,37 @@ async def move_project_job(job: "Job") -> dict[str, Any]:
     project = job.params["project_pk"]
     if "target" not in job.progress:
         async with connection() as conn:
-            row = await (await conn.execute("SELECT partition_id FROM projects WHERE pk = %s", [project])).fetchone()
-            source = row["partition_id"]  # type: ignore[index]
-            await lock_writes(conn, project)  # wait for running writes; new ones wait until moving_to is set
-            try:
-                async with conn.transaction():
-                    await conn.execute("SELECT pg_advisory_xact_lock(%s)", [_PARTITION_LOCK])
-                    target = await next_partition_id(conn)
-                    await create_partition(conn, target, lock_timeout="30s")
-                    await conn.execute(
-                        "INSERT INTO project_partitions (project_pk, partition_id) VALUES (%s, %s)", [project, target]
-                    )
-                    await conn.execute(
-                        "UPDATE projects SET moving_to = %s, own_partition = true WHERE pk = %s", [target, project]
-                    )
-            finally:
-                await lock_writes(conn, project, unlock=True)
-        logging.info(f"Moving project {project} from partition {source} to new partition {target}")
-        await job.save_progress(source=source, target=target, moved=0)
+            row = await (
+                await conn.execute("SELECT partition_id, moving_to FROM projects WHERE pk = %s", [project])
+            ).fetchone()
+            source, target = row["partition_id"], row["moving_to"]  # type: ignore[index]
+            if target is not None:
+                # Step 1 was done, but the job stopped before its progress was saved (a job of an older version, which
+                # saved it afterwards): continue with that partition, do not create a second one
+                logging.info(f"Resuming the move of project {project} to partition {target}")
+                await job.save_progress(source=source, target=target, moved=0)
+            else:
+                await lock_writes(conn, project)  # wait for running writes; new ones wait until moving_to is set
+                try:
+                    async with conn.transaction():
+                        await conn.execute("SELECT pg_advisory_xact_lock(%s)", [_PARTITION_LOCK])
+                        target = await next_partition_id(conn)
+                        await create_partition(conn, target, lock_timeout="30s")
+                        await conn.execute(
+                            "INSERT INTO project_partitions (project_pk, partition_id) VALUES (%s, %s)", [project, target]
+                        )
+                        await conn.execute(
+                            "UPDATE projects SET moving_to = %s, own_partition = true WHERE pk = %s", [target, project]
+                        )
+                        # the progress in the same transaction: a job that stops here resumes with this partition
+                        progress = {**job.progress, "source": source, "target": target, "moved": 0}
+                        await conn.execute(
+                            "UPDATE jobs SET progress = %s, updated_at = now() WHERE id = %s", [Jsonb(progress), job.id]
+                        )
+                finally:
+                    await lock_writes(conn, project, unlock=True)
+                job.progress.update(progress)
+                logging.info(f"Moving project {project} from partition {source} to new partition {target}")
     source, target = job.progress["source"], job.progress["target"]
 
     while True:

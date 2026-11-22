@@ -371,3 +371,47 @@ async def test_fieldset_partitions_one_snapshot(moving_projects, monkeypatch):
     assert finished
     async with connection() as conn:
         assert await count(conn, fieldset, SearchQuery()) == 40
+
+
+async def _partition_ids() -> list[int]:
+    from amcat4.postgres.connection import connection
+    from amcat4.postgres.layout import list_partitions
+
+    async with connection() as conn:
+        return [p["partition_id"] for p in await list_partitions(conn)]
+
+
+@pytest.mark.anyio
+async def test_move_step1_resume(moving_projects, monkeypatch):
+    """A move that stops right after step 1 resumes with the partition it created: no second (orphan) partition"""
+    from amcat4.postgres.connection import execute, fetch_one
+    from amcat4.postgres.projects import project_pk
+    from amcat4.projects import jobs, partitions
+
+    a, _ = moving_projects
+    before = await _partition_ids()
+    original = jobs.Job.save_progress
+
+    # stop at the first save_progress, after step 1 and the first batch: the target was stored with step 1 itself
+    async def stop(self, **progress):
+        raise jobs.JobCancelled()
+
+    monkeypatch.setattr(partitions, "MOVE_BATCH_SIZE", 15)
+    monkeypatch.setattr(jobs.Job, "save_progress", stop)
+    job = await partitions.start_move(a)
+    await jobs.run_pending_jobs()
+    monkeypatch.setattr(jobs.Job, "save_progress", original)
+    pk = await project_pk(a)
+    row = await fetch_one("SELECT moving_to FROM projects WHERE pk = %s", [pk])
+    progress = (await jobs.get_job(job["id"]))["progress"]
+    assert row is not None and progress["target"] == row["moving_to"] and progress["moved"] == 0
+    assert len(await _partition_ids()) == len(before) + 1
+
+    # a job of the older version saved the target after step 1: no target in the progress, but moving_to is set
+    await execute("UPDATE jobs SET progress = '{}' WHERE id = %s", [job["id"]])
+    done = await _finish_job(job["id"])
+    assert done["status"] == "done" and done["result"]["moved"] == 40 - 15  # (moved since the progress was lost)
+    assert len(await _partition_ids()) == len(before) + 1
+    row = await fetch_one("SELECT partition_id, moving_to FROM projects WHERE pk = %s", [pk])
+    assert row == {"partition_id": progress["target"], "moving_to": None}
+    assert (await query_documents(a, per_page=100)).total_count == 40
