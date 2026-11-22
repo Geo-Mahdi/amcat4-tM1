@@ -11,6 +11,7 @@ The fixtures come from test_fast_path.py: two projects in the same partition, wi
 
 # ruff: noqa: F811 (the fixtures are imported from test_fast_path)
 
+import asyncio
 import re
 
 import pytest
@@ -507,6 +508,18 @@ async def test_vacuum_after_large_changes(slot_project, monkeypatch):
         partition_id = await partition_of(conn, await project_pk(p))
     # a small change: no vacuum (unless the statistics say the partition changed a lot: vacuum it first)
     await execute(sql.SQL("VACUUM {}").format(sql.Identifier(f"documents_p{partition_id}")))  # type: ignore[arg-type]
+    # postgres publishes the statistics of other sessions with a delay (up to about a second): wait until the vacuum
+    # shows, else vacuum_soon can still see the dead rows from before it (this test failed now and then)
+    for _ in range(50):
+        async with connection() as conn:
+            await conn.execute("SELECT pg_stat_clear_snapshot()")
+            cur = await conn.execute(
+                "SELECT n_ins_since_vacuum + n_dead_tup AS changed FROM pg_stat_user_tables WHERE relid = to_regclass(%s)",
+                [f"documents_p{partition_id}"],
+            )
+            if (await cur.fetchone())["changed"] < 30:  # type: ignore[index]
+                break
+        await asyncio.sleep(0.1)
     await update_tag_query(p, "add", "tags", "small", ids=["d1", "d2"])
     assert await _vacuum_jobs() == []
     # a large one: a vacuum job for the partition, only one while it is pending
