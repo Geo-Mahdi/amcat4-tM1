@@ -18,6 +18,43 @@ with the help of Claude, and has not been reviewed by the AmCAT maintainers.
 · overview with reasons, measurements and switches:
 [`backend/POSTGRES_FAST_PATHS.md`](https://github.com/Geo-Mahdi/amcat4-tM1/blob/postgres-fast-v2/backend/POSTGRES_FAST_PATHS.md)
 
+### Try this branch
+
+You need [Docker with docker compose](https://docs.docker.com/compose/install/). Ready-made images of this branch
+are published in this fork's container registry (`ghcr.io/geo-mahdi/amcat4-tm1-backend` and `-frontend`), built
+from every push to the branch.
+
+**With the ready-made images** (no build, a few minutes):
+
+```sh
+mkdir amcat4-fast-v2 && cd amcat4-fast-v2
+B=https://raw.githubusercontent.com/Geo-Mahdi/amcat4-tM1/postgres-fast-v2/deploy
+curl -O $B/docker-compose.yml -O $B/docker-compose.fast-v2.yml -O $B/.env.example
+cp .env.example .env      # edit if needed, see below
+docker compose -f docker-compose.yml -f docker-compose.fast-v2.yml up -d
+```
+
+Then open http://localhost. Stop it with the same command and `down` instead of `up -d`; add `-v` to also delete
+the data.
+
+**Or build the images yourself** from a clone:
+
+```sh
+git clone -b postgres-fast-v2 https://github.com/Geo-Mahdi/amcat4-tM1 && cd amcat4-tM1/deploy
+cp .env.example .env
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+Before you start:
+
+- The example settings use `amcat4_auth=no_auth`: **everybody who can reach the server is an administrator**, and
+  the web server listens on ports 80 and 443 of all network interfaces. Use it only on your own computer or a
+  trusted network, or set up authentication and a real `AMCAT4_COOKIE_SECRET` in `.env` first.
+- Ports 80 and 443 must be free.
+- Upgrading an existing database of `postgres-migration` runs migrations `0002` and `0003`, which rebuild the
+  search index once (minutes per few million documents; it needs about as much free disk as the index takes).
+  Run `docker compose run --rm api amcat4 migrate` first, so the API is not down while it runs.
+
 ### What changed
 
 | Area | Change |
