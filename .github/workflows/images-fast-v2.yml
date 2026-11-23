@@ -1,0 +1,47 @@
+name: Images for the postgres-fast-v2 branch
+
+# Builds the backend and frontend images of this branch and publishes them to the GitHub container registry of this
+# fork (ghcr.io/geo-mahdi/...), so the branch can be tried without building anything (see deploy/docker-compose.fast-v2.yml).
+# Uses only the repository's own GITHUB_TOKEN; it never pushes to Docker Hub or to the ccsamsterdam images.
+on:
+  push:
+    branches: [postgres-fast-v2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to the GitHub container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          push: true
+          tags: |
+            ghcr.io/geo-mahdi/amcat4-tm1-backend:postgres-fast-v2
+            ghcr.io/geo-mahdi/amcat4-tm1-backend:${{ github.sha }}
+
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          push: true
+          tags: |
+            ghcr.io/geo-mahdi/amcat4-tm1-frontend:postgres-fast-v2
+            ghcr.io/geo-mahdi/amcat4-tm1-frontend:${{ github.sha }}

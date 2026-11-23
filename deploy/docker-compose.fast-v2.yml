@@ -1,0 +1,8 @@
+# Try the postgres-fast-v2 branch with ready-made images from this fork's container registry (built by
+# .github/workflows/images-fast-v2.yml), instead of building them yourself:
+#   docker compose -f docker-compose.yml -f docker-compose.fast-v2.yml up -d
+services:
+  caddy:
+    image: ghcr.io/geo-mahdi/amcat4-tm1-frontend:postgres-fast-v2
+  api:
+    image: ghcr.io/geo-mahdi/amcat4-tm1-backend:postgres-fast-v2
