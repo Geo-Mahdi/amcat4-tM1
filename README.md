@@ -17,6 +17,8 @@ with the help of Claude, and has not been reviewed by the AmCAT maintainers.
 [All changes compared with `postgres-migration`](https://github.com/Geo-Mahdi/amcat4-tM1/compare/postgres-migration...postgres-fast-v2)
 · overview with reasons, measurements and switches:
 [`backend/POSTGRES_FAST_PATHS.md`](https://github.com/Geo-Mahdi/amcat4-tM1/blob/postgres-fast-v2/backend/POSTGRES_FAST_PATHS.md)
+· the full reasoning behind every change, with alternatives and measurements:
+[`docs/postgres-fast-v2/RATIONALE.md`](https://github.com/Geo-Mahdi/amcat4-tM1/blob/postgres-fast-v2/docs/postgres-fast-v2/RATIONALE.md)
 
 ### Try this branch
 
