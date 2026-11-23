@@ -1,5 +1,8 @@
 # Changes on this branch since bb35e43a
 
+The reasons behind each change, the alternatives that were considered and the measurements are explained at length in
+[`docs/postgres-fast-v2/RATIONALE.md`](../docs/postgres-fast-v2/RATIONALE.md).
+
 This is an overview of every change made after the original code (bb35e43a), grouped by topic. For each change: what
 it does, why (with the measured effect where there is one), the switch to turn it off, and the files. The details and
 measurements are in the commit messages (`git log bb35e43a..HEAD`). "Not measured" means there is no measurement for
