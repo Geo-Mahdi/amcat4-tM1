@@ -506,22 +506,16 @@ async def test_vacuum_after_large_changes(slot_project, monkeypatch):
     monkeypatch.setattr(get_settings(), "vacuum_after_rows", 30)
     async with connection() as conn:
         partition_id = await partition_of(conn, await project_pk(p))
-    # a small change: no vacuum (unless the statistics say the partition changed a lot: vacuum it first)
+    # a small change: no vacuum. vacuum_soon also looks at postgres' statistics (inserted plus dead rows since the
+    # last vacuum), which other tests leave behind in this shared partition and which postgres publishes with a
+    # delay (counts of other sessions can still arrive after a VACUUM). So the limit for this step is set far
+    # above anything those statistics can show: the test then does not depend on that leftover state (it failed
+    # about once in ten runs when it did)
     await execute(sql.SQL("VACUUM {}").format(sql.Identifier(f"documents_p{partition_id}")))  # type: ignore[arg-type]
-    # postgres publishes the statistics of other sessions with a delay (up to about a second): wait until the vacuum
-    # shows, else vacuum_soon can still see the dead rows from before it (this test failed now and then)
-    for _ in range(50):
-        async with connection() as conn:
-            await conn.execute("SELECT pg_stat_clear_snapshot()")
-            cur = await conn.execute(
-                "SELECT n_ins_since_vacuum + n_dead_tup AS changed FROM pg_stat_user_tables WHERE relid = to_regclass(%s)",
-                [f"documents_p{partition_id}"],
-            )
-            if (await cur.fetchone())["changed"] < 30:  # type: ignore[index]
-                break
-        await asyncio.sleep(0.1)
+    monkeypatch.setattr(get_settings(), "vacuum_after_rows", 10**9)
     await update_tag_query(p, "add", "tags", "small", ids=["d1", "d2"])
     assert await _vacuum_jobs() == []
+    monkeypatch.setattr(get_settings(), "vacuum_after_rows", 30)
     # a large one: a vacuum job for the partition, only one while it is pending
     await update_tag_query(p, "add", "tags", "large")
     await delete_query(p, ids=[f"d{i}" for i in range(31)])
@@ -530,10 +524,15 @@ async def test_vacuum_after_large_changes(slot_project, monkeypatch):
     await jobs.run_pending_jobs()
     [job] = await _vacuum_jobs()
     assert job["status"] == "done" and job["result"]["table"] == f"documents_p{partition_id}"
-    row = await fetch_all(
-        "SELECT last_vacuum IS NOT NULL AS v FROM pg_stat_user_tables WHERE relid = to_regclass(%s)",
-        [f"documents_p{partition_id}"],
-    )
+    # (the job's result above already says the VACUUM ran; postgres shows it in its statistics with a delay)
+    for _ in range(50):
+        row = await fetch_all(
+            "SELECT last_vacuum IS NOT NULL AS v FROM pg_stat_user_tables WHERE relid = to_regclass(%s)",
+            [f"documents_p{partition_id}"],
+        )
+        if row[0]["v"]:
+            break
+        await asyncio.sleep(0.1)
     assert row[0]["v"]
     # switched off: never
     monkeypatch.setattr(get_settings(), "vacuum_after_rows", 0)
