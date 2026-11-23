@@ -6,6 +6,81 @@
 
 # AmCAT4
 
+## In this fork: branch `postgres-fast-v2`, faster read paths for the PostgreSQL version
+
+This fork has an extra branch, [`postgres-fast-v2`](https://github.com/Geo-Mahdi/amcat4-tM1/tree/postgres-fast-v2). The `master` branch you are looking at is unchanged AmCAT 4.2.11 (Elasticsearch), apart from this notice. The branch builds on [`postgres-migration`](https://github.com/Geo-Mahdi/amcat4-tM1/tree/postgres-migration)
+(commit `bb35e43a`) and keeps its design: one documents table, values in JSON columns under stable field keys,
+projects sharing partitions, AmCAT's own query parser and field-level access. It changes how queries reach the
+pg_search index, and adds a few index and maintenance details. It is experimental work in a personal fork, prepared
+with the help of Claude, and has not been reviewed by the AmCAT maintainers.
+
+[All changes compared with `postgres-migration`](https://github.com/Geo-Mahdi/amcat4-tM1/compare/postgres-migration...postgres-fast-v2)
+· overview with reasons, measurements and switches:
+[`backend/POSTGRES_FAST_PATHS.md`](https://github.com/Geo-Mahdi/amcat4-tM1/blob/postgres-fast-v2/backend/POSTGRES_FAST_PATHS.md)
+
+### What changed
+
+| Area | Change |
+|---|---|
+| Searches | Read queries go to the project's partition table, so pg_search can count and aggregate inside its index. The project condition and filters are unscored (`const_score`), so only the search words are scored. No parallel workers for API queries. One count per search, run next to the page. |
+| Aggregations | Done inside the index with `pdb.agg` (keywords, tags, dates, nested axes, metrics), with the original SQL as fallback. |
+| Sorting | Five more sort slots (`fast_sort`), next to `date` and `source`: three keyword, one number, one date. Sorting on a slot runs inside the index. |
+| Downloads | New sort key `"sort": "_seq"`: pages by internal id with a cursor, at the same cost for every page. |
+| Listing | Listing a project without a query uses a normal B-tree index. |
+| Maintenance | pg_search 0.27.0, VACUUM after large changes, an optional move of a large project to its own partition. |
+| Fixes | Trailing wildcards find all matching words, aggregations handle empty values, concurrent uploads of the same documents no longer fail. |
+| Schema | Migrations `0002` (sort slot columns, id index, the search index rebuilt once) and `0003` (project moves). `0001` is unchanged. |
+
+Every change has a switch that restores the original behaviour (see `deploy/.env.example`). The test suite went from
+125 to 257 tests and passes on pg_search 0.26.0 and 0.27.0.
+
+### Short test, 22 November 2026
+
+One laptop, one run per version, the same 2.68 million Dutch news articles, requests through the AmCAT API.
+The two PostgreSQL versions used the same database (PostgreSQL 18, pg_search 0.27.0), one after the other.
+
+| Median response time (ms) | Elasticsearch (`master` 4.2.11) | `postgres-migration` | `postgres-fast-v2` |
+|---|---:|---:|---:|
+| Rare word | 6.0 | 16.2 | 7.6 |
+| Medium word | 8.8 | 27.3 | 8.9 |
+| Common word | 8.8 | 108.1 | 11.8 |
+| Very common word (`de`, `het`) | 8.3 | 490.1 | 16.1 |
+| Phrase | 8.7 | 29.1 | 11.8 |
+| Boolean | 6.5 | 24.8 | 12.2 |
+| Broad wildcard | 8.3 | 22.7 | 12.1 |
+| Search with filters | 6.9 | 26.6 | 13.2 |
+| No query, filters only | 7.2 | 99.8 | 13.2 |
+| Sorted results | 8.0 | 477.2 | 12.4 |
+| Snippets | 14.1 | 50.4 | 21.1 |
+| Aggregations (15 kinds) | 28.9 | 237.8 | 22.1 |
+
+| Other measures | Elasticsearch | `postgres-migration` | `postgres-fast-v2` |
+|---|---:|---:|---:|
+| Requests per second, 32 clients, mixed searches | 912 | 133 | 370 |
+| Download, documents per second (best paging mode) | 7,645 | 4,779 | 13,217 |
+| Same counts as `postgres-migration` on 56 searches | | | 56 of 56 |
+| Aggregations identical to `postgres-migration` (15) | | | 15 of 15 |
+| Wildcard counts equal to Elasticsearch (7 tested) | | 1 of 7 | 7 of 7 |
+| Bulk upload, documents per second (batches of 1,000) | 9,741 | 1,342 | 8,605 |
+| Four clients upload the same documents at once | all accepted | 3 of 4 get HTTP 500 (data correct) | all accepted |
+| A reader sees a half-finished upload | yes | no | no |
+| Upload interrupted by a crash | part of it is kept | all or nothing | all or nothing |
+
+Notes on reading these numbers:
+
+- One run on one laptop with no authentication, so differences of a few milliseconds mean little.
+- `postgres-migration` is pinned to pg_search 0.26.0 and was run here on 0.27.0. It also had no sort slot for the
+  fields used in the sorted searches, which is part of what this branch adds.
+- Elasticsearch caches repeated aggregation requests, so its aggregation times are partly cache hits.
+- In `postgres-fast-v2`, two fields were put in sort slots before the test. Filling a slot rewrites every document
+  of the project (more than 10 minutes for two slots here, before a later improvement that fills several slots in
+  one pass), so it is a maintenance step.
+- Not tested in this short run: larger collections, cold starts, fixed-rate load, queries over many projects.
+
+The original README of `master` follows.
+
+---
+
 Server for document management and automatic text analysis, developed as part of [OPTED](https://opted.eu).
 [Learn more](https://opted.eu/fileadmin/user_upload/k_opted/OPTED_deliverable_D7.1.pdf) See also the [AmCAT book (in progress)](https://amcat.nl/book/02._getting-started).
 
