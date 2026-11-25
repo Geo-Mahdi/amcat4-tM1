@@ -217,6 +217,24 @@ class Settings(BaseSettings):
         ),
     ] = True
 
+    index_field_stats: Annotated[
+        bool,
+        Field(
+            description=(
+                "Get the values of a field (the lists of filter values) and the statistics of a field (count, "
+                "minimum, maximum, average) from an aggregation inside the search index. "
+                "Why: the original statements read every document of the project (values: 441 ms, statistics: "
+                "235 ms on 200k documents, against 2-12 ms for the aggregation, tried by hand, pg_search 0.27.0, "
+                "25 Nov 2026; not re-measured on this code). "
+                "The output is the same, except: the average is computed with floats inside the index (for dates it "
+                "can differ by microseconds), and a tag that is twice in one document counts once. "
+                "Values of number and date fields, fields with more than 65,000 different values, and keyword "
+                "values that look like a full timestamp keep the original statement. "
+                "false = always the original statements (AMCAT4_INDEX_FIELD_STATS=false)"
+            ),
+        ),
+    ] = True
+
     sort_slot_job_rows: Annotated[
         int,
         Field(

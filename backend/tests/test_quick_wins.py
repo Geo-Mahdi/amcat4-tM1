@@ -207,3 +207,119 @@ async def test_values_a_float_cannot_hold(project, index_paths, index_aggregatio
         original, off, new = await _old_and_new(monkeypatch, "index_agg_types", run)
         assert new == original == off
     assert index_aggregations == [None] * 6
+
+
+############ 2. Field values and field statistics through the index ############
+
+
+@pytest.fixture()
+def index_field_calls(monkeypatch):
+    """Records what index_field_values and index_field_stats returned (None: the original statement was used)"""
+    from amcat4.systemdata import fields as fields_module
+
+    calls: list = []
+    for name in ("index_field_values", "index_field_stats"):
+        original = getattr(fields_module, name)
+
+        async def spy(*args, _original=original, **kwargs):
+            result = await _original(*args, **kwargs)
+            calls.append(result)
+            return result
+
+        monkeypatch.setattr(fields_module, name, spy)
+    return calls
+
+
+async def _on_and_off(monkeypatch, switch: str, run):
+    monkeypatch.setattr(get_settings(), switch, False)
+    off = await run()
+    monkeypatch.setattr(get_settings(), switch, True)
+    return off, await run()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "field,in_index",
+    [("pub", True), ("tags", True), ("url", True), ("flag", True), ("n", True), ("x", False), ("date", False)],
+)
+@pytest.mark.parametrize("size", [2, 3, 1000])
+async def test_field_values_same_list(project, index_field_calls, monkeypatch, field, in_index, size):
+    """The same list of values (same order, also for values with the same count) with and without the index"""
+    from amcat4.systemdata.fields import field_values
+
+    off, on = await _on_and_off(monkeypatch, "index_field_stats", lambda: field_values(project, field, size))
+    assert on == off
+    assert 0 < len(on) <= size
+    assert [r is not None for r in index_field_calls] == [in_index]
+
+
+@pytest.mark.anyio
+async def test_field_values_odd_values(index, index_field_calls, monkeypatch):
+    """
+    Empty strings, values that look like numbers, booleans or dates, mixed case and accents. A keyword that looks
+    like a full timestamp is a date inside the index (two spellings of one moment become one value there), so
+    for such a field the original statement is used.
+    """
+    from amcat4.systemdata.fields import field_values
+
+    values = ["", "17", "17.0", "true", "a", "A", "é", "b b", "2024-05-01", "null", "Z", "z z"]
+    docs = [
+        {"kw": values[i % len(values)], "plain": values[i % 7], "tags": [values[i % 5], "t"], "i": i % 3} for i in range(40)
+    ]
+    await upload(index, docs, fields={"kw": "keyword", "plain": "keyword", "tags": "tag", "i": "integer"})
+    await upload(
+        index, [{"kw": "2024-05-01T00:00:00Z"}, {"kw": "2024-05-01T00:00:00.000000Z"}, {"i": 2**53 + 1}, {"i": 2**53 + 2}]
+    )
+    for field, in_index in [("plain", True), ("tags", True), ("kw", False), ("i", False)]:
+        off, on = await _on_and_off(monkeypatch, "index_field_stats", lambda: field_values(index, field, 100))
+        assert on == off
+        assert (index_field_calls.pop() is not None) == in_index
+    assert "2024-05-01T00:00:00Z" in await field_values(index, "kw", 100)
+
+
+@pytest.mark.anyio
+async def test_field_values_too_many_values(project, index_field_calls, monkeypatch):
+    """More different values than the index returns: the original statement, never a cut list"""
+    from amcat4.postgres import index_aggregate
+    from amcat4.systemdata.fields import field_values
+
+    monkeypatch.setattr(index_aggregate, "MAX_BUCKETS", 2)
+    off, on = await _on_and_off(monkeypatch, "index_field_stats", lambda: field_values(project, "pub", 10))
+    assert on == off == ["A", "B", "C", "D"]
+    assert index_field_calls == [None]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("field", ["n", "x", "date"])
+async def test_field_stats_same_output(project, index_field_calls, monkeypatch, field):
+    """Count, minimum and maximum are the same; the average within float precision (dates: within a millisecond)"""
+    from datetime import datetime
+
+    from amcat4.systemdata.fields import field_stats
+
+    off, on = await _on_and_off(monkeypatch, "index_field_stats", lambda: field_stats(project, field))
+    assert index_field_calls[0] is not None
+    assert {k: on[k] for k in ("count", "min", "max")} == {k: off[k] for k in ("count", "min", "max")}
+    assert on["count"] > 0
+    if field == "date":
+        assert abs((datetime.fromisoformat(on["avg"]) - datetime.fromisoformat(off["avg"])).total_seconds()) < 0.001
+    else:
+        assert on["avg"] == pytest.approx(off["avg"])
+
+
+@pytest.mark.anyio
+async def test_field_stats_no_values_and_old_dates(index, index_field_calls, monkeypatch):
+    """A field without any value, an empty project, and dates a float cannot hold exactly (the original statement)"""
+    from amcat4.systemdata.fields import create_fields, field_stats
+
+    await create_fields(index, {"n": "integer", "date": "date", "pub": "keyword"})
+    for field in ("n", "date"):
+        off, on = await _on_and_off(monkeypatch, "index_field_stats", lambda: field_stats(index, field))
+        assert on == off == {"count": 0, "min": None, "max": None, "avg": None}
+    await upload(index, [{"pub": "a"}, {"pub": "b", "date": "1500-03-04T05:06:07.123457"}, {"pub": "b", "date": "1500-03-05"}])
+    index_field_calls.clear()
+    for field in ("n", "date"):
+        off, on = await _on_and_off(monkeypatch, "index_field_stats", lambda: field_stats(index, field))
+        assert on == off
+    assert on["count"] == 2
+    assert [r is not None for r in index_field_calls] == [True, False]

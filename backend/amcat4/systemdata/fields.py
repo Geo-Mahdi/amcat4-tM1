@@ -47,6 +47,7 @@ from amcat4.postgres.fields import (
     sort_slots_for_type,
     storage_column,
 )
+from amcat4.postgres.index_aggregate import index_field_stats, index_field_values
 from amcat4.postgres.layout import project_filter
 from amcat4.postgres.projects import project_layout, project_pk, project_pks
 from amcat4.systemdata.roles import get_user_project_role, role_is_at_least
@@ -511,6 +512,20 @@ async def _field_info(index: str, field: str) -> tuple[int, FieldInfo]:
     return pk, f
 
 
+async def _index_search(index: str):
+    """
+    The table and condition to read all documents of the project inside the search index of its partition, or None
+    if that cannot be used now (the switch AMCAT4_INDEX_FIELD_STATS or the fast path is off, or the project is being
+    moved to another partition)
+    """
+    if not get_settings().index_field_stats:
+        return None
+    from amcat4.postgres.search import SearchQuery, compile_search
+
+    c = compile_search(await get_fieldset([index]), SearchQuery(), fast=True)
+    return c if c.fast else None
+
+
 async def field_values(index: str, field: str, size: int) -> list[str]:
     """
     Get the most frequent values for a given field (e.g. to populate list of filter values on keyword field)
@@ -518,9 +533,16 @@ async def field_values(index: str, field: str, size: int) -> list[str]:
     pk, f = await _field_info(index, field)
     if f.column != "exact_fields":
         raise ValueError(f"Cannot list values of {f.type} field {field}")
+    c = await _index_search(index)
     value = sql.SQL("documents.exact_fields->{}").format(sql.Literal(f.key))
     elements = sql.SQL("CASE jsonb_typeof({v}) WHEN 'array' THEN {v} ELSE jsonb_build_array({v}) END").format(v=value)
     async with connection() as conn:
+        if c is not None:
+            # A terms aggregation inside the search index, where it gives the same list (see index_field_values)
+            values = await index_field_values(conn, c.table, c.where, c.params, f, size)
+            if values is not None:
+                return values
+        # The original statement: reads every document of the project
         cur = await conn.execute(
             sql.SQL(
                 """SELECT value, count(*) AS n FROM documents, jsonb_array_elements_text({}) AS value
@@ -540,18 +562,23 @@ async def field_stats(index: str, field: str) -> dict[str, Any]:
     pk, f = await _field_info(index, field)
     if f.type not in ("number", "integer", "date"):
         raise ValueError(f"Cannot compute statistics for {f.type} field {field}")
+    c = await _index_search(index)
     raw = sql.SQL("(documents.exact_fields->>{})").format(sql.Literal(f.key))
     if f.type == "date":
         x = sql.SQL("extract(epoch FROM {}::timestamptz)").format(raw)
     else:
         x = sql.SQL("{}::double precision").format(raw)
     async with connection() as conn:
-        cur = await conn.execute(
-            sql.SQL(
-                "SELECT count({x}) AS count, min({x}) AS min, max({x}) AS max, avg({x}) AS avg FROM documents WHERE {project}"
-            ).format(x=x, project=await project_filter(conn, pk))
-        )
-        row: dict | None = await cur.fetchone()  # type: ignore[assignment]
+        # A stats aggregation inside the search index if possible, else the original statement (every document)
+        row = await index_field_stats(conn, c.table, c.where, c.params, f) if c is not None else None
+        if row is None:
+            cur = await conn.execute(
+                sql.SQL(
+                    "SELECT count({x}) AS count, min({x}) AS min, max({x}) AS max, avg({x}) AS avg "
+                    "FROM documents WHERE {project}"
+                ).format(x=x, project=await project_filter(conn, pk))
+            )
+            row = await cur.fetchone()  # type: ignore[assignment]
     assert row is not None
     stats: dict[str, Any] = {"count": row["count"]}
     for k in ("min", "max", "avg"):

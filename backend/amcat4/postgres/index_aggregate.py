@@ -297,3 +297,89 @@ def _single_row(row: dict | None, metrics: list, metric_fields: list[FieldInfo])
     for j, metric in enumerate(metrics):
         out[f"m{j}"] = _metric_value(_json(row[f"m{j}"]), metric.function, metric_fields[j].type)
     return out
+
+
+# field_values: which json type the bucket keys of each field type must have. A keyword value that looks like a full
+# timestamp (2024-05-01T00:00:00Z) is indexed by pg_search as a date and comes back as a number; such a result is not
+# used. Number and date fields are not listed (their values are not formatted like the stored json): old statement.
+_STRING_VALUES = "jsonb_typeof(b->'key') <> 'string'"
+_VALUE_CHECKS = {
+    **{t: _STRING_VALUES for t in ("keyword", "tag", "url", "image", "video", "audio")},
+    "boolean": "NOT b ? 'key_as_string'",
+    # whole numbers of at most 15 characters: below 2^53, so not rounded by the 64-bit floats of the index
+    "integer": "jsonb_typeof(b->'key') <> 'number' OR b->>'key' !~ '^-?[0-9]{1,14}$'",
+}
+
+
+async def _try(conn: AsyncConnection, stmt: sql.Composable, params: list) -> dict | None:
+    """The one row of a statement, or None if it fails with an error that allows using the old statement"""
+    try:
+        cur = await conn.execute(stmt, params)
+        return await cur.fetchone()  # type: ignore[return-value]
+    except psycopg.Error as e:
+        if must_not_fall_back(e):
+            raise
+        logging.warning(f"pdb.agg failed, using the statement without the index: {e}")
+        return None
+
+
+async def index_field_values(
+    conn: AsyncConnection, table: sql.Composable, where: sql.Composable, params: list, f: FieldInfo, size: int
+) -> list[str] | None:
+    """
+    The most frequent values of a field (most frequent first, then by value) from a terms aggregation in the index,
+    or None if that cannot be used: the field type is not listed in _VALUE_CHECKS, there are more than MAX_BUCKETS
+    different values, a key has an unexpected type, or the statement fails. Sorted by postgres, so values with the
+    same count are in the same order as in the statement without the index.
+    The count is the number of documents with the value; the statement without the index counts a tag that is twice
+    in one document twice.
+    """
+    check = _VALUE_CHECKS.get(f.type)
+    if check is None or f.subkey:
+        return None
+    request = {"terms": {"field": f.path, "size": MAX_BUCKETS}}
+    stmt = sql.SQL(
+        """WITH a AS MATERIALIZED (SELECT pdb.agg({request}::jsonb) AS r FROM {table} WHERE {where}),
+                b AS (SELECT b, coalesce(b->>'key_as_string', b->>'key') AS value, (b->>'doc_count')::bigint AS n
+                      FROM a, jsonb_array_elements(a.r->'buckets') AS b WHERE jsonb_typeof(b->'key') <> 'null')
+           SELECT (SELECT r IS NOT NULL AND coalesce((r->>'sum_other_doc_count')::bigint, 0) = 0 FROM a) AS complete,
+                  (SELECT count(*) FROM b WHERE {check}) AS unexpected,
+                  (SELECT coalesce(array_agg(value ORDER BY n DESC, value), '{{}}')
+                   FROM (SELECT value, n FROM b ORDER BY n DESC, value LIMIT %s) top) AS values"""
+    ).format(request=sql.Literal(json.dumps(request)), table=table, where=where, check=sql.SQL(check))  # type: ignore[arg-type]
+    row = await _try(conn, stmt, [*params, size])
+    if row is None or not row["complete"] or row["unexpected"]:
+        return None
+    return row["values"]
+
+
+async def index_field_stats(
+    conn: AsyncConnection, table: sql.Composable, where: sql.Composable, params: list, f: FieldInfo
+) -> dict[str, Any] | None:
+    """
+    {count, min, max, avg} of a number, integer or date field from a stats aggregation in the index (dates as seconds
+    since 1970, like the statement without the index), or None if that cannot be used.
+    """
+    stmt = sql.SQL("SELECT pdb.agg({}::jsonb) AS r FROM {} WHERE {}").format(
+        sql.Literal(json.dumps({"stats": {"field": f.path}})), table, where
+    )
+    row = await _try(conn, stmt, params)
+    stats = _json(row["r"]) if row is not None else None
+    if not isinstance(stats, dict) or not isinstance(stats.get("count"), (int, float)):
+        return None
+    if not stats["count"]:
+        return {"count": 0, "min": None, "max": None, "avg": None}
+    try:
+        if f.type == "date":
+            # min and max are exact; the average is a 64-bit float (it can differ from the SQL average by microseconds)
+            avg = Decimal(stats["avg"]) / 1_000_000 + POSTGRES_EPOCH
+            return {
+                "count": int(stats["count"]),
+                "min": _date_seconds(stats["min"]),
+                "max": _date_seconds(stats["max"]),
+                "avg": avg,
+            }
+        return {"count": int(stats["count"]), **{k: float(stats[k]) for k in ("min", "max", "avg")}}
+    except (_NotSupported, TypeError, ValueError, ArithmeticError) as e:
+        logging.info(f"pdb.agg result not usable ({e}), using the statement without the index")
+        return None
