@@ -242,22 +242,24 @@ def slot_sort_column(fieldset: FieldSet, name: str) -> str | None:
     return fs[0].sort_read_column
 
 
-def order_items(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "desc"]]] | None) -> list[sql.Composable]:
-    """The ORDER BY item of each item of the sort"""
-    items: list[sql.Composable] = []
+def order_items(
+    fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "desc"]]] | None
+) -> list[tuple[sql.Composable, sql.Composable | None]]:
+    """The ORDER BY item of each item of the sort, as (expression, direction); random order has no direction"""
+    items: list[tuple[sql.Composable, sql.Composable | None]] = []
     for name, order in sort or []:
         direction = sql.SQL("DESC NULLS LAST" if order == "desc" else "ASC NULLS LAST")
         if name == "_score":
-            items.append(sql.SQL("paradedb.score(documents.id) {}").format(direction))
+            items.append((sql.SQL("paradedb.score(documents.id)"), direction))
         elif name == "?":
-            items.append(sql.SQL("random()"))
+            items.append((sql.SQL("random()"), None))
         elif name == "_id":
             # the document id (doc_id), as before (the doc_id column is not in the search index, so all hits are read)
-            items.append(sql.SQL("documents.doc_id {}").format(direction))
+            items.append((sql.SQL("documents.doc_id"), direction))
         elif name == SEQ:
             # the internal id: the order in which documents were stored. Same order as id-ordered (keyset) paging, and
             # pg_search can use it for a fast Top-K scan
-            items.append(sql.SQL("documents.id {}").format(direction))
+            items.append((sql.SQL("documents.id"), direction))
         else:
             if name not in fieldset.by_name:
                 raise QueryError(f"Cannot sort on unknown field: {name}")
@@ -271,23 +273,23 @@ def order_items(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "desc"]
                 # AMCAT4_CUTOFF_SORT=false: the json text of the tag list, as before (below)
                 exprs = [cutoff_sort.tag_sort_sql(f, order == "desc", byte_order) for f in fs]
                 value = exprs[0] if len(exprs) == 1 else sql.SQL("coalesce({})").format(sql.SQL(", ").join(exprs))
-                items.append(sql.SQL("{} {}").format(value, direction))
+                items.append((value, direction))
             elif slot is not None:
                 # the field is in a sort slot: a real column, which pg_search can use for a fast Top-K scan. (Text slots
                 # have COLLATE "C", the byte order pg_search sorts in: another collation here would prevent Top-K)
-                items.append(sql.SQL("documents.{} {}").format(sql.Identifier(slot), direction))
+                items.append((sql.SQL("documents.{}").format(sql.Identifier(slot)), direction))
             elif byte_order and fs[0].type in ("keyword", "url", "text", "tag"):
                 # The same order as the text slot columns (COLLATE "C", byte order), so sorting does not change when a
                 # field gets a slot, or while its slot is being filled. It is also the order of Elasticsearch.
                 # AMCAT4_BYTE_ORDER_SORT=false: the database's collation, as in the original
-                items.append(sql.SQL('{} COLLATE "C" {}').format(_coalesce(fs), direction))
+                items.append((sql.SQL('{} COLLATE "C"').format(_coalesce(fs)), direction))
             else:
-                items.append(sql.SQL("{} {}").format(_coalesce(fs), direction))
+                items.append((_coalesce(fs), direction))
     return items
 
 
 def order_by(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "desc"]]] | None, scored: bool) -> sql.Composable:
-    items = order_items(fieldset, sort)
+    items = [cutoff_sort.order_item(expr, direction) for expr, direction in order_items(fieldset, sort)]
     if not items and scored:
         items.append(sql.SQL("paradedb.score(documents.id) DESC"))
     items.append(sql.SQL("documents.id"))
@@ -455,46 +457,59 @@ async def search(
             for name, order in sort or []
         ]
 
-    async def cutoff_page_ids() -> list[int] | None:
-        """The ids of the page from the cutoff sort, or None to sort all hits (the late fetch)"""
-        if not cutoff_keys or cutoff_keys[0] is None:
-            return None
-        try:
-            # (a savepoint: after an error in it, the late fetch can still run in the same snapshot)
-            async with conn.transaction():
-                return await cutoff_sort.page_ids(
-                    conn,
-                    c.table,
-                    lambda clauses: json_query_of([*c.selection, *clauses], c.scored),
-                    cutoff_keys,
-                    order_items(fieldset, sort),
-                    offset,
-                    per_page,
-                )
-        except psycopg.Error as e:
-            if must_not_fall_back(e):
-                raise
-            logging.warning(f"Cutoff sort failed, sorting all hits instead: {e}")
-            return None
+    async def find_page_ids() -> list[int] | None:
+        """The ids of the page without the late fetch, or None to sort all hits (the late fetch)"""
+        page_ids = None
+        if cutoff_sort.SMALL_HITS > 0:
+            # A small result: sort all hits (as the late fetch does), in a statement that stops if there are many
+            page_ids = await cutoff_sort.small_page_ids(
+                conn, c.table, c.json_query, order_items(fieldset, sort), offset, per_page
+            )
+        if page_ids is None:
+            page_ids = await cutoff_sort.page_ids(
+                conn,
+                c.table,
+                lambda clauses: json_query_of([*c.selection, *clauses], c.scored),
+                cutoff_keys,
+                order_items(fieldset, sort),
+                offset,
+                per_page,
+            )
+        return page_ids
 
     async def page_rows() -> list[dict]:
-        if not use_cutoff or conn.info.transaction_status != TransactionStatus.IDLE:
-            return await page_statements()
-        # Both statements of the late fetch, and the statements of the cutoff sort, must see the same documents: one
-        # snapshot (REPEATABLE READ; read statements cannot fail on it). Without it, a document that is changed or
-        # deleted between the statements could be missing from the page. (Not when the caller already has a
-        # transaction: then its isolation level is used.)
+        if not use_cutoff:
+            return await page_statements(None)
+        # The statement(s) that find the ids of the page and the statement that reads the rows must see the same
+        # documents: one snapshot (REPEATABLE READ; read statements cannot fail on it). Without it, a document that is
+        # changed or deleted between the statements could be missing from the page. (If the caller already has a
+        # transaction, its isolation level is used.) Only for sorts with a late fetch: other searches are one
+        # statement and get no transaction.
+        # A database error while finding the ids (not a timeout or a connection problem) ends the transaction; the
+        # page is then fetched with the late fetch, in a new one
+        own_transaction = conn.info.transaction_status == TransactionStatus.IDLE
         isolation_level = conn.isolation_level
-        await conn.set_isolation_level(IsolationLevel.REPEATABLE_READ)
+        if own_transaction:
+            await conn.set_isolation_level(IsolationLevel.REPEATABLE_READ)
         try:
-            async with conn.transaction():
-                return await page_statements()
+            for find_ids in (True, False) if cutoff_keys and cutoff_keys[0] is not None else (False,):
+                found = False
+                try:
+                    async with conn.transaction():
+                        page_ids = await find_page_ids() if find_ids else None
+                        found = True
+                        return await page_statements(page_ids)
+                except psycopg.Error as e:
+                    if found or not find_ids or must_not_fall_back(e):
+                        raise
+                    logging.warning(f"Cutoff sort failed, sorting all hits instead: {e}")
+            raise AssertionError("not reached")
         finally:
-            await conn.set_isolation_level(isolation_level)
+            if own_transaction:
+                await conn.set_isolation_level(isolation_level)
 
-    async def page_statements() -> list[dict]:
+    async def page_statements(page_ids: list[int] | None) -> list[dict]:
         where_, params_, query_offset = where, list(params), offset
-        page_ids = await cutoff_page_ids() if use_cutoff else None
         if page_ids is not None:
             where_ = sql.SQL("{} AND documents.id = ANY(%s)").format(where_)
             params_.append(page_ids)

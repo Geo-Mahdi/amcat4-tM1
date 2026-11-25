@@ -198,8 +198,17 @@ async def _page(filters: dict[str, dict], sort: list[tuple[str, str]], page: int
 # The limits of the cutoff sort (module constants), as they are and small: with the small ones this test set uses the
 # group for many ties at the cutoff, the second histogram for numbers and the fallback for deep pages
 CUTOFF_LIMITS = {
-    "on": {},
-    "on, small limits": {"SPLIT_ROWS": 4, "ZOOM_ROWS": 4, "HIST_BUCKETS": 6, "MAX_BUCKETS": 400},
+    "on": {"SMALL_HITS": 0},
+    "on, small limits": {
+        "SMALL_HITS": 0,
+        "SPLIT_ROWS": 4,
+        "ZOOM_ROWS": 4,
+        "HIST_BUCKETS": 6,
+        "MAX_BUCKETS": 400,
+        "MAX_TERMS": 3,
+    },
+    # results of up to 100 hits are sorted as a whole (as the default limit does for all results of this test set)
+    "on, small results": {"SMALL_HITS": 100},
 }
 
 
@@ -247,6 +256,7 @@ async def test_parity_filters_and_sorts(parity_project, monkeypatch):
     used = {mode: sum(calls) for mode, calls in late_fetches.items()}
     assert used["on"] >= 0.9 * len(late_fetches["on"]) > 0.3 * N_CASES, (used, N_CASES)
     assert used["on, small limits"] >= 0.5 * len(late_fetches["on, small limits"]), used
+    assert 0 < len(late_fetches["on, small results"]) < len(late_fetches["on"]), late_fetches
     print(f"parity: {N_CASES} cases, late fetches { ({m: len(c) for m, c in late_fetches.items()}) }, by cutoff sort {used}")
 
 

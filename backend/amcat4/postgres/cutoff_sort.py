@@ -19,9 +19,11 @@ The order is exactly the order of the late fetch: key 1, key 2, ..., documents.i
   sorted, and the documents with exactly the cutoff value are ordered by the remaining keys (with no keys left
   that is ORDER BY id, a Top-K scan).
 - Tags: Elasticsearch order (ascending on the smallest tag of a document, descending on the largest, see
-  tag_sort_sql). A range clause on a tag list matches if any tag is in the range, which is the same as
-  "smallest tag <= cutoff" (or "largest tag >= cutoff"). The aggregation counts a document once per tag, so the
-  cutoff can be too early; then the page comes back short and the walk is repeated with a larger target.
+  tag_sort_sql). A clause on a tag list matches if any tag matches, which is the same as "smallest tag <= cutoff"
+  (or "largest tag >= cutoff"). The aggregation counts a document once per tag, so the cutoff can be too early;
+  then the page comes back short and the walk is repeated with a larger target. Many documents with the cutoff
+  tag: groups, see _tag_groups.
+- Small results (up to SMALL_HITS hits) are not cut off at all: small_page_ids sorts all hits in one statement.
 
 Rules that come from pg_search 0.27.0 (found in the research of 25 Nov 2026, json-speed-research/round2/R2_cutoff.md):
 - conditions on json keys are always part of the json query, never SQL comparisons (pg_search turns
@@ -36,6 +38,7 @@ Correctness first: page_ids raises _Fallback (and returns None) whenever somethi
 caller then uses the late fetch. Switch: AMCAT4_CUTOFF_SORT (config.py).
 """
 
+import dataclasses
 import json
 import logging
 import math
@@ -56,8 +59,14 @@ HIST_BUCKETS = 1_000
 ZOOM_ROWS = 2_000
 # More documents than this with exactly the cutoff value: do not sort them on the first key (see module text)
 SPLIT_ROWS = 1_000
+# Text fields: up to this many values, "up to the cutoff" is a set of terms instead of a range (see _among)
+MAX_TERMS = 1_000
 # Tags: how often to repeat the walk with a larger target before giving up
 MAX_RETRY = 3
+
+# Up to this many hits, all hits are sorted (one statement, as the late fetch does) and no cutoff is looked for: the
+# aggregation would cost more than it saves. See small_page_ids for the measurements behind the number
+SMALL_HITS = 5_000
 
 TEXT_TYPES = ("keyword", "url", "tag")
 CUTOFF_TYPES = (*TEXT_TYPES, "integer", "number", "date")
@@ -67,6 +76,13 @@ _DATE_EPOCH = datetime(2000, 1, 1)
 _EXACT_FLOAT = 2**53
 
 _ID = sql.SQL("documents.id")
+
+
+OrderItem = tuple[sql.Composable, sql.Composable | None]
+
+
+def order_item(expr: sql.Composable, direction: sql.Composable | None) -> sql.Composable:
+    return expr if direction is None else sql.SQL("{} {}").format(expr, direction)
 
 
 class _Fallback(Exception):
@@ -154,12 +170,39 @@ def _up_to(k: SortKey, value: Any, inclusive: bool = True) -> dict:
     return _range(k, upper=value, include_upper=inclusive)
 
 
+def _among(k: SortKey, values: list[Any]) -> dict:
+    """
+    Documents with a value up to the last of these values: the values of the search in sort order, from the first
+    one, without gaps (the bucket keys of the walk). For text fields this is a set of terms as long as it is not
+    too long: pg_search looks terms up in its index, while a text range reads the values of every document of the
+    partition (on a tag field of 1 M documents: 3 ms against 80 ms, 25 Nov 2026). Both select the same documents
+    """
+    if k.field.type in TEXT_TYPES and len(values) <= MAX_TERMS:
+        return _equal(k, values[0]) if len(values) == 1 else {"term_set": {"terms": [_term(k, v) for v in values]}}
+    return _up_to(k, values[-1])
+
+
+def _term(k: SortKey, value: Any) -> dict:
+    return {"field": k.field.path, "value": value}
+
+
+def _equal(k: SortKey, value: Any) -> dict:
+    """Documents with exactly this value (tags: with this tag)"""
+    if k.field.type in TEXT_TYPES:
+        return {"term": _term(k, value)}
+    return _range(k, value, value)
+
+
 def _exists(k: SortKey) -> dict:
     return {"exists": {"field": k.field.path}}
 
 
+def _not(clause: dict) -> dict:
+    return {"boolean": {"must": [{"all": None}], "must_not": [clause]}}
+
+
 def _missing(k: SortKey) -> dict:
-    return {"boolean": {"must": [{"all": None}], "must_not": [_exists(k)]}}
+    return _not(_exists(k))
 
 
 # ---------------------------------------------------------------- the sort
@@ -173,6 +216,7 @@ class _Cutoff:
     value: Any = None
     before: int = 0
     ties: int = 0
+    values_before: list[Any] = dataclasses.field(default_factory=list)  # the values before the cutoff value, in sort order
 
 
 def _check_keys(k: SortKey, keys: list[Any]) -> None:
@@ -197,7 +241,7 @@ class _Sorter:
         table: sql.Composable,
         json_query: Callable[[list[dict]], dict],
         keys: list[SortKey | None],
-        order_items: list[sql.Composable],
+        order_items: list[OrderItem],
     ):
         self.conn, self.table, self.json_query, self.keys, self.order_items = conn, table, json_query, keys, order_items
 
@@ -205,7 +249,7 @@ class _Sorter:
 
     async def fetch(self, extra: list[dict], level: int, offset: int, limit: int) -> list[int]:
         """Ids of the documents of the search plus these clauses, ordered by the sort keys from this level on"""
-        ordering = sql.SQL(", ").join([*self.order_items[level:], _ID])
+        ordering = sql.SQL(", ").join([*(order_item(*item) for item in self.order_items[level:]), _ID])
         cur = await self.conn.execute(
             sql.SQL("SELECT documents.id FROM {} WHERE documents.id @@@ %s::jsonb ORDER BY {} LIMIT %s OFFSET %s").format(
                 self.table, ordering
@@ -258,10 +302,11 @@ class _Sorter:
         buckets = [b for b in result.get("buckets", []) if b.get("key") is not None]
         _check_keys(k, [b["key"] for b in buckets])
         passed = 0
-        for b in buckets:
+        for i, b in enumerate(buckets):
             n = b["doc_count"]
             if passed + n >= need:
-                return _Cutoff(_up_to(k, b["key"]), True, value=b["key"], before=passed, ties=n)
+                values = [x["key"] for x in buckets[: i + 1]]
+                return _Cutoff(_among(k, values), True, value=b["key"], before=passed, ties=n, values_before=values[:-1])
             passed += n
         if len(buckets) >= size:
             raise _Fallback("more buckets than expected")
@@ -316,23 +361,26 @@ class _Sorter:
         """The documents that have a value for the key of this level, in order, from offset"""
         k = self.keys[level]
         assert k is not None
-        extra = [*extra, _exists(k)]
+        # (No "exists" clause next to the clauses below: a clause on a value only matches documents that have one, and
+        # the aggregations skip documents without. On 1 M documents the clause cost 10 to 15 ms per statement)
         need = offset + limit
         for _ in range(MAX_RETRY + 1):
             if k.field.type == "number":
                 c = await self._number_cutoff(extra, k, need)
             else:
                 c = await self._terms_cutoff(extra, k, need)
-            if c.cut and c.value is not None and k.field.type != "tag" and c.ties > SPLIT_ROWS:
+            if c.cut and c.value is not None and k.field.type == "tag" and c.ties > SPLIT_ROWS:
+                return await self._tag_groups(extra, level, offset, limit, c)
+            if c.cut and c.value is not None and c.ties > SPLIT_ROWS:
                 # Many documents with exactly the cutoff value: the documents before that value (c.before, exact) are
                 # sorted as usual, the documents with the value are a group ordered by the remaining keys
                 ids: list[int] = []
                 if offset < c.before:
-                    ids = await self.fetch([*extra, _up_to(k, c.value, inclusive=False)], level, offset, limit)
+                    ids = await self.fetch([*extra, _among(k, c.values_before)], level, offset, limit)
                     if len(ids) != min(limit, c.before - offset):
                         raise _Fallback("fewer documents before the cutoff value than counted")
                 if len(ids) < limit:
-                    same = [*extra, _range(k, c.value, c.value)]
+                    same = [*extra, _equal(k, c.value)]
                     ids += await self.page(same, level + 1, max(0, offset - c.before), limit - len(ids))
                 if len(ids) != limit:
                     raise _Fallback("fewer documents with the cutoff value than counted")
@@ -345,6 +393,40 @@ class _Sorter:
             # tags: documents with several tags were counted more than once, so the cutoff was too early
             need = need * 2 + (limit - len(ids))
         raise _Fallback("tag cutoff too early after retries")
+
+    async def _tag_groups(self, extra: list[dict], level: int, offset: int, limit: int, c: _Cutoff) -> list[int]:
+        """
+        Tags, with many documents that have the cutoff tag (so sorting all documents up to the cutoff would read many
+        rows, each with its list of tags). The documents with a value are three groups, in this order:
+        1. a tag before the cutoff tag: their smallest (descending: largest) tag is before the cutoff. Sorted as usual;
+        2. the cutoff tag and no tag before it: the cutoff tag is their smallest (largest) tag, so they are ordered
+           by the remaining keys (with no keys left: by id, a Top-K scan);
+        3. only tags after the cutoff tag: the same question again, for what is left of the page.
+        The aggregation counts a document once per tag, so its counts only say where to look: the sizes of the groups
+        are counted (group 1: nothing to count if the cutoff tag is the first value), or follow from the rows.
+        """
+        k = self.keys[level]
+        assert k is not None
+        first_value = not c.values_before  # no value before the cutoff tag among these documents
+        before_cutoff = {} if first_value else _among(k, c.values_before)
+        before = 0 if first_value else await self.count([*extra, before_cutoff])
+        ids: list[int] = []
+        if offset < before:
+            ids = await self.fetch([*extra, before_cutoff], level, offset, limit)
+            if len(ids) != min(limit, before - offset):
+                raise _Fallback("other number of documents before the cutoff tag than counted")
+            if len(ids) == limit:
+                return ids
+        group = [*extra, _equal(k, c.value), *([] if first_value else [_not(before_cutoff)])]
+        group_offset = max(0, offset - before)
+        in_group = await self.page(group, level + 1, group_offset, limit - len(ids))
+        ids += in_group
+        if len(ids) < limit:
+            # the group ran out: the rest of the page has only tags after the cutoff tag
+            group_size = group_offset + len(in_group) if in_group else await self.count(group)
+            rest = [*extra, _not(c.clause)]
+            ids += await self.with_value(rest, level, max(0, offset - before - group_size), limit - len(ids))
+        return ids
 
     async def page(self, extra: list[dict], level: int, offset: int, limit: int) -> list[int]:
         """`limit` ids from `offset` of the search plus these clauses, ordered by the sort keys from this level on"""
@@ -363,12 +445,48 @@ class _Sorter:
         return ids
 
 
+async def small_page_ids(
+    conn: AsyncConnection,
+    table: sql.Composable,
+    json_query: dict,
+    order_items: list[OrderItem],
+    offset: int,
+    limit: int,
+) -> list[int] | None:
+    """
+    The internal ids of one page (in order) if the search has at most SMALL_HITS hits, otherwise None.
+
+    One statement: it reads at most SMALL_HITS + 1 hits with their sort values, in no order, counts them and sorts
+    them. For a small result this is the work of the first statement of the late fetch (which reads and sorts all
+    hits), so a small result costs what it cost before the cutoff sort existed. For a large result the statement
+    stops after SMALL_HITS + 1 hits and the cutoff sort follows.
+
+    The number (benchmark of 1 M documents, 25 Nov 2026, pg_search 0.27.0): the statement costs about 2 ms per 1,000
+    hits it reads, the cutoff sort 8 to 15 ms whatever the number of hits, so they meet at 3,000 to 6,000 hits. For a
+    large result the statement is wasted: 4 ms at 2,000, 10 ms at 5,000. Under load (32 clients, lists of a few
+    thousand hits sorted on a json field among other lists) 5,000 gave 323 to 333 requests/s in three runs, 2,000 and 3,000
+    gave 306 and 300, and always using the cutoff sort 168 to 186.
+    """
+    columns = [sql.SQL("{} AS {}").format(expr, sql.Identifier(f"o{i}")) for i, (expr, _) in enumerate(order_items)]
+    ordering = [order_item(sql.Identifier(f"o{i}"), direction) for i, (_, direction) in enumerate(order_items)]
+    cur = await conn.execute(
+        sql.SQL(
+            "WITH hits AS MATERIALIZED (SELECT {} FROM {} WHERE documents.id @@@ %s::jsonb LIMIT %s) "
+            "SELECT (SELECT count(*) FROM hits) AS n, "
+            "ARRAY(SELECT id FROM hits ORDER BY {} LIMIT %s OFFSET %s) AS ids"
+        ).format(sql.SQL(", ").join([_ID, *columns]), table, sql.SQL(", ").join([*ordering, sql.Identifier("id")])),
+        [json.dumps(json_query), SMALL_HITS + 1, limit, offset],
+    )
+    row: dict = await cur.fetchone()  # type: ignore[assignment]
+    return list(row["ids"]) if row["n"] <= SMALL_HITS else None
+
+
 async def page_ids(
     conn: AsyncConnection,
     table: sql.Composable,
     json_query: Callable[[list[dict]], dict],
     keys: list[SortKey | None],
-    order_items: list[sql.Composable],
+    order_items: list[OrderItem],
     offset: int,
     limit: int,
 ) -> list[int] | None:

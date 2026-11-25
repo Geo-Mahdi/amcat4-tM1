@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 from psycopg import AsyncConnection
+from psycopg.pq import TransactionStatus
 
 from amcat4.config import get_settings
 from amcat4.models import FieldSpec, FilterSpec, ProjectSettings, SortSpec
@@ -84,6 +85,8 @@ def cutoff_calls(monkeypatch):
     """Records for every late fetch whether the cutoff sort gave the ids of the page (True) or not (False: fallback)"""
     calls: list[bool] = []
     original = cutoff_sort.page_ids
+    # (the test sets are small: without this, all their hits would simply be sorted, see test_small_results)
+    monkeypatch.setattr(cutoff_sort, "SMALL_HITS", 0)
 
     async def recording(*args, **kwargs):
         ids = await original(*args, **kwargs)
@@ -102,6 +105,21 @@ def statements(monkeypatch):
 
     async def execute(self, query, params=None, **kwargs):
         seen.append(query if isinstance(query, str) else query.as_string(None))
+        return await original(self, query, params, **kwargs)
+
+    monkeypatch.setattr(AsyncConnection, "execute", execute)
+    return seen
+
+
+@pytest.fixture()
+def transactions(monkeypatch):
+    """Records for every statement whether it ran inside a transaction: (text, in transaction)"""
+    seen: list[tuple[str, bool]] = []
+    original = AsyncConnection.execute
+
+    async def execute(self, query, params=None, **kwargs):
+        text = query if isinstance(query, str) else query.as_string(None)
+        seen.append((text, self.info.transaction_status != TransactionStatus.IDLE))
         return await original(self, query, params, **kwargs)
 
     monkeypatch.setattr(AsyncConnection, "execute", execute)
@@ -186,6 +204,7 @@ async def test_small_steps(project, cutoff_calls, monkeypatch, name):
     monkeypatch.setattr(cutoff_sort, "SPLIT_ROWS", 3)
     monkeypatch.setattr(cutoff_sort, "ZOOM_ROWS", 3)
     monkeypatch.setattr(cutoff_sort, "HIST_BUCKETS", 7)
+    monkeypatch.setattr(cutoff_sort, "MAX_TERMS", 2)
     for order in ("asc", "desc"):
         await _check_pages(project, [(name, order)], per_page=7)
     assert cutoff_calls and all(cutoff_calls)
@@ -288,6 +307,109 @@ async def test_few_hits(project, cutoff_calls):
         assert await _page([(name, "asc")], 3, 50, {"i": {"values": [7]}}) == []
         assert await _page([(name, "desc")], 0, 50, {"i": {"values": [12345]}}) == []
     assert all(cutoff_calls)
+
+
+# ---------------------------------------------------------------- small results
+
+
+@pytest.mark.parametrize(
+    "sort",
+    [
+        [("kw", "asc")],
+        [("link", "desc")],
+        [("tags", "asc")],
+        [("tags", "desc")],
+        [("i", "desc")],
+        [("num", "asc")],
+        [("day", "desc")],
+        [("kw", "desc"), ("num", "asc"), ("tags", "asc")],
+        [("i", "asc"), ("date", "desc")],
+        [("day", "asc"), ("_id", "desc")],
+    ],
+)
+async def test_small_results_are_sorted_as_a_whole(project, statements, sort):
+    """Up to SMALL_HITS hits (the default covers this test set): one statement sorts all hits, no aggregation"""
+    assert cutoff_sort.SMALL_HITS >= N_DOCS
+    await _check_pages(project, sort, per_page=9)
+    assert await _page(sort, 100, 9) == []  # a page after the last one
+    finding = [s for s in statements if "@@@" in s and "count(*) AS n FROM" not in s and "ANY(%s)" not in s]
+    assert finding and all(s.startswith("WITH hits AS MATERIALIZED (SELECT documents.id, ") for s in finding)
+    assert 'FROM hits ORDER BY "o0" ' in finding[0]
+    assert not any("pdb.agg" in s for s in statements)
+
+
+async def test_more_hits_than_small_use_the_cutoff(project, statements, monkeypatch):
+    """One hit more than SMALL_HITS: the first statement stops there, and the cutoff sort finds the page"""
+    hits = sum(1 for d in project if d.get("i", -99) >= 10)
+    for small, by_cutoff in ((hits, False), (hits - 1, True)):
+        monkeypatch.setattr(cutoff_sort, "SMALL_HITS", small)
+        del statements[:]
+        await _check_pages(
+            project, [("kw", "asc")], filters={"i": {"gte": 10}}, keep=lambda d: d.get("i", -99) >= 10, pages=[2]
+        )
+        assert sum(s.startswith("WITH hits AS MATERIALIZED") for s in statements) == 1
+        assert any("pdb.agg" in s for s in statements) == by_cutoff
+
+
+async def test_only_late_fetch_sorts_get_a_transaction(project, transactions):
+    """
+    Searches that never had a late fetch (sort slot columns, relevance, id order, no sort) are untouched: one
+    statement, no transaction, no extra statement. Sorts on a json field run their statements in one transaction
+    """
+    for sort, queries in (
+        ([("date", "desc")], None),
+        ([("date", "asc"), ("_seq", "desc")], None),
+        ([], None),
+        ([], {"q": "red"}),
+        ([("_score", "desc")], {"q": "red"}),
+        ([("date", "desc")], {"q": "red"}),
+    ):
+        del transactions[:]
+        assert len(await _page(sort, 1, 10, queries=queries)) == 10
+        searches = [(s, t) for s, t in transactions if "@@@" in s or "FROM documents" in s or 'FROM "documents' in s]
+        pages = [s for s, _ in searches if "count(*)" not in s]
+        assert len(pages) == 1 and "ORDER BY" in pages[0] and "hits" not in pages[0], (sort, pages)
+        assert not any(t for _, t in transactions), sort
+        assert not any("pdb.agg" in s for s, _ in transactions)
+    for sort in ([("kw", "asc")], [("_id", "asc")]):
+        del transactions[:]
+        assert len(await _page(sort, 1, 10)) == 10
+        pages = [t for s, t in transactions if "@@@" in s and "count(*) AS n FROM" not in s]
+        assert len(pages) == 2 and all(pages), sort
+
+
+async def test_database_error_while_finding_ids(project, monkeypatch):
+    """A statement of the cutoff sort that fails (not a timeout): the page comes from the late fetch"""
+    failed = []
+
+    async def failing(conn, *args, **kwargs):
+        failed.append(True)
+        await conn.execute("SELECT 1 / 0")
+
+    for name in ("small_page_ids", "page_ids"):
+        with monkeypatch.context() as m:
+            m.setattr(cutoff_sort, "SMALL_HITS", N_DOCS if name == "small_page_ids" else 0)
+            m.setattr(cutoff_sort, name, failing)
+            await _check_pages(project, [("kw", "asc")], pages=[3])
+    assert failed == [True, True]
+
+
+async def test_tag_groups(project, cutoff_calls, statements, monkeypatch):
+    """
+    Tags with many documents per tag: the documents whose smallest (largest) tag is the cutoff tag are a group that
+    is not sorted on the tags; a page can lie in several groups, and before, in and after a group
+    """
+    monkeypatch.setattr(cutoff_sort, "SPLIT_ROWS", 10)
+    for sort in ([("tags", "asc")], [("tags", "desc")], [("tags", "asc"), ("i", "desc")], [("tags", "desc"), ("kw", "asc")]):
+        for per_page in (10, 150, 400):
+            await _check_pages(project, sort, per_page=per_page)
+    assert all(cutoff_calls)
+    # the first page of a sort on tags alone: an aggregation, then the first documents with the first tag by id
+    del statements[:]
+    await _page([("tags", "asc")], 0, 10)
+    searches = [s for s in statements if "@@@" in s and "count(*) AS n FROM" not in s]
+    assert len(searches) == 3 and "pdb.agg" in searches[0]
+    assert searches[1].endswith("WHERE documents.id @@@ %s::jsonb ORDER BY documents.id LIMIT %s OFFSET %s")
 
 
 # ---------------------------------------------------------------- tag order
@@ -499,6 +621,7 @@ async def test_delete_between_the_two_statements(changing_project, monkeypatch):
     name, docs = changing_project
     original = cutoff_sort.page_ids
     used = []
+    monkeypatch.setattr(cutoff_sort, "SMALL_HITS", 0)
 
     async def page_ids_then_delete(*args, **kwargs):
         ids = await original(*args, **kwargs)
