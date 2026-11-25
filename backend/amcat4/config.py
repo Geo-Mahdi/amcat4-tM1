@@ -186,6 +186,24 @@ class Settings(BaseSettings):
         ),
     ] = True
 
+    cutoff_sort: Annotated[
+        bool,
+        Field(
+            description=(
+                "Sort on a field without a sort slot (keyword, url, tag, integer, number, date) with the cutoff sort: "
+                "an aggregation in the search index finds the value of the last document of the page, and only the "
+                "documents up to that value are read and sorted, instead of every hit. Both statements of such a page "
+                "then run in one snapshot. "
+                "Why: sorting all hits took 110 to 1,100 ms for 100,000 to 1,000,000 hits, the cutoff sort 7 to 43 ms "
+                "(research prototype on 1 M documents, pg_search 0.27.0, 25 Nov 2026; not re-measured on this code). "
+                "The results are the same, except for tag fields: with this switch on they sort like Elasticsearch "
+                "(ascending on the smallest tag of a document, descending on the largest), not on the text of the "
+                "whole tag list. "
+                "false = sort all hits, and the old tag order, as in postgres-fast-v2 (AMCAT4_CUTOFF_SORT=false)"
+            ),
+        ),
+    ] = True
+
     quarter_key: Annotated[
         bool,
         Field(

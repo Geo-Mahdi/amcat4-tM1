@@ -13,15 +13,19 @@ has a switch in the settings (config.py) that gives back the original behaviour.
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from psycopg import AsyncConnection, sql
+import psycopg
+from psycopg import AsyncConnection, IsolationLevel, sql
+from psycopg.pq import TransactionStatus
 from psycopg.types.json import Jsonb
 
 from amcat4.config import get_settings
 from amcat4.models import FilterSpec, SnippetParams
-from amcat4.postgres.connection import spare_connection
+from amcat4.postgres import cutoff_sort
+from amcat4.postgres.connection import must_not_fall_back, spare_connection
 from amcat4.postgres.fields import FieldInfo, FieldSet, QueryError
 from amcat4.postgres.filters import compile_filters, field_sql
 from amcat4.postgres.layout import partition_table
@@ -55,6 +59,11 @@ class CompiledSearch:
     # rows of the page (the search index has to go through the ids of all projects in the partition)
     plain_where: sql.Composable | None = None
     plain_params: list[Any] = field(default_factory=list)
+    # The parts json_query was built from (see json_query_of), so that the cutoff sort can add clauses to the selection
+    selection: list[dict] = field(default_factory=list)
+    scored: list[dict] = field(default_factory=list)
+    # True if `documents.id @@@ json_query` is the whole condition (where has no other SQL conditions)
+    json_only: bool = False
 
 
 def project_clause(project_pks: list[int]) -> dict:
@@ -77,6 +86,18 @@ def unscored(clauses: list[dict]) -> dict:
     """
     query = clauses[0] if len(clauses) == 1 else {"boolean": {"must": clauses}}
     return {"const_score": {"score": 0.0, "query": query}}
+
+
+def json_query_of(selection: list[dict], scored: list[dict]) -> dict:
+    """The json query for these selecting clauses (the project clause first) and the scored query string clauses"""
+    if get_settings().filter_clauses:
+        # the project and the filters select without scoring; only the query string is scored (see unscored)
+        must = [unscored(selection), *scored]
+    else:
+        # AMCAT4_FILTER_CLAUSES=false: the original form, everything is a scored must clause (same hits and counts,
+        # other scores and so another relevance order)
+        must = [selection[0], *scored, *selection[1:]]
+    return must[0] if len(must) == 1 else {"boolean": {"must": must}}
 
 
 def _compile_query_string(label: str, q: str, fieldset: FieldSet) -> dict:
@@ -166,14 +187,7 @@ def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False, b
         extra_clauses.append(sql.SQL("documents.doc_id = ANY(%s)"))
         extra_params.append(list(query.ids))
     sql_clauses, params = [*base_clauses, *extra_clauses], [*base_params, *extra_params]
-    if get_settings().filter_clauses:
-        # the project and the filters select without scoring; only the query string is scored (see unscored)
-        must = [unscored(selection), *scored]
-    else:
-        # AMCAT4_FILTER_CLAUSES=false: the original form, everything is a scored must clause (same hits and counts,
-        # other scores and so another relevance order)
-        must = [selection[0], *scored, *selection[1:]]
-    json_query = must[0] if len(must) == 1 else {"boolean": {"must": must}}
+    json_query = json_query_of(selection, scored)
     where = sql.SQL(" AND ").join([sql.SQL("documents.id @@@ %s::jsonb"), *sql_clauses])
     plain_where, plain_params = None, []
     if not scored and len(selection) == 1:
@@ -189,6 +203,9 @@ def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False, b
         fast=use_partition_table,
         plain_where=plain_where,
         plain_params=plain_params,
+        selection=selection,
+        scored=scored,
+        json_only=not sql_clauses,
     )
 
 
@@ -225,7 +242,8 @@ def slot_sort_column(fieldset: FieldSet, name: str) -> str | None:
     return fs[0].sort_read_column
 
 
-def order_by(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "desc"]]] | None, scored: bool) -> sql.Composable:
+def order_items(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "desc"]]] | None) -> list[sql.Composable]:
+    """The ORDER BY item of each item of the sort"""
     items: list[sql.Composable] = []
     for name, order in sort or []:
         direction = sql.SQL("DESC NULLS LAST" if order == "desc" else "ASC NULLS LAST")
@@ -245,17 +263,31 @@ def order_by(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "desc"]]] 
                 raise QueryError(f"Cannot sort on unknown field: {name}")
             fs = fieldset.by_name[name]
             slot = slot_sort_column(fieldset, name)
-            if slot is not None:
+            byte_order = get_settings().byte_order_sort
+            if fs[0].type == "tag" and get_settings().cutoff_sort:
+                # Tags in the order of Elasticsearch: ascending on the smallest tag of the document, descending on the
+                # largest (cutoff_sort.tag_sort_sql). This is the order whenever the cutoff sort is switched on, whether
+                # or not a statement uses it, so the order of a tag sort never depends on the path.
+                # AMCAT4_CUTOFF_SORT=false: the json text of the tag list, as before (below)
+                exprs = [cutoff_sort.tag_sort_sql(f, order == "desc", byte_order) for f in fs]
+                value = exprs[0] if len(exprs) == 1 else sql.SQL("coalesce({})").format(sql.SQL(", ").join(exprs))
+                items.append(sql.SQL("{} {}").format(value, direction))
+            elif slot is not None:
                 # the field is in a sort slot: a real column, which pg_search can use for a fast Top-K scan. (Text slots
                 # have COLLATE "C", the byte order pg_search sorts in: another collation here would prevent Top-K)
                 items.append(sql.SQL("documents.{} {}").format(sql.Identifier(slot), direction))
-            elif get_settings().byte_order_sort and fs[0].type in ("keyword", "url", "text", "tag"):
+            elif byte_order and fs[0].type in ("keyword", "url", "text", "tag"):
                 # The same order as the text slot columns (COLLATE "C", byte order), so sorting does not change when a
                 # field gets a slot, or while its slot is being filled. It is also the order of Elasticsearch.
                 # AMCAT4_BYTE_ORDER_SORT=false: the database's collation, as in the original
                 items.append(sql.SQL('{} COLLATE "C" {}').format(_coalesce(fs), direction))
             else:
                 items.append(sql.SQL("{} {}").format(_coalesce(fs), direction))
+    return items
+
+
+def order_by(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "desc"]]] | None, scored: bool) -> sql.Composable:
+    items = order_items(fieldset, sort)
     if not items and scored:
         items.append(sql.SQL("paradedb.score(documents.id) DESC"))
     items.append(sql.SQL("documents.id"))
@@ -404,9 +436,70 @@ async def search(
             where = sql.SQL("{} AND documents.id {} %s").format(where, sql.SQL("<" if descending else ">"))
             params.append(after_id)
 
+    # The cutoff sort (cutoff_sort.py) finds the ids of the page without sorting all hits. It replaces the first
+    # statement of the late fetch when: the first sort key is a json field of one of the supported types without a sort
+    # slot, with the same json key in every project of the query; the search is on a partition table and all its
+    # conditions are in the json query; and filters are unscored (the extra clauses must not change scores).
+    # AMCAT4_CUTOFF_SORT=false: always the late fetch as it was (and the old order of tag sorts)
+    use_cutoff = late_fetch and get_settings().cutoff_sort
+    cutoff_keys: list[cutoff_sort.SortKey | None] = []
+    if use_cutoff and c.fast and c.json_only and get_settings().filter_clauses and where is c.where:
+        cutoff_keys = [
+            cutoff_sort.sort_key(
+                fieldset,
+                name,
+                order,
+                lambda n: slot_sort_column(fieldset, n) is not None,
+                get_settings().byte_order_sort,
+            )
+            for name, order in sort or []
+        ]
+
+    async def cutoff_page_ids() -> list[int] | None:
+        """The ids of the page from the cutoff sort, or None to sort all hits (the late fetch)"""
+        if not cutoff_keys or cutoff_keys[0] is None:
+            return None
+        try:
+            # (a savepoint: after an error in it, the late fetch can still run in the same snapshot)
+            async with conn.transaction():
+                return await cutoff_sort.page_ids(
+                    conn,
+                    c.table,
+                    lambda clauses: json_query_of([*c.selection, *clauses], c.scored),
+                    cutoff_keys,
+                    order_items(fieldset, sort),
+                    offset,
+                    per_page,
+                )
+        except psycopg.Error as e:
+            if must_not_fall_back(e):
+                raise
+            logging.warning(f"Cutoff sort failed, sorting all hits instead: {e}")
+            return None
+
     async def page_rows() -> list[dict]:
+        if not use_cutoff or conn.info.transaction_status != TransactionStatus.IDLE:
+            return await page_statements()
+        # Both statements of the late fetch, and the statements of the cutoff sort, must see the same documents: one
+        # snapshot (REPEATABLE READ; read statements cannot fail on it). Without it, a document that is changed or
+        # deleted between the statements could be missing from the page. (Not when the caller already has a
+        # transaction: then its isolation level is used.)
+        isolation_level = conn.isolation_level
+        await conn.set_isolation_level(IsolationLevel.REPEATABLE_READ)
+        try:
+            async with conn.transaction():
+                return await page_statements()
+        finally:
+            await conn.set_isolation_level(isolation_level)
+
+    async def page_statements() -> list[dict]:
         where_, params_, query_offset = where, list(params), offset
-        if late_fetch:
+        page_ids = await cutoff_page_ids() if use_cutoff else None
+        if page_ids is not None:
+            where_ = sql.SQL("{} AND documents.id = ANY(%s)").format(where_)
+            params_.append(page_ids)
+            query_offset = 0
+        elif late_fetch:
             # Late fetch: the sort is on a json field (not a sort slot), so pg_search cannot do a Top-K scan and every
             # hit is read and sorted. Do that with only the internal id (no text, no snippets), then fetch the full
             # rows of just this page with the same statement as below, restricted to these ids (same order, columns).

@@ -2,7 +2,10 @@
 Same-results test (version 3): many random searches through the normal query code, each compared with a reference.
 
 - Filters and sorts on fields: the reference is computed in Python from the uploaded documents, so it does not depend
-  on pg_search at all (no Top-K scan, no index).
+  on pg_search at all (no Top-K scan, no index). Every case runs with the cutoff sort (AMCAT4_CUTOFF_SORT) on, on
+  with small limits (so that the branches for large results are used on this small test set) and off. Tag sorts are
+  only compared with the switch on: then the order is that of Elasticsearch (smallest tag ascending, largest tag
+  descending); with the switch off it is the order of postgres-fast-v2 (the json text of the tag list).
 - Relevance order: the reference is one SQL statement that first materializes every hit with its score and then
   sorts them in postgres, so pg_search cannot use its Top-K scan.
 
@@ -22,6 +25,7 @@ from psycopg import sql
 
 from amcat4.config import get_settings
 from amcat4.models import FieldSpec, FilterSpec, ProjectSettings, SortSpec
+from amcat4.postgres import cutoff_sort
 from amcat4.postgres.connection import connection
 from amcat4.postgres.search import SearchQuery, compile_search
 from amcat4.projects.index import create_project_index, delete_project_index
@@ -34,7 +38,15 @@ pytestmark = pytest.mark.anyio
 N_DOCS = 1500
 N_CASES = int(os.environ.get("AMCAT4_PARITY_CASES", "120"))
 PROJECT = "amcat4_unittest_parity"
-FIELDS = {"text": "text", "kw": "keyword", "num": "number", "i": "integer", "date": "date", "tags": "tag"}
+FIELDS = {
+    "text": "text",
+    "kw": "keyword",
+    "num": "number",
+    "i": "integer",
+    "date": "date",
+    "tags": "tag",
+    "date2": "date",
+}
 WORDS = [f"w{k}" for k in range(60)]
 KEYWORDS = ["alpha", "Beta", "gamma", "delta", "épsilon", "zeta", "Zeta", "10", "9", "a b"]
 NUMBERS = [17, 17.5, 18, 3.25, 40, -2, -2.5, 0, 1000000, 0.1]
@@ -59,6 +71,8 @@ def make_docs(n: int = N_DOCS, seed: int = 7) -> list[dict[str, Any]]:
             doc["date"] = f"20{rnd.randrange(10, 24)}-{rnd.randrange(1, 13):02d}-{rnd.randrange(1, 28):02d}"
         if rnd.random() < 0.8:
             doc["tags"] = rnd.sample(TAGS, rnd.randrange(1, 4))
+        if rnd.random() < 0.85:
+            doc["date2"] = f"{rnd.randrange(1995, 2024)}-{rnd.randrange(1, 13):02d}-01T{rnd.randrange(0, 24):02d}:00:00"
         docs.append(doc)
     return docs
 
@@ -107,8 +121,12 @@ def _matches(doc: dict, name: str, spec: dict) -> bool:
     return False
 
 
-def _sort_key(name: str, value: Any) -> Any:
-    if name == "date":
+def _sort_key(name: str, value: Any, order: str = "asc") -> Any:
+    if name == "tags":
+        # the order of Elasticsearch: the smallest tag of the document for ascending, the largest for descending
+        tags = [str(t).encode("utf-8") for t in value]
+        return max(tags) if order == "desc" else min(tags)
+    if name in ("date", "date2"):
         return _date(value)
     if name in ("num", "i"):
         return float(value)
@@ -119,10 +137,11 @@ def reference(docs: list[dict], filters: dict[str, dict], sort: list[tuple[str, 
     """The ids of all hits in the expected order (values first, missing values last, ties in upload order)"""
     hits = [(k, d) for k, d in enumerate(docs) if all(_matches(d, name, spec) for name, spec in filters.items())]
     for name, order in reversed(sort):  # stable sorts, last key first
-        present = [(k, d) for k, d in hits if d.get(name) is not None]
-        missing = [(k, d) for k, d in hits if d.get(name) is None]
+        # (a document without tags, or with an empty list of tags, has no value)
+        present = [(k, d) for k, d in hits if d.get(name) not in (None, [])]
+        missing = [(k, d) for k, d in hits if d.get(name) in (None, [])]
         # python's sort is stable, also with reverse=True: equal values keep their earlier order
-        present.sort(key=lambda kd: _sort_key(name, kd[1][name]), reverse=(order == "desc"))
+        present.sort(key=lambda kd: _sort_key(name, kd[1][name], order), reverse=(order == "desc"))
         hits = present + missing
     return [d["_id"] for _, d in hits]
 
@@ -158,8 +177,9 @@ def random_filters(rnd: random.Random) -> dict[str, dict]:
 
 
 def random_sort(rnd: random.Random) -> list[tuple[str, str]]:
-    # tags are left out: the order of a tag sort is defined (and tested) with the cutoff sort
-    names = rnd.sample(["kw", "num", "i", "date"], rnd.choice([1, 1, 2]))
+    # date is the first date field, so it is in a sort slot (a Top-K scan); date2 is sorted on its json value.
+    # tags: only compared with the cutoff sort switched on (see the top of this file)
+    names = rnd.sample(["kw", "num", "i", "date", "date2", "tags"], rnd.choice([1, 1, 2, 3]))
     return [(name, rnd.choice(["asc", "desc"])) for name in names]
 
 
@@ -175,23 +195,59 @@ async def _page(filters: dict[str, dict], sort: list[tuple[str, str]], page: int
     )
 
 
-async def test_parity_filters_and_sorts(parity_project):
-    """Random filters, sorts and pages give exactly the documents of the python reference, in the same order"""
+# The limits of the cutoff sort (module constants), as they are and small: with the small ones this test set uses the
+# group for many ties at the cutoff, the second histogram for numbers and the fallback for deep pages
+CUTOFF_LIMITS = {
+    "on": {},
+    "on, small limits": {"SPLIT_ROWS": 4, "ZOOM_ROWS": 4, "HIST_BUCKETS": 6, "MAX_BUCKETS": 400},
+}
+
+
+async def test_parity_filters_and_sorts(parity_project, monkeypatch):
+    """
+    Random filters, sorts and pages give exactly the documents of the python reference, in the same order: with the
+    cutoff sort on (twice: normal and small limits) and off
+    """
     docs = parity_project
     rnd = random.Random(2026)
     mismatches = []
+    late_fetches: dict[str, list[bool]] = {mode: [] for mode in CUTOFF_LIMITS}
+    mode = "on"
+    original = cutoff_sort.page_ids
+
+    async def recording(*args, **kwargs):
+        ids = await original(*args, **kwargs)
+        late_fetches[mode].append(ids is not None)
+        return ids
+
+    monkeypatch.setattr(cutoff_sort, "page_ids", recording)
     for case in range(N_CASES):
         filters, sort = random_filters(rnd), random_sort(rnd)
         per_page = rnd.choice([1, 5, 10, 50])
         expected = reference(docs, filters, sort)
         last_page = max(0, (len(expected) - 1) // per_page)
         page = rnd.choice([0, 0, 1, last_page, rnd.randrange(0, last_page + 1)])
-        result = await _page(filters, sort, page, per_page)
-        got = [d["_id"] for d in result.data]
         want = expected[page * per_page : (page + 1) * per_page]
-        if got != want or result.total_count != len(expected):
-            mismatches.append((case, filters, sort, page, per_page, got[:5], want[:5], result.total_count, len(expected)))
+        modes = [*CUTOFF_LIMITS, "off"]
+        if any(name == "tags" for name, _ in sort):
+            modes.remove("off")  # another order of tags, by design
+        for mode in modes:
+            with monkeypatch.context() as m:
+                m.setattr(get_settings(), "cutoff_sort", mode != "off")
+                for constant, value in CUTOFF_LIMITS.get(mode, {}).items():
+                    m.setattr(cutoff_sort, constant, value)
+                result = await _page(filters, sort, page, per_page)
+            got = [d["_id"] for d in result.data]
+            if got != want or result.total_count != len(expected):
+                mismatches.append(
+                    (case, mode, filters, sort, page, per_page, got[:5], want[:5], result.total_count, len(expected))
+                )
     assert not mismatches, f"{len(mismatches)} of {N_CASES} cases differ, first: {mismatches[0]}"
+    # the cutoff sort really ran: in most sorts on a json field (with the normal limits in nearly all of them)
+    used = {mode: sum(calls) for mode, calls in late_fetches.items()}
+    assert used["on"] >= 0.9 * len(late_fetches["on"]) > 0.3 * N_CASES, (used, N_CASES)
+    assert used["on, small limits"] >= 0.5 * len(late_fetches["on, small limits"]), used
+    print(f"parity: {N_CASES} cases, late fetches { ({m: len(c) for m, c in late_fetches.items()}) }, by cutoff sort {used}")
 
 
 async def _reference_by_score(queries: dict[str, str], filters: dict[str, dict], limit: int) -> list[str]:
