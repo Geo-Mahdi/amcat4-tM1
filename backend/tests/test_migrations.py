@@ -174,3 +174,167 @@ async def test_migration_0002_with_data():
     finally:
         await drop_schema(conn, SCHEMA)
         await conn.close()
+
+
+async def _insert_0003_data(conn) -> tuple[int, int]:
+    """A project with a text field and 300 documents, as the code before migration 0005 stored them"""
+    project = (await _one(conn, "INSERT INTO projects (id, partition_id) VALUES ('p', 1) RETURNING pk"))["pk"]
+    text_pk = (
+        await _one(conn, "INSERT INTO fields (project_pk, name, type) VALUES (%s, 'text', 'text') RETURNING pk", [project])
+    )["pk"]
+    async with conn.cursor() as cur:
+        await cur.executemany(
+            "INSERT INTO documents (partition_id, project_pk, doc_id, text_fields) VALUES (1, %s, %s, %s)",
+            [(project, str(i), Jsonb({f"f{text_pk}": f"word{i % 3} text"})) for i in range(300)],
+        )
+    return project, text_pk
+
+
+async def _check_0005(conn, project: int, text_pk: int, bm25_0003: str) -> str:
+    """The state after migration 0005 on the data of _insert_0003_data. Returns the definition of the search index."""
+    current = 9223372036854775807
+    # no row was rewritten or lost: old rows are "created before any release", current, and have no doc_pk yet
+    row = await _one(
+        conn,
+        """SELECT count(*) AS n, min(created_seq) AS c0, max(created_seq) AS c1, min(retired_seq) AS r0,
+                  count(doc_pk) AS with_pk FROM documents""",
+    )
+    assert row == {"n": 300, "c0": 0, "c1": 0, "r0": current, "with_pk": 0}
+    assert (await _one(conn, "SELECT labels_ready FROM projects WHERE pk = %s", [project]))["labels_ready"] is False
+    default = await _one(
+        conn,
+        """SELECT column_default AS d FROM information_schema.columns
+           WHERE table_schema = %s AND table_name = 'documents' AND column_name = 'created_seq'""",
+        [SCHEMA],
+    )
+    assert default["d"] is None
+    # the search index: the 0002 entries and options, plus the three columns, once per partition
+    bm25 = await _bm25(conn, "documents_p1")
+    for entry in bm25_0003.removeprefix("bm25 (").split(") WITH")[0].split(", "):
+        assert entry in bm25
+    for column in ["doc_pk", "created_seq", "retired_seq"]:
+        assert f" {column}," in bm25
+    assert bm25_0003.split(" WITH ")[1] == bm25.split(" WITH ")[1]
+    assert len(await _indexdefs(conn, indexname="documents_p1_bm25")) == 1
+    assert await _indexdefs(conn, indexname="%bm25_new") == []
+    assert await _search(conn, f"f{text_pk}", "word1") == 100
+    # "current" is found as an INTEGER term, and a release range works
+    for query, n in [
+        ({"term": {"field": "retired_seq", "value": current}}, 300),
+        ({"range": {"field": "created_seq", "lower_bound": None, "upper_bound": {"included": 5}}}, 300),
+        ({"range": {"field": "retired_seq", "lower_bound": {"excluded": 5}, "upper_bound": None}}, 300),
+        ({"range": {"field": "created_seq", "lower_bound": {"excluded": 0}, "upper_bound": None}}, 0),
+    ]:
+        row = await _one(conn, "SELECT count(*) AS n FROM documents_p1 WHERE id @@@ %s::jsonb", [Jsonb(query)])
+        assert row["n"] == n, query
+    # the unique constraint on doc_id is now a unique index over current rows
+    assert await _one(conn, "SELECT 1 FROM pg_constraint WHERE conrelid = 'documents'::regclass AND contype = 'u'") is None
+    [live] = await _indexdefs(conn, indexname="documents_p1_doc_id_live")
+    assert "UNIQUE" in live and "retired_seq = " in live
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        await conn.execute(
+            "INSERT INTO documents (partition_id, project_pk, doc_id, created_seq) VALUES (1, %s, '7', 1)", [project]
+        )
+    # created_seq has no default any more; a new row gets doc_pk = id, a new version keeps the doc_pk it is given
+    with pytest.raises(psycopg.errors.NotNullViolation):
+        await conn.execute("INSERT INTO documents (partition_id, project_pk, doc_id) VALUES (1, %s, 'new')", [project])
+    async with conn.transaction(force_rollback=True):
+        new = await _one(
+            conn,
+            """INSERT INTO documents (partition_id, project_pk, doc_id, created_seq) VALUES (1, %s, 'new', 1)
+               RETURNING id, doc_pk""",
+            [project],
+        )
+        assert new["doc_pk"] == new["id"]
+        old = await _one(
+            conn,
+            """INSERT INTO documents (partition_id, project_pk, doc_id, created_seq, retired_seq, doc_pk)
+               VALUES (1, %s, 'new', 0, 1, %s) RETURNING id, doc_pk""",
+            [project, new["id"]],
+        )
+        assert old["doc_pk"] == new["id"] != old["id"]
+    # the new tables, the label index and the sequence
+    assert {"number", "seq", "doi", "manifest", "created_by"} <= await _columns(conn, "releases")
+    assert {"doc_pk", "field_pk", "value", "created_seq", "retired_seq", "created_by"} <= await _columns(conn, "doc_labels")
+    [labels] = await _indexdefs(conn, indexname="doc_labels_bm25")
+    assert "bm25" in labels and "retired_seq" in labels and "mutable_segment_rows" in labels
+    assert "label_table" in await _columns(conn, "fields")
+    assert (await _one(conn, "SELECT last_value FROM change_seq"))["last_value"] == 1
+    return bm25
+
+
+@pytest.mark.anyio
+async def test_migration_0005_with_data():
+    """
+    Migration 0005 on a database with documents: no row is rewritten or lost, the search index is rebuilt once with the
+    version columns, the new tables exist. Running it again (as after an interruption) changes nothing, also from a
+    half-done state. The downgrade gives back the 0003 schema.
+    """
+    conn = await _connect()
+    try:
+        await drop_schema(conn, SCHEMA)
+        await asyncio.to_thread(_migrate, "upgrade", "0003")
+        bm25_0003 = await _bm25(conn, "documents_p1")
+        project, text_pk = await _insert_0003_data(conn)
+        xmin = (await _one(conn, "SELECT max(xmin::text::bigint) AS x FROM documents"))["x"]
+
+        await asyncio.to_thread(_migrate, "upgrade", "0005")
+        bm25 = await _check_0005(conn, project, text_pk, bm25_0003)
+        # no document row was written by the migration
+        assert (await _one(conn, "SELECT max(xmin::text::bigint) AS x FROM documents"))["x"] == xmin
+        index_oid = (await _one(conn, "SELECT 'documents_p1_bm25'::regclass::oid AS oid"))["oid"]
+
+        # Run again, as after an interruption at the very end: nothing changes, and the search index is not rebuilt
+        await asyncio.to_thread(_migrate, "stamp", "0003")
+        await asyncio.to_thread(_migrate, "upgrade", "0005")
+        assert await _check_0005(conn, project, text_pk, bm25_0003) == bm25
+        assert (await _one(conn, "SELECT 'documents_p1_bm25'::regclass::oid AS oid"))["oid"] == index_oid
+
+        # Run again from a half-done state: the new search index was being built (a leftover parent without the
+        # partition's index), the unique index over current rows is missing, the default is back
+        await asyncio.to_thread(_migrate, "stamp", "0003")
+        await conn.execute("DROP INDEX documents_bm25")
+        await conn.execute(f"CREATE INDEX documents_bm25 ON documents USING {bm25_0003}")
+        await conn.execute(f"CREATE INDEX documents_bm25_new ON ONLY documents USING {bm25}")
+        await conn.execute("DROP INDEX documents_doc_id_live")
+        await conn.execute("ALTER TABLE documents ALTER COLUMN created_seq SET DEFAULT 0")
+        await conn.execute("DROP TABLE doc_labels")
+        await asyncio.to_thread(_migrate, "upgrade", "0005")
+        assert await _check_0005(conn, project, text_pk, bm25_0003) == bm25
+
+        # a new partition gets the same indexes and the doc_pk trigger
+        await create_partition(conn, 2)
+        assert await _bm25(conn, "documents_p2") == bm25
+        assert any("retired_seq = " in d and "UNIQUE" in d for d in await _indexdefs(conn, tablename="documents_p2"))
+        await conn.execute("INSERT INTO projects (id, partition_id) VALUES ('q', 2)")
+        row = await _one(
+            conn,
+            """INSERT INTO documents (partition_id, project_pk, doc_id, created_seq)
+               VALUES (2, (SELECT pk FROM projects WHERE id = 'q'), 'x', 1) RETURNING id, doc_pk""",
+        )
+        assert row["doc_pk"] == row["id"]
+
+        # The downgrade is refused while a release exists; without, it gives back the 0003 schema and keeps the documents
+        await conn.execute("INSERT INTO releases (project_pk, number, seq) VALUES (%s, 1, 5)", [project])
+        with pytest.raises(RuntimeError, match="releases"):
+            await asyncio.to_thread(_migrate, "downgrade", "0003")
+        await conn.execute("DELETE FROM releases")
+        # an old row version that no release needs any more is removed by the downgrade
+        await conn.execute(
+            """INSERT INTO documents (partition_id, project_pk, doc_id, created_seq, retired_seq, doc_pk)
+               VALUES (1, %s, '7', 0, 3, 1)""",
+            [project],
+        )
+        await asyncio.to_thread(_migrate, "downgrade", "0003")
+        assert (await _one(conn, "SELECT count(*) AS n FROM documents WHERE project_pk = %s", [project]))["n"] == 300
+        assert not {"created_seq", "retired_seq", "doc_pk"} & await _columns(conn, "documents")
+        assert await _columns(conn, "releases") == set() and await _columns(conn, "doc_labels") == set()
+        assert await _bm25(conn, "documents_p1") == bm25_0003
+        assert await _one(conn, "SELECT 1 FROM pg_constraint WHERE conrelid = 'documents'::regclass AND contype = 'u'")
+        assert await _indexdefs(conn, indexname="%doc_id_live") == []
+        assert await _search(conn, f"f{text_pk}", "word1") == 100
+        await asyncio.to_thread(_migrate, "upgrade", "head")
+        assert await _bm25(conn, "documents_p1") == bm25
+    finally:
+        await drop_schema(conn, SCHEMA)
+        await conn.close()

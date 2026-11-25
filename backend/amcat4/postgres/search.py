@@ -28,6 +28,7 @@ from amcat4.postgres.layout import partition_table
 from amcat4.postgres.querystring import highlight_patterns, match_positions, parse_query, query_string_to_json
 from amcat4.postgres.snippets import byte_to_char_positions, make_snippet
 from amcat4.postgres.snippets import highlight as highlight_text
+from amcat4.postgres.versions import visible, visible_clauses
 
 
 @dataclass
@@ -60,6 +61,15 @@ class CompiledSearch:
 def project_clause(project_pks: list[int]) -> dict:
     terms = [{"term": {"field": "project_pk", "value": pk}} for pk in project_pks]
     return terms[0] if len(terms) == 1 else {"boolean": {"should": terms}}
+
+
+def scope_clauses(fieldset: FieldSet) -> list[dict]:
+    """
+    The rows a search may see at all: the projects, and of these only the current rows (retired_seq = "current"), or,
+    for a query on a release (fieldset.release = R), the rows with created_seq <= R and retired_seq > R. Both are real
+    columns of the BM25 index (migration 0005), so this is decided inside the index, in the unscored block.
+    """
+    return [project_clause(fieldset.project_pks), *visible_clauses(fieldset.release)]
 
 
 def unscored(clauses: list[dict]) -> dict:
@@ -124,7 +134,9 @@ def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False, b
     partitions). AMCAT4_FAST_PATH=false always uses the parent table with both SQL conditions, as in the original.
     """
     # selection: the project clause first (built here, never from user input), then the user's filters
-    selection: list[dict] = [project_clause(fieldset.project_pks)]
+    # ... and "current rows only", or the rows of a release (real columns of the index, migration 0005)
+    selection: list[dict] = scope_clauses(fieldset)
+    n_scope = len(selection)
     scored: list[dict] = []
     if query.queries:
         qs = [_compile_query_string(label, q, fieldset) for label, q in query.queries.items()]
@@ -176,10 +188,11 @@ def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False, b
     json_query = must[0] if len(must) == 1 else {"boolean": {"must": must}}
     where = sql.SQL(" AND ").join([sql.SQL("documents.id @@@ %s::jsonb"), *sql_clauses])
     plain_where, plain_params = None, []
-    if not scored and len(selection) == 1:
-        # only the project clause is in the json query. The partition condition is also needed on a partition table:
+    if not scored and len(selection) == n_scope:
+        # only the project clause (and the row versions) are in the json query. The partition condition is also needed on a partition table:
         # it is the first column of the B-tree index
-        plain_where = sql.SQL(" AND ").join([partition_cond, project_cond, *extra_clauses])
+        versions = visible(fieldset.release)
+        plain_where = sql.SQL(" AND ").join([partition_cond, project_cond, versions, *extra_clauses])
         plain_params = [partition_param, project_param, *extra_params]
     return CompiledSearch(
         json_query,

@@ -314,11 +314,14 @@ class FieldSet:
         queryable: set[str] | None = None,
         partitions: dict[int, int] | None = None,
         moving: dict[int, int] | None = None,
+        release: int | None = None,
     ):
         self.project_fields = project_fields
         self.queryable = queryable
         self.partitions = partitions or {}
         self.moving = moving or {}
+        # None: the current documents. A number R: the release with this sequence number (see amcat4.postgres.versions)
+        self.release = release
         self.by_name: dict[str, list[FieldInfo]] = {}
         for fields in project_fields.values():
             for name, f in fields.items():

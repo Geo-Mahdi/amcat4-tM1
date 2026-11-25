@@ -14,6 +14,7 @@ from psycopg import AsyncConnection, sql
 from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
+from amcat4.errors import ConflictError
 from amcat4.postgres.fields import (
     DATE_DERIVED,
     SLOT_TYPES,
@@ -24,6 +25,14 @@ from amcat4.postgres.fields import (
     normalize_value,
 )
 from amcat4.postgres.layout import guard_writes, partition_of, project_filter
+from amcat4.postgres.versions import (
+    has_releases,
+    live,
+    retire_or_delete,
+    version_assignments,
+    versioned_update,
+    write_seq,
+)
 
 if TYPE_CHECKING:
     from amcat4.postgres.search import SearchQuery
@@ -114,7 +123,9 @@ async def update_dedup_hashes(
     """
     unique = [f for f in fields.values() if f.unique]
     expr = dedup_expression(unique) if unique else sql.SQL("NULL")
-    where = await project_filter(conn, project_pk)
+    # only current rows: an old row version (kept for a release) has no hash, so it cannot block a new document.
+    # (Not versioned: the hash is derived from the content)
+    where = await project_filter(conn, project_pk, live=True)
     params: list[Any] = []
     if ids is not None:
         where = sql.SQL("{} AND documents.id = ANY(%s)").format(where)
@@ -153,8 +164,10 @@ CREATE TEMP TABLE IF NOT EXISTS staging_documents (
 ) ON COMMIT DELETE ROWS
 """.format(slots=", ".join(f"{c} {SLOT_TYPES[c]}" for c in SORT_SLOTS))  # type: ignore[index]
 
+# created_seq: the number of the write (amcat4.postgres.versions); it has no default, so every INSERT must give it
 _INSERT_COLUMNS = (
-    f"partition_id, project_pk, doc_id, text_fields, exact_fields, stored_fields, copied_from, {', '.join(STANDARD_COLUMNS)}"
+    "partition_id, project_pk, created_seq, doc_id, text_fields, exact_fields, stored_fields, copied_from, "
+    f"{', '.join(STANDARD_COLUMNS)}"
 )
 
 _MERGE = (
@@ -174,6 +187,10 @@ _REPLACE = (
     + """,
               updated_at = now()"""
 )
+
+
+# Current rows of the table alias d (the literal, so postgres uses the unique index over current rows)
+_LIVE = "d.retired_seq = 9223372036854775807"
 
 
 def _examples(rows: Sequence[Any], key: str = "doc_id") -> str:
@@ -203,6 +220,7 @@ async def upload_documents(
 
     async with conn.transaction():
         project = [await partition_of(conn, project_pk), project_pk]
+        w = await write_seq(conn, project_pk)
         await conn.execute(_STAGING)  # type: ignore[arg-type]
         async with conn.cursor().copy(
             "COPY staging_documents (rn, doc_id, new_doc_id, text_fields, exact_fields, stored_fields, copied_from, "
@@ -240,18 +258,19 @@ async def upload_documents(
                 what = "_id" if key == "doc_id" else "values for the unique fields"
                 raise UploadError(f"The upload contains multiple documents with the same {what}")
 
-        # Find existing documents, by id or by the values of the unique fields
+        # Find existing documents, by id or by the values of the unique fields. Only current rows (_LIVE): an old
+        # version or a deleted document that a release keeps is not "existing"
         await conn.execute(
-            """UPDATE staging_documents s SET target_id = d.id, target_doc_id = d.doc_id FROM documents d
-               WHERE d.partition_id = %s AND d.project_pk = %s AND d.doc_id = s.doc_id""",
+            f"""UPDATE staging_documents s SET target_id = d.id, target_doc_id = d.doc_id FROM documents d
+               WHERE d.partition_id = %s AND d.project_pk = %s AND d.doc_id = s.doc_id AND {_LIVE}""",  # type: ignore[arg-type]
             project,
         )
         if unique:
             cur = await conn.execute(
-                """SELECT s.doc_id FROM staging_documents s JOIN documents d
+                f"""SELECT s.doc_id FROM staging_documents s JOIN documents d
                    ON d.partition_id = %s AND d.project_pk = %s AND d.dedup_hash = s.dedup_hash
-                      AND d.id <> coalesce(s.target_id, -1)
-                   WHERE s.doc_id IS NOT NULL""",
+                      AND d.id <> coalesce(s.target_id, -1) AND {_LIVE}
+                   WHERE s.doc_id IS NOT NULL""",  # type: ignore[arg-type]
                 project,
             )
             if conflicts := await cur.fetchall():
@@ -259,9 +278,9 @@ async def upload_documents(
                     f"Documents {_examples(conflicts)} have the same unique field values as other existing documents"
                 )
             await conn.execute(
-                """UPDATE staging_documents s SET target_id = d.id, target_doc_id = d.doc_id FROM documents d
+                f"""UPDATE staging_documents s SET target_id = d.id, target_doc_id = d.doc_id FROM documents d
                    WHERE d.partition_id = %s AND d.project_pk = %s AND d.dedup_hash = s.dedup_hash
-                     AND s.target_id IS NULL""",
+                     AND s.target_id IS NULL AND {_LIVE}""",  # type: ignore[arg-type]
                 project,
             )
 
@@ -277,19 +296,20 @@ async def upload_documents(
         columns = f"text_fields, exact_fields, stored_fields, copied_from, {', '.join(STANDARD_COLUMNS)}"
         cur = await conn.execute(
             f"""INSERT INTO documents ({_INSERT_COLUMNS}, dedup_hash)
-                SELECT %s, %s, coalesce(doc_id, new_doc_id), {columns}, dedup_hash
+                SELECT %s, %s, %s, coalesce(doc_id, new_doc_id), {columns}, dedup_hash
                 FROM staging_documents WHERE target_id IS NULL ORDER BY rn
                 RETURNING id, doc_id""",  # type: ignore[arg-type]
-            project,
+            [*project, w.seq],
         )
         created = await cur.fetchall()
         assignments = _MERGE if op_type in ("update", "upsert") else _REPLACE
-        cur = await conn.execute(
-            f"""UPDATE documents SET {assignments} FROM staging_documents s
-                WHERE documents.partition_id = %s AND documents.project_pk = %s AND documents.id = s.target_id
-                RETURNING documents.id""",  # type: ignore[arg-type]
-            project,
-        )
+        # (through versioned_update: the old content of a document that is in a release is kept as an extra row)
+        update = sql.SQL(
+            """UPDATE documents SET {assignments}{version} FROM staging_documents s
+               WHERE documents.partition_id = %s AND documents.project_pk = %s AND documents.id = s.target_id
+                 AND {live}"""
+        ).format(assignments=sql.SQL(assignments), version=version_assignments(w), live=live())  # type: ignore[arg-type]
+        cur = await conn.execute(versioned_update(update, w), project)
         updated = [row["id"] for row in await cur.fetchall()]  # type: ignore[index, call-overload]
         if unique and updated and op_type in ("update", "upsert"):
             # merging can change the values of unique fields
@@ -298,9 +318,9 @@ async def upload_documents(
         # Vectors
         if any(f.column == "vector" for f in fields.values()):
             cur = await conn.execute(
-                """SELECT s.rn, d.id FROM staging_documents s JOIN documents d
-                   ON d.partition_id = %s AND d.project_pk = %s
-                      AND d.doc_id = coalesce(s.target_doc_id, s.doc_id, s.new_doc_id)""",
+                f"""SELECT s.rn, d.id FROM staging_documents s JOIN documents d
+                   ON d.partition_id = %s AND d.project_pk = %s AND {_LIVE}
+                      AND d.doc_id = coalesce(s.target_doc_id, s.doc_id, s.new_doc_id)""",  # type: ignore[arg-type]
                 project,
             )
             internal = {row["rn"]: row["id"] for row in await cur.fetchall()}  # type: ignore[index, call-overload]
@@ -348,6 +368,7 @@ async def ensure_vector_index(conn: AsyncConnection, field_pk: int, dims: int) -
 @guard_writes(lambda conn, project_pk, *a, **k: project_pk)
 async def delete_field_values(conn: AsyncConnection, project_pk: int, f: FieldInfo) -> None:
     """Remove the values of a field from all documents of the project"""
+    await _refuse_with_releases(conn, project_pk, "delete a field")
     if f.column == "vector":
         await conn.execute("DELETE FROM document_vectors WHERE field_pk = %s", [f.pk])
         await conn.execute(sql.SQL("DROP INDEX IF EXISTS {}").format(sql.Identifier(f"document_vectors_f{f.pk}")))
@@ -369,11 +390,20 @@ async def project_size_at_most(conn: AsyncConnection, project_pk: int, n: int) -
     """
     cur = await conn.execute(
         sql.SQL("SELECT count(*) AS n FROM (SELECT 1 FROM documents WHERE {} LIMIT %s) x").format(
-            await project_filter(conn, project_pk)
+            await project_filter(conn, project_pk, live=True)
         ),
         [n + 1],
     )
     return (await cur.fetchone())["n"] <= n  # type: ignore[index]
+
+
+async def _refuse_with_releases(conn: AsyncConnection, project_pk: int, what: str) -> None:
+    """
+    Deleting a field or changing its type rewrites its values in every document, and the field definitions are not
+    versioned: a release could no longer show the field as it was. So these are refused for a project with releases.
+    """
+    if await has_releases(conn, project_pk):
+        raise ConflictError(f"Cannot {what}: this project has releases, which must stay as they are")
 
 
 def _sort_slot_lock(project_pk: int, slot: str) -> list[int]:
@@ -485,7 +515,7 @@ async def get_document(
     ]
     cur = await conn.execute(
         sql.SQL("SELECT {} FROM documents WHERE {} AND doc_id = %s").format(
-            sql.SQL(", ").join(columns), await project_filter(conn, project_pk)
+            sql.SQL(", ").join(columns), await project_filter(conn, project_pk, live=True)
         ),
         [doc_id],
     )
@@ -502,10 +532,9 @@ async def get_document(
 
 @guard_writes(lambda conn, project_pk, *a, **k: project_pk)
 async def delete_document(conn: AsyncConnection, project_pk: int, doc_id: str) -> bool:
-    cur = await conn.execute(
-        sql.SQL("DELETE FROM documents WHERE {} AND doc_id = %s").format(await project_filter(conn, project_pk)), [doc_id]
-    )
-    return cur.rowcount > 0
+    w = await write_seq(conn, project_pk)
+    where = sql.SQL("{} AND documents.doc_id = %s").format(await project_filter(conn, project_pk))
+    return bool(await retire_or_delete(conn, where, [doc_id], w))
 
 
 @guard_writes(lambda conn, from_project_pk, to_project_pk, *a, **k: to_project_pk)
@@ -552,17 +581,22 @@ async def copy_batch(
         return f"({s.column}->>'{s.key}')::{cast}"
 
     merge = re.sub(r"\bs\.", "EXCLUDED.", _MERGE)
-    stmt = f"""INSERT INTO documents ({_INSERT_COLUMNS})
-               SELECT %s, %s, doc_id, {remap("text_fields")}, {remap("exact_fields")}, {remap("stored_fields")},
-                      jsonb_build_object('project_pk', project_pk, 'doc_id', doc_id),
-                      {", ".join(sort_value(c) for c in STANDARD_COLUMNS)}
-               FROM documents WHERE partition_id = %s AND project_pk = %s AND id = ANY(%s)
-               ON CONFLICT (partition_id, project_pk, doc_id) DO UPDATE SET {merge}
-               RETURNING id"""
     from_project = [await partition_of(conn, from_project_pk), from_project_pk]
     to_project = [await partition_of(conn, to_project_pk), to_project_pk]
     async with conn.transaction():
-        cur = await conn.execute(stmt, [*to_project, *from_project, ids])  # type: ignore[arg-type]
+        w = await write_seq(conn, to_project_pk)
+        # ON CONFLICT names the unique index over current rows (documents_doc_id_live). A document of the destination
+        # that is in a release keeps its old content as an extra row (versioned_update)
+        stmt = sql.SQL(
+            f"""INSERT INTO documents ({_INSERT_COLUMNS})
+               SELECT %s, %s, %s, doc_id, {remap("text_fields")}, {remap("exact_fields")}, {remap("stored_fields")},
+                      jsonb_build_object('project_pk', project_pk, 'doc_id', doc_id),
+                      {", ".join(sort_value(c) for c in STANDARD_COLUMNS)}
+               FROM documents WHERE partition_id = %s AND project_pk = %s AND id = ANY(%s)
+               ON CONFLICT (partition_id, project_pk, doc_id) WHERE retired_seq = 9223372036854775807
+               DO UPDATE SET {merge}{version_assignments(w).as_string(conn)}"""  # type: ignore[arg-type]
+        )
+        cur = await conn.execute(versioned_update(stmt, w), [*to_project, w.seq, *from_project, ids])
         copied = [row["id"] for row in await cur.fetchall()]  # type: ignore[index, call-overload]
         if any(f.unique for f in dest_fields.values()):
             await update_dedup_hashes(conn, to_project_pk, dest_fields, copied)
@@ -622,19 +656,21 @@ async def update_tag_by_query(
         if action == "add":
             stmt = sql.SQL(
                 """UPDATE documents SET exact_fields = jsonb_set(exact_fields, ARRAY[{key}], {current} || to_jsonb(%s::text)),
-                   updated_at = now()
+                   updated_at = now(){version}
                    WHERE {where} AND {project} AND NOT ({current} ? %s)"""
             )
             params = [tag, *c.params, tag]
         else:
             stmt = sql.SQL(
                 """UPDATE documents SET exact_fields = CASE WHEN {current} - %s = '[]'::jsonb THEN exact_fields - {key}
-                   ELSE jsonb_set(exact_fields, ARRAY[{key}], {current} - %s) END, updated_at = now()
+                   ELSE jsonb_set(exact_fields, ARRAY[{key}], {current} - %s) END, updated_at = now(){version}
                    WHERE {where} AND {project} AND {current} ? %s"""
             )
             params = [tag, tag, *c.params, tag]
         project = _project_condition(fieldset, f)
-        cur = await conn.execute(stmt.format(key=key, current=current, where=c.where, project=project), params)
+        w = await write_seq(conn, _project_of_field(fieldset, f))
+        update = stmt.format(key=key, current=current, where=c.where, project=project, version=version_assignments(w))
+        cur = await conn.execute(versioned_update(update, w), params)
         updated += cur.rowcount
     return updated
 
@@ -654,28 +690,28 @@ async def update_by_query(conn: AsyncConnection, fieldset: FieldSet, query: "Sea
         project = _project_condition(fieldset, f)
         if value is None:
             stmt = sql.SQL(
-                "UPDATE documents SET {col} = {col} - %s::text[]{sort}, updated_at = now() WHERE {where} AND {project}"
+                "UPDATE documents SET {col} = {col} - %s::text[]{sort}, updated_at = now(){version} "
+                "WHERE {where} AND {project}"
             )
             params: list[Any] = [stored_keys(f)]
             if f.sort_column:
                 params.append(None)
         else:
             stmt = sql.SQL(
-                "UPDATE documents SET {col} = coalesce({col}, '{{}}') || %s{sort}, updated_at = now() "
+                "UPDATE documents SET {col} = coalesce({col}, '{{}}') || %s{sort}, updated_at = now(){version} "
                 "WHERE {where} AND {project}"
             )
             values = stored_values(f, value)
             params = [Jsonb(values)]
             if f.sort_column:
                 params.append(values[f.key])
-        update = stmt.format(col=column, sort=sort, where=c.where, project=project)
-        if f.unique:
-            update = sql.SQL("{} RETURNING documents.id").format(update)
+        pk = _project_of_field(fieldset, f)
         async with conn.transaction():
-            cur = await conn.execute(update, [*params, *c.params])
+            w = await write_seq(conn, pk)
+            update = stmt.format(col=column, sort=sort, where=c.where, project=project, version=version_assignments(w))
+            cur = await conn.execute(versioned_update(update, w), [*params, *c.params])
             updated += cur.rowcount
             if f.unique:
-                pk = _project_of_field(fieldset, f)
                 ids = [row["id"] for row in await cur.fetchall()]  # type: ignore[index, call-overload]
                 await update_dedup_hashes(conn, pk, fieldset.project_fields[pk], ids)
     return updated
@@ -686,8 +722,13 @@ async def delete_by_query(conn: AsyncConnection, fieldset: FieldSet, query: "Sea
     from amcat4.postgres.search import compile_search
 
     c = compile_search(fieldset, query)
-    cur = await conn.execute(sql.SQL("DELETE FROM documents WHERE {}").format(c.where), c.params)
-    return cur.rowcount
+    deleted = 0
+    for pk in fieldset.project_pks:
+        # per project: each has its own releases (and so its own rule for what is kept)
+        w = await write_seq(conn, pk)
+        where = sql.SQL("{} AND documents.project_pk = {}").format(c.where, sql.Literal(pk))
+        deleted += len(await retire_or_delete(conn, where, c.params, w))
+    return deleted
 
 
 def convert_value(value: Any, old_type: str, new_type: str) -> Any:
@@ -711,6 +752,7 @@ async def convert_field(conn: AsyncConnection, project_pk: int, old: FieldInfo, 
     This moves values between storage columns if needed. Raises ValueError (and changes nothing, if called within a
     transaction) if a value cannot be converted.
     """
+    await _refuse_with_releases(conn, project_pk, "change the type of a field")
     project = await project_filter(conn, project_pk)
     if (old.column == "vector") != (new.column == "vector"):
         cur = await conn.execute(

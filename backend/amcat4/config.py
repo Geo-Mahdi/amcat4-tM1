@@ -201,6 +201,44 @@ class Settings(BaseSettings):
         ),
     ] = True
 
+    versioned_writes: Annotated[
+        bool,
+        Field(
+            description=(
+                "Keep the old version of a document (or tag) when it is updated or deleted, if it belongs to a "
+                "release of its project (migration 0005). "
+                "Why: a frozen release must return the same documents, values and counts for ever. "
+                "It only acts on projects that have at least one release, and there only on rows that are in a "
+                "release: all other updates and deletes are done in place, as before, so projects without releases "
+                "pay nothing and the table does not grow. "
+                "false = always update and delete in place, as in the original. Releases can then not be created, "
+                "and EXISTING RELEASES ARE NO LONGER PROTECTED: a later update or delete changes them "
+                "(AMCAT4_VERSIONED_WRITES=false)"
+            ),
+        ),
+    ] = True
+
+    label_tables: Annotated[
+        bool,
+        Field(
+            description=(
+                "Store the values of tag fields in a separate table (doc_labels, with its own search index) instead "
+                "of inside the document. "
+                "Why: adding or removing a tag then writes one small row and does not rewrite and re-index the "
+                "whole document (measured in the research: 9 ms against 145 ms per 1,000 documents), and a release "
+                "keeps old tags without keeping a copy of the document. The price: a filter or count on tags "
+                "together with a text search is a join of two indexes, 3 to 8 times slower than a tag inside the "
+                "document (7-36 ms against 2-13 ms at 600,000 documents; not measured at 10 million). "
+                "With true, new tag fields of projects made after migration 0005 use the table at once; for older "
+                "projects a background job moves the existing tags first (projects.labels_ready), and until it is "
+                "done they work as before. A field that uses the table keeps using it when the switch is turned "
+                "off again. "
+                "Default false (off): tags stay inside the document, exactly as in the original "
+                "(AMCAT4_LABEL_TABLES=true)"
+            ),
+        ),
+    ] = False
+
     sort_slot_job_rows: Annotated[
         int,
         Field(

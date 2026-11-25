@@ -106,10 +106,11 @@ async def field_infos(index: str) -> dict[str, FieldInfo]:
     return {row["name"]: field_info_from_row(row) for row in await _field_rows(index)}
 
 
-async def get_fieldset(indices: str | list[str], queryable: set[str] | None = None) -> FieldSet:
+async def get_fieldset(indices: str | list[str], queryable: set[str] | None = None, release: int | None = None) -> FieldSet:
     """
     Get the fields of one or more indices, for searching. queryable restricts which fields can be used in queries
-    and filters (None = all fields).
+    and filters (None = all fields). release: the sequence number of a release (of the one index): searches with this
+    fieldset see the documents of that release instead of the current ones (amcat4.projects.releases).
     """
     indices = [indices] if isinstance(indices, str) else indices
     pks = await project_pks(indices)
@@ -123,7 +124,7 @@ async def get_fieldset(indices: str | list[str], queryable: set[str] | None = No
     # partition and move target in one statement (one snapshot): read separately, a move that finished in between
     # made the request search only the old, by then empty, partition
     partitions, moving = await project_layout(list(pks.values()))
-    return FieldSet(project_fields, queryable=queryable, partitions=partitions, moving=moving)
+    return FieldSet(project_fields, queryable=queryable, partitions=partitions, moving=moving, release=release)
 
 
 def _standardize_createfields(fields: Mapping[str, FieldType | CreateDocumentField]) -> dict[str, CreateDocumentField]:
@@ -525,7 +526,7 @@ async def field_values(index: str, field: str, size: int) -> list[str]:
             sql.SQL(
                 """SELECT value, count(*) AS n FROM documents, jsonb_array_elements_text({}) AS value
                    WHERE {} AND documents.exact_fields ? {} GROUP BY value ORDER BY n DESC, value LIMIT %s"""
-            ).format(elements, await project_filter(conn, pk), sql.Literal(f.key)),
+            ).format(elements, await project_filter(conn, pk, live=True), sql.Literal(f.key)),
             [size],
         )
         rows: list[dict] = await cur.fetchall()  # type: ignore[assignment]
@@ -549,7 +550,7 @@ async def field_stats(index: str, field: str) -> dict[str, Any]:
         cur = await conn.execute(
             sql.SQL(
                 "SELECT count({x}) AS count, min({x}) AS min, max({x}) AS max, avg({x}) AS avg FROM documents WHERE {project}"
-            ).format(x=x, project=await project_filter(conn, pk))
+            ).format(x=x, project=await project_filter(conn, pk, live=True))
         )
         row: dict | None = await cur.fetchone()  # type: ignore[assignment]
     assert row is not None
