@@ -14,6 +14,7 @@ from psycopg import AsyncConnection, sql
 from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
+from amcat4.config import get_settings
 from amcat4.postgres.fields import (
     DATE_DERIVED,
     SLOT_TYPES,
@@ -153,6 +154,31 @@ CREATE TEMP TABLE IF NOT EXISTS staging_documents (
 ) ON COMMIT DELETE ROWS
 """.format(slots=", ".join(f"{c} {SLOT_TYPES[c]}" for c in SORT_SLOTS))  # type: ignore[index]
 
+# Give the json columns of the staging table the compression setting of the same columns of documents (when it
+# differs: once per connection). Postgres compresses a large value when it is written to the staging table, and
+# INSERT ... SELECT copies the compressed value as it is, so without this an uploaded value keeps the default
+# compression (pglz) of the temporary table, whatever is set on documents: the lz4 setting of text_fields (migration
+# 0002) had no effect on uploads (checked on the phase 1 code, 25 Nov 2026: pg_column_compression = pglz).
+# Only with AMCAT4_LZ4_JSON_COLUMNS, which sets lz4 on exact_fields and stored_fields too.
+_STAGING_COMPRESSION = """
+DO $$
+DECLARE c record;
+BEGIN
+    FOR c IN SELECT d.attname, {wanted} AS wanted FROM pg_attribute d
+             JOIN pg_attribute s ON s.attname = d.attname AND s.attrelid = 'pg_temp.staging_documents'::regclass
+             WHERE d.attrelid = 'documents'::regclass AND d.attname IN ('text_fields', 'exact_fields', 'stored_fields')
+               AND s.attcompression <> {wanted}
+    LOOP
+        EXECUTE format('ALTER TABLE pg_temp.staging_documents ALTER COLUMN %I SET COMPRESSION %s', c.attname,
+                       CASE c.wanted WHEN 'l' THEN 'lz4' WHEN 'p' THEN 'pglz' ELSE 'default' END);
+    END LOOP;
+END $$
+"""
+# (the switch off: the default compression for the staging table, as before. Only different from doing nothing on a
+# connection that uploaded with the switch on before, i.e. in tests)
+_STAGING_COMPRESSION_ON = _STAGING_COMPRESSION.format(wanted="d.attcompression")
+_STAGING_COMPRESSION_OFF = _STAGING_COMPRESSION.format(wanted="''::\"char\"")
+
 _INSERT_COLUMNS = (
     f"partition_id, project_pk, doc_id, text_fields, exact_fields, stored_fields, copied_from, {', '.join(STANDARD_COLUMNS)}"
 )
@@ -204,6 +230,7 @@ async def upload_documents(
     async with conn.transaction():
         project = [await partition_of(conn, project_pk), project_pk]
         await conn.execute(_STAGING)  # type: ignore[arg-type]
+        await conn.execute(_STAGING_COMPRESSION_ON if get_settings().lz4_json_columns else _STAGING_COMPRESSION_OFF)  # type: ignore[arg-type]
         async with conn.cursor().copy(
             "COPY staging_documents (rn, doc_id, new_doc_id, text_fields, exact_fields, stored_fields, copied_from, "
             f"{', '.join(STANDARD_COLUMNS)}) FROM STDIN"  # type: ignore[arg-type]

@@ -36,7 +36,7 @@ from amcat4.errors import ConflictError, NotFoundError
 from amcat4.models import CreateDocumentField, FieldType, FilterSpec
 from amcat4.postgres import documents as storage
 from amcat4.postgres.connection import connection, execute, fetch_all, fetch_one
-from amcat4.postgres.fields import FIELD_COLUMNS, FieldInfo, FieldSet, quarter_sql
+from amcat4.postgres.fields import FIELD_COLUMNS, FieldInfo, FieldSet, quarter_sql, with_text_keys_sql
 from amcat4.postgres.layout import project_filter, writing
 from amcat4.postgres.projects import project_partitions, project_pk
 from amcat4.postgres.search import SearchQuery, compile_search
@@ -540,26 +540,91 @@ async def _backfill_quarter_batch(conn: AsyncConnection, project: int, f: FieldI
     return last
 
 
-async def schedule_quarter_backfill(state: dict) -> dict:
+async def _backfill_text_keys_job(job: Job) -> dict[str, Any]:
     """
-    Periodic task: a backfill_quarter job for every project with date fields that do not have their quarter keys
-    (after migration 0002, or a copy from such a project). Not for a project that is being moved (or has a move job
-    waiting): the job would only be postponed. A failed job is tried again after RETRY_AFTER, at most
-    MAX_BACKFILL_ATTEMPTS times in all (then it needs a look; delete the failed jobs to try again).
+    Give the documents of a project that were stored before migration 0004 the list of their text keys
+    (exact_fields._text, see amcat4.postgres.fields.TEXT_KEYS), in batches (resumable), then mark the text fields of
+    the project as ready ('exists' filters on them then run inside the search index). params: project_pk.
+    Only writes documents whose list is missing or differs from their text fields. New and changed documents get the
+    list from the trigger of 0004, so every text field of the project is ready when the job is done.
+    Postponed while the project is being moved, like backfill_quarter.
+    """
+    project = job.params["project_pk"]
+    await postpone_if_moving(project)
+    after = job.progress.get("after", 0)
+    while after is not None:
+        await postpone_if_moving(project)
+        async with connection() as conn:
+            try:
+                async with writing(conn, project):
+                    after = await _backfill_text_keys_batch(conn, project, after)
+            except ConflictError as e:  # a move started (writes to the project are refused until it is done)
+                raise JobPostponed(str(e)) from e
+        await job.save_progress(after=after)
+    await execute("UPDATE fields SET text_exists_ready = true WHERE project_pk = %s AND type = 'text'", [project])
+    await maintenance.vacuum_soon((await project_partitions([project])).values())  # (a mass update, see above)
+    return {"project_pk": project}
+
+
+async def _backfill_text_keys_batch(conn: AsyncConnection, project: int, after: int) -> int | None:
+    """Give the next FILL_BATCH_SIZE documents after id `after` their list of text keys. Returns the last id (None: done)"""
+    where = await project_filter(conn, project)
+    cur = await conn.execute(
+        sql.SQL("SELECT max(id) AS last FROM ({}) b").format(
+            sql.SQL("SELECT id FROM documents WHERE {} AND id > %s ORDER BY id LIMIT %s").format(where)
+        ),
+        [after, FILL_BATCH_SIZE],
+    )
+    last = (await cur.fetchone())["last"]  # type: ignore[index]
+    if last is not None:
+        await conn.execute(
+            sql.SQL(
+                """UPDATE documents SET exact_fields = {new}
+                   WHERE {where} AND documents.id > %s AND documents.id <= %s AND exact_fields IS DISTINCT FROM {new}"""
+            ).format(new=with_text_keys_sql(), where=where),
+            [after, last],
+        )
+    return last
+
+
+async def _schedule_backfill(job_type: str, fields: str) -> None:
+    """
+    A job of this type for every project with fields that match the SQL condition `fields` (on fields f). Not for a
+    project that is being moved (or has a move job waiting): the job would only be postponed. A failed job is tried
+    again after RETRY_AFTER, at most MAX_BACKFILL_ATTEMPTS times in all (then it needs a look; delete the failed
+    jobs to try again).
     """
     rows = await fetch_all(
         f"""SELECT DISTINCT f.project_pk FROM fields f JOIN projects p ON p.pk = f.project_pk
-            WHERE f.type = 'date' AND NOT f.quarter_ready AND p.moving_to IS NULL
+            WHERE {fields} AND p.moving_to IS NULL
               AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.project_pk = f.project_pk
-                              AND j.status IN ('pending', 'running') AND j.type IN ('backfill_quarter', 'move_project'))
-              AND (SELECT count(*) FROM jobs j WHERE j.type = 'backfill_quarter' AND j.project_pk = f.project_pk
+                              AND j.status IN ('pending', 'running') AND j.type IN (%(type)s, 'move_project'))
+              AND (SELECT count(*) FROM jobs j WHERE j.type = %(type)s AND j.project_pk = f.project_pk
                    AND j.status = 'failed') < {MAX_BACKFILL_ATTEMPTS}
-              AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.type = 'backfill_quarter' AND j.project_pk = f.project_pk
-                              AND j.status = 'failed' AND j.updated_at > now() - interval '{RETRY_AFTER}')"""  # type: ignore[arg-type]
+              AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.type = %(type)s AND j.project_pk = f.project_pk
+                              AND j.status = 'failed' AND j.updated_at > now() - interval '{RETRY_AFTER}')""",  # type: ignore[arg-type]
+        {"type": job_type},
     )
     for row in rows:
         async with connection() as conn:  # (autocommit: the job exists at once)
-            await create_job_in_transaction(conn, "backfill_quarter", row["project_pk"], {"project_pk": row["project_pk"]})
+            await create_job_in_transaction(conn, job_type, row["project_pk"], {"project_pk": row["project_pk"]})
+
+
+async def schedule_quarter_backfill(state: dict) -> dict:
+    """
+    Periodic task: a backfill_quarter job for every project with date fields that do not have their quarter keys
+    (after migration 0002, or a copy from such a project), see _schedule_backfill.
+    """
+    await _schedule_backfill("backfill_quarter", "f.type = 'date' AND NOT f.quarter_ready")
+    return state
+
+
+async def schedule_text_keys_backfill(state: dict) -> dict:
+    """
+    Periodic task: a backfill_text_keys job for every project with text fields whose documents do not all have the
+    list of text keys (after migration 0004), see _schedule_backfill.
+    """
+    await _schedule_backfill("backfill_text_keys", "f.type = 'text' AND NOT f.text_exists_ready")
     return state
 
 
@@ -567,6 +632,7 @@ HANDLERS: dict[str, Callable[[Job], Awaitable[dict[str, Any]]]] = {
     "copy": _copy_job,
     "fill_sort_slot": _fill_sort_slot_job,
     "backfill_quarter": _backfill_quarter_job,
+    "backfill_text_keys": _backfill_text_keys_job,
     "reindex": maintenance.reindex_job,
     "vacuum": maintenance.vacuum_job,
     "move_project": partitions.move_project_job,
@@ -575,4 +641,5 @@ HANDLERS: dict[str, Callable[[Job], Awaitable[dict[str, Any]]]] = {
 PERIODIC: dict[str, PeriodicTask] = {
     "partition_maintenance": PeriodicTask(interval=maintenance.CHECK_INTERVAL, run=maintenance.check_partitions),
     "quarter_backfill": PeriodicTask(interval=timedelta(minutes=1), run=schedule_quarter_backfill),
+    "text_keys_backfill": PeriodicTask(interval=timedelta(minutes=1), run=schedule_text_keys_backfill),
 }

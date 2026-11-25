@@ -219,6 +219,94 @@ class Settings(BaseSettings):
         ),
     ] = True
 
+    index_agg_types: Annotated[
+        bool,
+        Field(
+            description=(
+                "Aggregate inside the search index (pdb.agg) also for: group by a number, integer or boolean field, "
+                "the minimum and maximum of a date field, and metrics without any axis. "
+                "Why: these read every matching row before (group by an integer field: 199 ms, a keyword axis with "
+                "max(date): 409 ms, against 2-23 ms for the same aggregation in the index, tried by hand on 200k "
+                "documents, pg_search 0.27.0, 25 Nov 2026; not re-measured on this code). "
+                "The rows are the same as GROUP BY (tested, also for number fields with whole and decimal values). "
+                "Still read from the rows: number intervals, hour and minute, url axes, avg and sum of dates. "
+                "false = these use GROUP BY, as in postgres-fast-v2 (AMCAT4_INDEX_AGG_TYPES=false)"
+            ),
+        ),
+    ] = True
+
+    index_field_stats: Annotated[
+        bool,
+        Field(
+            description=(
+                "Get the values of a field (the lists of filter values) and the statistics of a field (count, "
+                "minimum, maximum, average) from an aggregation inside the search index. "
+                "Why: the original statements read every document of the project (values: 441 ms, statistics: "
+                "235 ms on 200k documents, against 2-12 ms for the aggregation, tried by hand, pg_search 0.27.0, "
+                "25 Nov 2026; not re-measured on this code). "
+                "The output is the same, except: the average is computed with floats inside the index (for dates it "
+                "can differ by microseconds), and a tag that is twice in one document counts once. "
+                "Values of number and date fields, fields with more than 65,000 different values, and keyword "
+                "values that look like a full timestamp keep the original statement. "
+                "false = always the original statements (AMCAT4_INDEX_FIELD_STATS=false)"
+            ),
+        ),
+    ] = True
+
+    text_exists_key: Annotated[
+        bool,
+        Field(
+            description=(
+                "Filter on 'this text field has a value' (exists) inside the search index, on the list of text keys "
+                "that every document has in exact_fields since migration 0004 (written by a database trigger). "
+                "Why: it was the only filter outside the index, a SQL condition that reads the long text of every "
+                "hit (a page 180 ms and a count 260 ms on 200k documents, measured by hand on postgres-fast-v2, "
+                "25 Nov 2026; the new filter is a term like any keyword filter, not measured on this code). "
+                "Text fields whose older documents do not have the list yet keep the SQL condition until the "
+                "background job of their project is done (results are the same). "
+                "false = always the SQL condition, as in the original (AMCAT4_TEXT_EXISTS_KEY=false). The list is "
+                "written in both cases"
+            ),
+        ),
+    ] = True
+
+    auto_sort_slot: Annotated[
+        bool,
+        Field(
+            description=(
+                "Give every new field a free sort slot of its kind when it is created (keyword and url: 4 slots, "
+                "date: 2, number and integer: 1 per project), first come, first served. "
+                "Why: sorting on a slot is a Top-K scan inside the search index (sort by publisher: 2.9 to 4.6 ms "
+                "on a slot against 48.7 ms on the json value, Nov 2026), and a new field has no values yet, so the "
+                "slot costs no fill job; before, only the first date field and a keyword field called source got a "
+                "slot without asking (fast_sort). "
+                "When the slots of a kind are taken, later fields get none; fast_sort false on a field frees its "
+                "slot. Existing fields are not changed. "
+                "false = only the date and source slots are given automatically, as in postgres-fast-v2 "
+                "(AMCAT4_AUTO_SORT_SLOT=false)"
+            ),
+        ),
+    ] = True
+
+    lz4_json_columns: Annotated[
+        bool,
+        Field(
+            description=(
+                "Compress new values of exact_fields and stored_fields with lz4 instead of postgres' default "
+                "(pglz), as text_fields since migration 0002, and give the staging table of uploads the same "
+                "settings. Set at startup on the documents table and its partitions; existing rows are not "
+                "rewritten and keep their compression. "
+                "Why: lz4 is faster to compress and to read. An uploaded value kept the compression of the "
+                "staging table (pglz), so until now uploaded texts were not lz4 either (seen with "
+                "pg_column_compression, 25 Nov 2026). Postgres only compresses values of about 2 kB and more, so "
+                "for exact_fields and stored_fields this matters for documents with much metadata or large "
+                "objects. The effect on speed is not measured. Skipped with a warning if the server has no lz4. "
+                "false = the server's default for new values of the two columns, and uploads as before "
+                "(AMCAT4_LZ4_JSON_COLUMNS=false)"
+            ),
+        ),
+    ] = True
+
     sort_slot_job_rows: Annotated[
         int,
         Field(

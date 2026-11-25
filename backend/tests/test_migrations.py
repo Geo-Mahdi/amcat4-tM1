@@ -1,5 +1,5 @@
 """
-Migrations 0002 and 0003 on a database that has data from 0001: rows are kept, the new columns and indexes exist, the
+Migrations 0002 to 0004 on a database that has data from 0001: rows are kept, the new columns and indexes exist, the
 search index is rebuilt with the slot columns, searching still works, documents reference project_partitions (0003),
 and the downgrade gives back the 0001 schema.
 Runs in its own schema, next to the test schema.
@@ -130,6 +130,18 @@ async def test_migration_0002_with_data():
         # the existing date field still needs its quarter keys; other fields do not
         cur = await conn.execute("SELECT name, quarter_ready FROM fields ORDER BY name")
         assert {row["name"]: row["quarter_ready"] for row in await cur.fetchall()} == {"date": False, "text": True}
+        # 0004: the existing text field still needs the lists of text keys; new rows get them from the trigger
+        cur = await conn.execute("SELECT name, text_exists_ready FROM fields ORDER BY name")
+        assert {row["name"]: row["text_exists_ready"] for row in await cur.fetchall()} == {"date": True, "text": False}
+        assert (await _one(conn, "SELECT count(*) AS n FROM documents WHERE exact_fields ? '_text'"))["n"] == 0
+        row = await _one(
+            conn,
+            """INSERT INTO documents (partition_id, project_pk, doc_id, text_fields) VALUES (1, %s, 'new', %s)
+               RETURNING exact_fields""",
+            [project, Jsonb({f"f{text_pk}": "new"})],
+        )
+        assert row["exact_fields"] == {"_text": [f"f{text_pk}"]}
+        await conn.execute("DELETE FROM documents WHERE doc_id = 'new'")
 
         bm25 = await _bm25(conn, "documents_p1")
         assert bm25 != bm25_0001
@@ -167,7 +179,8 @@ async def test_migration_0002_with_data():
         assert (await _one(conn, "SELECT count(*) AS n FROM documents"))["n"] == 300
         assert await _references(conn) == "projects"
         assert not {"sort_kw1", "sort_num1", "sort_date2"} & await _columns(conn, "documents")
-        assert not {"sort_slot_ready", "quarter_ready"} & await _columns(conn, "fields")
+        assert not {"sort_slot_ready", "quarter_ready", "text_exists_ready"} & await _columns(conn, "fields")
+        assert await _one(conn, "SELECT 1 FROM pg_trigger WHERE tgrelid = 'documents'::regclass AND NOT tgisinternal") is None
         assert await _bm25(conn, "documents_p1") == bm25_0001
         assert await _indexdefs(conn, indexname="%project_id") == []
         assert await _search(conn, f"f{text_pk}", "word1") == 100

@@ -47,11 +47,15 @@ from amcat4.postgres.fields import (
     sort_slots_for_type,
     storage_column,
 )
+from amcat4.postgres.index_aggregate import index_field_stats, index_field_values
 from amcat4.postgres.layout import project_filter
 from amcat4.postgres.projects import project_layout, project_pk, project_pks
 from amcat4.systemdata.roles import get_user_project_role, role_is_at_least
 
-_COLUMNS = "pk, name, type, unique_field, metareader, reader, client_settings, sort_slot, sort_slot_ready, quarter_ready"
+_COLUMNS = (
+    "pk, name, type, unique_field, metareader, reader, client_settings, sort_slot, sort_slot_ready, quarter_ready, "
+    "text_exists_ready"
+)
 
 
 def _document_field(row: dict) -> DocumentField:
@@ -169,12 +173,20 @@ async def create_fields(index: str, fields: Mapping[str, FieldType | CreateDocum
         async with conn.transaction():
             cur = await conn.execute("SELECT sort_slot FROM fields WHERE project_pk = %s AND sort_slot IS NOT NULL", [pk])
             used_slots = {row["sort_slot"] for row in await cur.fetchall()}  # type: ignore[index, call-overload]
+            auto = get_settings().auto_sort_slot
+            # (not a slot that a job is still clearing, or failed to clear, for a field that left it)
+            busy = await _slots_with_fill_job(conn, pk) if auto else set()
             for name, f in new_fields.items():
                 # The first date field, and a keyword field called source, automatically get the standard columns
-                # (the other slots only with fast_sort)
                 slot = sort_slot_for_type(f.type)
                 if slot in used_slots or not (f.type == "date" or (f.type == "keyword" and name.lower() == "source")):
                     slot = None
+                if slot is None and auto:
+                    # Any other new field gets the first free slot of its kind, first come, first served (before:
+                    # only with fast_sort, which also frees a slot again). No fill job is needed and the slot is
+                    # ready at once (the default of sort_slot_ready): no document has a value for a new field, and
+                    # every write of the field fills the slot column too
+                    slot = next((s for s in sort_slots_for_type(f.type) if s not in used_slots and s not in busy), None)
                 if slot:
                     used_slots.add(slot)
                 await conn.execute(
@@ -329,6 +341,22 @@ async def _set_sort_slot(conn, project: int, f: FieldInfo, fast_sort: bool) -> N
     except UniqueViolation:
         raise ValueError(f"Sort slot {free[0]} was just taken by another field, please try again")
     await _fill_slot(conn, project, free[0], f)
+
+
+async def _slots_with_fill_job(conn, project: int) -> set[str]:
+    """
+    The sort slots of the project whose last fill_sort_slot job (which fills or clears the slot column) is not done:
+    waiting, running, failed or cancelled. The column can then still hold values of the field that left the slot.
+    (fast_sort on a field writes the whole column again, so it can use such a slot.)
+    """
+    cur = await conn.execute(
+        "SELECT status, params FROM jobs WHERE type = 'fill_sort_slot' AND project_pk = %s ORDER BY created_at", [project]
+    )
+    last: dict[str, str] = {}
+    for row in await cur.fetchall():
+        slots = set(row["params"].get("slots") or {}) | ({row["params"]["slot"]} if row["params"].get("slot") else set())
+        last.update({slot: row["status"] for slot in slots})
+    return {slot for slot, status in last.items() if status != "done"}
 
 
 async def _fill_job_active(conn, project: int, slot: str) -> bool:
@@ -511,6 +539,20 @@ async def _field_info(index: str, field: str) -> tuple[int, FieldInfo]:
     return pk, f
 
 
+async def _index_search(index: str):
+    """
+    The table and condition to read all documents of the project inside the search index of its partition, or None
+    if that cannot be used now (the switch AMCAT4_INDEX_FIELD_STATS or the fast path is off, or the project is being
+    moved to another partition)
+    """
+    if not get_settings().index_field_stats:
+        return None
+    from amcat4.postgres.search import SearchQuery, compile_search
+
+    c = compile_search(await get_fieldset([index]), SearchQuery(), fast=True)
+    return c if c.fast else None
+
+
 async def field_values(index: str, field: str, size: int) -> list[str]:
     """
     Get the most frequent values for a given field (e.g. to populate list of filter values on keyword field)
@@ -518,9 +560,16 @@ async def field_values(index: str, field: str, size: int) -> list[str]:
     pk, f = await _field_info(index, field)
     if f.column != "exact_fields":
         raise ValueError(f"Cannot list values of {f.type} field {field}")
+    c = await _index_search(index)
     value = sql.SQL("documents.exact_fields->{}").format(sql.Literal(f.key))
     elements = sql.SQL("CASE jsonb_typeof({v}) WHEN 'array' THEN {v} ELSE jsonb_build_array({v}) END").format(v=value)
     async with connection() as conn:
+        if c is not None:
+            # A terms aggregation inside the search index, where it gives the same list (see index_field_values)
+            values = await index_field_values(conn, c.table, c.where, c.params, f, size)
+            if values is not None:
+                return values
+        # The original statement: reads every document of the project
         cur = await conn.execute(
             sql.SQL(
                 """SELECT value, count(*) AS n FROM documents, jsonb_array_elements_text({}) AS value
@@ -540,18 +589,23 @@ async def field_stats(index: str, field: str) -> dict[str, Any]:
     pk, f = await _field_info(index, field)
     if f.type not in ("number", "integer", "date"):
         raise ValueError(f"Cannot compute statistics for {f.type} field {field}")
+    c = await _index_search(index)
     raw = sql.SQL("(documents.exact_fields->>{})").format(sql.Literal(f.key))
     if f.type == "date":
         x = sql.SQL("extract(epoch FROM {}::timestamptz)").format(raw)
     else:
         x = sql.SQL("{}::double precision").format(raw)
     async with connection() as conn:
-        cur = await conn.execute(
-            sql.SQL(
-                "SELECT count({x}) AS count, min({x}) AS min, max({x}) AS max, avg({x}) AS avg FROM documents WHERE {project}"
-            ).format(x=x, project=await project_filter(conn, pk))
-        )
-        row: dict | None = await cur.fetchone()  # type: ignore[assignment]
+        # A stats aggregation inside the search index if possible, else the original statement (every document)
+        row = await index_field_stats(conn, c.table, c.where, c.params, f) if c is not None else None
+        if row is None:
+            cur = await conn.execute(
+                sql.SQL(
+                    "SELECT count({x}) AS count, min({x}) AS min, max({x}) AS max, avg({x}) AS avg "
+                    "FROM documents WHERE {project}"
+                ).format(x=x, project=await project_filter(conn, pk))
+            )
+            row = await cur.fetchone()  # type: ignore[assignment]
     assert row is not None
     stats: dict[str, Any] = {"count": row["count"]}
     for k in ("min", "max", "avg"):

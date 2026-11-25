@@ -13,7 +13,7 @@ from alembic.script import ScriptDirectory
 
 from amcat4.connections import db_schema
 from amcat4.postgres.connection import connection
-from amcat4.postgres.layout import drop_schema
+from amcat4.postgres.layout import drop_schema, ensure_json_compression
 
 
 def _alembic_config() -> Config:
@@ -31,6 +31,9 @@ async def create_or_update_systemdata() -> str:
     config = _alembic_config()
     # alembic is synchronous, so run it in a thread to not block the event loop
     await asyncio.to_thread(command.upgrade, config, "head")
+    # (not a migration: it follows a setting, AMCAT4_LZ4_JSON_COLUMNS, and is checked at every start)
+    async with connection() as conn:
+        await ensure_json_compression(conn)
     head = ScriptDirectory.from_config(config).get_current_head()
     assert head is not None
     return head

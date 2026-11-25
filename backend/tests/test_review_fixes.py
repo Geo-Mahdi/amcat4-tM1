@@ -245,7 +245,7 @@ async def test_statement_timeout_is_not_a_fallback_error():
 IN_INDEX = {
     # pdb.agg (a keyword axis)
     "pdb.agg": ("pub", lambda text: "pdb.agg" in text),
-    # GROUP BY on the partition table (an integer axis, which pdb.agg does not do)
+    # GROUP BY on the partition table (an integer axis, which pdb.agg does not do with AMCAT4_INDEX_AGG_TYPES=false)
     "in-index GROUP BY": ("n", lambda text: "GROUP BY" in text and '"documents_p' in text),
 }
 
@@ -265,6 +265,7 @@ async def test_aggregate_fallbacks(two, monkeypatch, path):
 
     monkeypatch.setattr(aggregate_module, "SMALL_RESULT", 0)
     monkeypatch.setattr(search_module, "COUNT_STEP", 0)
+    monkeypatch.setattr(get_settings(), "index_agg_types", False)
     axis, marker = IN_INDEX[path]
     a, _ = two
     await upload(
@@ -439,7 +440,7 @@ async def _make_claimable(job_id: str) -> None:
 
 
 @pytest.mark.anyio
-async def test_fill_and_backfill_jobs_wait_for_a_move(moving_projects, monkeypatch):
+async def test_fill_and_backfill_jobs_wait_for_a_move(no_auto_sort_slot, moving_projects, monkeypatch):
     """
     Fill and backfill jobs met a project move and failed for good (and a failed backfill was never scheduled again).
     Now they are postponed while the project moves and run after it
@@ -483,7 +484,7 @@ async def test_fill_and_backfill_jobs_wait_for_a_move(moving_projects, monkeypat
 
 
 @pytest.mark.anyio
-async def test_fill_job_postponed_between_batches(moving_projects, monkeypatch):
+async def test_fill_job_postponed_between_batches(no_auto_sort_slot, moving_projects, monkeypatch):
     """A move that starts while the fill job runs: the next batch is refused, and the job is postponed"""
     from amcat4.postgres.connection import execute, fetch_all
     from amcat4.projects import jobs
@@ -555,7 +556,7 @@ async def test_backfill_retried_after_failure(two_projects, monkeypatch):  # noq
 
 
 @pytest.mark.anyio
-async def test_fast_sort_restarts_unfinished_fill(two_projects, monkeypatch):  # noqa: F811
+async def test_fast_sort_restarts_unfinished_fill(no_auto_sort_slot, two_projects, monkeypatch):  # noqa: F811
     """fast_sort on a field whose slot is reserved but not filled (its job failed): the fill starts again"""
     from amcat4.postgres.connection import execute, fetch_all
     from amcat4.projects import jobs

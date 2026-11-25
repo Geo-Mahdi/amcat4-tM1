@@ -98,6 +98,15 @@ def no_automatic_vacuum(monkeypatch):
     monkeypatch.setattr(get_settings(), "vacuum_after_rows", 0)
 
 
+@pytest.fixture()
+def no_auto_sort_slot(monkeypatch):
+    """
+    New fields get a sort slot only as in postgres-fast-v2 (AMCAT4_AUTO_SORT_SLOT=false), for the tests of fast_sort,
+    which put fields in slots themselves. List it before the fixture that creates the fields.
+    """
+    monkeypatch.setattr(get_settings(), "auto_sort_slot", False)
+
+
 @pytest.fixture(autouse=True)
 def mock_middlecat(httpx_mock):
     get_settings().middlecat_url = "http://mock_middlecat.net"
