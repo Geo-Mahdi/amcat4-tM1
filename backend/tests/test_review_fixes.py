@@ -440,7 +440,7 @@ async def _make_claimable(job_id: str) -> None:
 
 
 @pytest.mark.anyio
-async def test_fill_and_backfill_jobs_wait_for_a_move(moving_projects, monkeypatch):
+async def test_fill_and_backfill_jobs_wait_for_a_move(no_auto_sort_slot, moving_projects, monkeypatch):
     """
     Fill and backfill jobs met a project move and failed for good (and a failed backfill was never scheduled again).
     Now they are postponed while the project moves and run after it
@@ -484,7 +484,7 @@ async def test_fill_and_backfill_jobs_wait_for_a_move(moving_projects, monkeypat
 
 
 @pytest.mark.anyio
-async def test_fill_job_postponed_between_batches(moving_projects, monkeypatch):
+async def test_fill_job_postponed_between_batches(no_auto_sort_slot, moving_projects, monkeypatch):
     """A move that starts while the fill job runs: the next batch is refused, and the job is postponed"""
     from amcat4.postgres.connection import execute, fetch_all
     from amcat4.projects import jobs
@@ -556,7 +556,7 @@ async def test_backfill_retried_after_failure(two_projects, monkeypatch):  # noq
 
 
 @pytest.mark.anyio
-async def test_fast_sort_restarts_unfinished_fill(two_projects, monkeypatch):  # noqa: F811
+async def test_fast_sort_restarts_unfinished_fill(no_auto_sort_slot, two_projects, monkeypatch):  # noqa: F811
     """fast_sort on a field whose slot is reserved but not filled (its job failed): the fill starts again"""
     from amcat4.postgres.connection import execute, fetch_all
     from amcat4.projects import jobs

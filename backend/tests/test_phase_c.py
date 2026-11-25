@@ -154,7 +154,7 @@ def _slot_docs(n: int) -> list[dict]:
 
 
 @pytest.fixture()
-async def slot_project():
+async def slot_project(no_auto_sort_slot):
     name = "amcat4_unittest_slots"
     await delete_project_index(name, ignore_missing=True)
     await create_project_index(ProjectSettings(id=name))

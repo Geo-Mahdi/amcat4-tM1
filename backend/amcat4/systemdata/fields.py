@@ -173,12 +173,20 @@ async def create_fields(index: str, fields: Mapping[str, FieldType | CreateDocum
         async with conn.transaction():
             cur = await conn.execute("SELECT sort_slot FROM fields WHERE project_pk = %s AND sort_slot IS NOT NULL", [pk])
             used_slots = {row["sort_slot"] for row in await cur.fetchall()}  # type: ignore[index, call-overload]
+            auto = get_settings().auto_sort_slot
+            # (not a slot that a job is still clearing, or failed to clear, for a field that left it)
+            busy = await _slots_with_fill_job(conn, pk) if auto else set()
             for name, f in new_fields.items():
                 # The first date field, and a keyword field called source, automatically get the standard columns
-                # (the other slots only with fast_sort)
                 slot = sort_slot_for_type(f.type)
                 if slot in used_slots or not (f.type == "date" or (f.type == "keyword" and name.lower() == "source")):
                     slot = None
+                if slot is None and auto:
+                    # Any other new field gets the first free slot of its kind, first come, first served (before:
+                    # only with fast_sort, which also frees a slot again). No fill job is needed and the slot is
+                    # ready at once (the default of sort_slot_ready): no document has a value for a new field, and
+                    # every write of the field fills the slot column too
+                    slot = next((s for s in sort_slots_for_type(f.type) if s not in used_slots and s not in busy), None)
                 if slot:
                     used_slots.add(slot)
                 await conn.execute(
@@ -333,6 +341,22 @@ async def _set_sort_slot(conn, project: int, f: FieldInfo, fast_sort: bool) -> N
     except UniqueViolation:
         raise ValueError(f"Sort slot {free[0]} was just taken by another field, please try again")
     await _fill_slot(conn, project, free[0], f)
+
+
+async def _slots_with_fill_job(conn, project: int) -> set[str]:
+    """
+    The sort slots of the project whose last fill_sort_slot job (which fills or clears the slot column) is not done:
+    waiting, running, failed or cancelled. The column can then still hold values of the field that left the slot.
+    (fast_sort on a field writes the whole column again, so it can use such a slot.)
+    """
+    cur = await conn.execute(
+        "SELECT status, params FROM jobs WHERE type = 'fill_sort_slot' AND project_pk = %s ORDER BY created_at", [project]
+    )
+    last: dict[str, str] = {}
+    for row in await cur.fetchall():
+        slots = set(row["params"].get("slots") or {}) | ({row["params"]["slot"]} if row["params"].get("slot") else set())
+        last.update({slot: row["status"] for slot in slots})
+    return {slot for slot, status in last.items() if status != "done"}
 
 
 async def _fill_job_active(conn, project: int, slot: str) -> bool:

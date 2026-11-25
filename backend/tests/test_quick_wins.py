@@ -519,3 +519,165 @@ async def test_text_keys_backfill(project, index_paths, monkeypatch):  # noqa: F
     await jobs.schedule_text_keys_backfill({})  # nothing left to do
     assert len(await fetch_all("SELECT 1 FROM jobs WHERE type = 'backfill_text_keys' AND project_pk = %s", [pk])) == 1
     await fetch_all("DELETE FROM jobs WHERE type = 'backfill_text_keys' RETURNING id")
+
+
+############ 4. Automatic sort slot for new fields ############
+
+
+async def _slots(index: str) -> dict[str, str | None]:
+    from amcat4.systemdata.fields import list_fields
+
+    return {name: f.sort_slot for name, f in (await list_fields(index)).items()}
+
+
+async def _sorted_ids(index: str, field: str, direction: str, **kwargs) -> list[str]:
+    from amcat4.models import SortSpec
+    from amcat4.projects.query import query_documents
+
+    r = await query_documents(index, sort=[{field: SortSpec(order=direction)}], per_page=200, **kwargs)  # type: ignore[arg-type]
+    return [d["_id"] for d in r.data]
+
+
+SLOT_FIELDS = {
+    "text": "text",
+    "k1": "keyword",
+    "when": "date",
+    "link": "url",
+    "k2": "keyword",
+    "amount": "number",
+    "labels": "tag",
+    "when2": "date",
+    "k3": "keyword",
+    "count": "integer",
+    "k4": "keyword",
+    "when3": "date",
+    "seen": "boolean",
+}
+
+
+def _slot_docs(n: int) -> list[dict]:
+    docs = []
+    for i in range(n):
+        doc: dict = {"_id": f"s{i}", "text": f"common word{i % 3}", "labels": ["x"], "seen": bool(i % 2)}
+        if i % 5:
+            doc.update(
+                k1=f"v{i % 7}", k2=["b", "A", "a", "B", ""][i % 5], k3=f"k{i % 3}", k4=f"x{i % 4}", link=f"http://x/{i % 6}"
+            )
+        if i % 4:
+            doc.update(when=f"2020-01-{1 + i % 20:02d}", when2=f"2019-0{1 + i % 9}-01", when3=f"2018-0{1 + i % 8}-01")
+        if i % 3:
+            doc.update(amount=[1.0, 2.5, -3.0, 17.0][i % 4], count=i % 9 - 4)
+        docs.append(doc)
+    return docs
+
+
+@pytest.mark.anyio
+async def test_new_fields_get_free_sort_slots(index, monkeypatch):
+    """
+    New fields get the free slots of their kind in the order in which they are created; when the slots are taken,
+    later fields get none. The slots are filled by the upload and ready at once, and sorting gives the same order as
+    without slots (the switch off).
+    """
+    from amcat4.models import UpdateDocumentField
+    from amcat4.postgres.connection import fetch_all
+    from amcat4.postgres.projects import project_pk
+    from amcat4.systemdata.fields import create_fields, field_infos, update_fields
+
+    expected_slots = {
+        "text": None,
+        "k1": "source",
+        "when": "date",
+        "link": "sort_kw1",
+        "k2": "sort_kw2",
+        "amount": "sort_num1",
+        "labels": None,
+        "when2": "sort_date2",
+        "k3": "sort_kw3",
+        "count": None,  # the one number slot is taken by amount
+        "k4": None,  # the four keyword slots are taken
+        "when3": None,
+        "seen": None,
+    }
+    await upload(index, _slot_docs(60), fields=SLOT_FIELDS)  # type: ignore[arg-type]
+    assert await _slots(index) == expected_slots
+    assert all(f.sort_ready for f in (await field_infos(index)).values())
+    assert (
+        await fetch_all("SELECT 1 FROM jobs WHERE type = 'fill_sort_slot' AND project_pk = %s", [await project_pk(index)])
+        == []
+    )
+    # the slot columns hold exactly the values of their fields
+    rows = await fetch_all(
+        """SELECT count(*) FILTER (WHERE source IS DISTINCT FROM exact_fields->>%(k1)s
+                                      OR sort_kw1 IS DISTINCT FROM exact_fields->>%(link)s
+                                      OR sort_kw2 IS DISTINCT FROM exact_fields->>%(k2)s
+                                      OR sort_kw3 IS DISTINCT FROM exact_fields->>%(k3)s
+                                      OR sort_num1 IS DISTINCT FROM (exact_fields->>%(amount)s)::numeric
+                                      OR sort_date2 IS DISTINCT FROM (exact_fields->>%(when2)s)::timestamptz
+                                      OR date IS DISTINCT FROM (exact_fields->>%(when)s)::timestamptz) AS wrong,
+                  count(source) AS n FROM documents WHERE project_pk = %(pk)s""",
+        {**{name: f.key for name, f in (await field_infos(index)).items()}, "pk": await project_pk(index)},
+    )
+    assert rows == [{"wrong": 0, "n": 48}]
+
+    # the same project without automatic slots sorts every field in the same order
+    plain = "amcat4_unittest_quick_noslots"
+    await delete_project_index(plain, ignore_missing=True)
+    try:
+        monkeypatch.setattr(get_settings(), "auto_sort_slot", False)
+        await create_project_index(ProjectSettings(id=plain))
+        await upload(plain, _slot_docs(60), fields=SLOT_FIELDS)  # type: ignore[arg-type]
+        monkeypatch.setattr(get_settings(), "auto_sort_slot", True)
+        old_slots = await _slots(plain)
+        assert {name for name, slot in old_slots.items() if slot} == {"when"}  # (as before: only the first date field)
+        for field in SLOT_FIELDS:
+            if field in ("text", "labels"):
+                continue
+            for direction in ("asc", "desc"):
+                for kwargs in ({}, {"queries": {"q": "word1 OR word2"}}):
+                    # (documents with the same value come in id order in both: compare the values, then the ids)
+                    new = await _sorted_ids(index, field, direction, **kwargs)
+                    old = await _sorted_ids(plain, field, direction, **kwargs)
+                    assert new == old, (field, direction, kwargs)
+    finally:
+        await delete_project_index(plain, ignore_missing=True)
+
+    # existing fields are not changed: a field created later takes what is free, nothing moves
+    await create_fields(index, {"k5": "keyword", "k1": "keyword"})
+    assert await _slots(index) == {**expected_slots, "k5": None}
+    # a slot can still be freed and given to another field with the existing setting
+    await update_fields(index, {"k2": UpdateDocumentField(fast_sort=False)})
+    await update_fields(index, {"k4": UpdateDocumentField(fast_sort=True)})
+    assert await _slots(index) == {**expected_slots, "k5": None, "k2": None, "k4": "sort_kw2"}
+    assert await _sorted_ids(index, "k4", "asc") == await _sorted_ids(index, "k4", "asc", queries={"q": "common"})
+    # ... and a field that is created when a slot is free again gets it
+    await update_fields(index, {"amount": UpdateDocumentField(fast_sort=False)})
+    await create_fields(index, {"count2": "integer"})
+    assert (await _slots(index))["count2"] == "sort_num1"
+
+
+@pytest.mark.anyio
+async def test_no_automatic_slot_while_it_is_cleared(index, monkeypatch):
+    """A slot that a background job is still clearing (its field left it) is not given to a new field"""
+    from amcat4.models import UpdateDocumentField
+    from amcat4.projects.jobs import run_pending_jobs
+    from amcat4.systemdata.fields import create_fields, update_fields
+
+    docs = [{"_id": f"s{i}", "text": "common", "amount": i / 2, "k1": f"v{i % 3}"} for i in range(30)]
+    await upload(index, docs, fields={"text": "text", "amount": "number", "k1": "keyword"})
+    assert (await _slots(index))["amount"] == "sort_num1"
+    monkeypatch.setattr(get_settings(), "sort_slot_job_rows", 0)  # (clear the slot in a job, as for a large project)
+    await update_fields(index, {"amount": UpdateDocumentField(fast_sort=False)})
+    await create_fields(index, {"count": "integer"})
+    assert (await _slots(index))["count"] is None
+    # ... also not if that job failed: the column can still hold values of the old field
+    from amcat4.postgres.connection import execute
+
+    await execute("UPDATE jobs SET status = 'failed' WHERE type = 'fill_sort_slot' AND status = 'pending'")
+    await create_fields(index, {"count1": "integer"})
+    assert (await _slots(index))["count1"] is None
+    await execute("UPDATE jobs SET status = 'pending' WHERE type = 'fill_sort_slot' AND status = 'failed'")
+    await run_pending_jobs()
+    await create_fields(index, {"count2": "integer"})
+    assert (await _slots(index))["count2"] == "sort_num1"
+    await upload(index, [{"_id": "n1", "count2": 5}, {"_id": "n2", "count2": -1}])
+    assert (await _sorted_ids(index, "count2", "asc"))[:2] == ["n2", "n1"]

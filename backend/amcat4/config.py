@@ -252,6 +252,24 @@ class Settings(BaseSettings):
         ),
     ] = True
 
+    auto_sort_slot: Annotated[
+        bool,
+        Field(
+            description=(
+                "Give every new field a free sort slot of its kind when it is created (keyword and url: 4 slots, "
+                "date: 2, number and integer: 1 per project), first come, first served. "
+                "Why: sorting on a slot is a Top-K scan inside the search index (sort by publisher: 2.9 to 4.6 ms "
+                "on a slot against 48.7 ms on the json value, Nov 2026), and a new field has no values yet, so the "
+                "slot costs no fill job; before, only the first date field and a keyword field called source got a "
+                "slot without asking (fast_sort). "
+                "When the slots of a kind are taken, later fields get none; fast_sort false on a field frees its "
+                "slot. Existing fields are not changed. "
+                "false = only the date and source slots are given automatically, as in postgres-fast-v2 "
+                "(AMCAT4_AUTO_SORT_SLOT=false)"
+            ),
+        ),
+    ] = True
+
     sort_slot_job_rows: Annotated[
         int,
         Field(

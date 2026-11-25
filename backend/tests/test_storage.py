@@ -110,7 +110,7 @@ async def test_snippets_non_ascii(index):
 
 
 @pytest.mark.anyio
-async def test_sort_slots(docs_index):
+async def test_sort_slots(no_auto_sort_slot, docs_index):
     """A number field can now get the sort_num1 slot (migration 0002; before, this was an error) and sorts on it"""
 
     async def order(field, direction="asc"):
