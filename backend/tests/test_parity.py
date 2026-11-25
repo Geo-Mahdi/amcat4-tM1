@@ -276,11 +276,26 @@ async def test_parity_filters_and_sorts(parity_project, monkeypatch):
 
 
 async def _reference_by_score(queries: dict[str, str], filters: dict[str, dict], limit: int) -> list[str]:
-    """Top documents by score, sorted by postgres over all hits (materialized, so no Top-K scan in pg_search)"""
+    """
+    Top documents by score, sorted by postgres over all hits (materialized, so no Top-K scan in pg_search).
+
+    The search is compiled as the page is (fast=True, by_score=True: the partition table, with the condition on
+    partition_id). pg_search also scores the plain SQL conditions next to the search condition: seen 25 Nov 2026,
+    three documents with exactly the same score for the query (6.216723) got 6.2168493 each with the condition on
+    partition_id, but 7.1875477, 7.1875477 and 7.187547 on the parent table with the conditions on partition_id and
+    project_pk. A score is a sum of 32-bit floats, so with other conditions the last digit of documents with the same
+    score can differ, and a reference on the parent table then orders such documents in another way than the page
+    (which orders them by id). Which documents are affected depends on what else is in the partition, so the test
+    failed in about half of the runs of the whole suite after the releases branch was merged.
+    """
     fieldset = await get_fieldset([PROJECT])
     c = compile_search(
-        fieldset, SearchQuery(queries=queries, filters={k: FilterSpec(**v) for k, v in filters.items()} or None)
+        fieldset,
+        SearchQuery(queries=queries, filters={k: FilterSpec(**v) for k, v in filters.items()} or None),
+        fast=True,
+        by_score=True,
     )
+    assert c.fast
     # (score_sql: paradedb.score, or pdb.score with AMCAT4_NEW_QUERY_API=true)
     stmt = sql.SQL(
         "WITH hits AS MATERIALIZED (SELECT documents.id, documents.doc_id, {} AS s "
