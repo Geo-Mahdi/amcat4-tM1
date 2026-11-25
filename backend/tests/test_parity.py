@@ -35,6 +35,20 @@ from tests.conftest import upload
 
 pytestmark = pytest.mark.anyio
 
+
+@pytest.fixture(scope="module", autouse=True)
+def json_sort_fields():
+    """
+    No automatic sort slots for the fields of this module (AMCAT4_AUTO_SORT_SLOT=false): the tests are about sorting on
+    json fields, and a field that gets a slot is sorted on its slot column instead.
+    """
+    settings = get_settings()
+    before = settings.auto_sort_slot
+    settings.auto_sort_slot = False
+    yield
+    settings.auto_sort_slot = before
+
+
 N_DOCS = 1500
 N_CASES = int(os.environ.get("AMCAT4_PARITY_CASES", "120"))
 PROJECT = "amcat4_unittest_parity"

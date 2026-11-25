@@ -24,6 +24,20 @@ from tests.conftest import upload
 
 pytestmark = pytest.mark.anyio
 
+
+@pytest.fixture(scope="module", autouse=True)
+def json_sort_fields():
+    """
+    No automatic sort slots for the fields of this module (AMCAT4_AUTO_SORT_SLOT=false): the tests are about sorting on
+    json fields, and a field that gets a slot is sorted on its slot column instead.
+    """
+    settings = get_settings()
+    before = settings.auto_sort_slot
+    settings.auto_sort_slot = False
+    yield
+    settings.auto_sort_slot = before
+
+
 PROJECT = "amcat4_unittest_cutoff"
 N_DOCS = 600
 # "date" is the first date field, so it gets the date sort slot: sorting on it is a Top-K scan, not a cutoff sort
