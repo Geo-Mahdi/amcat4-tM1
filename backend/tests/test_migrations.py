@@ -354,3 +354,98 @@ async def test_migration_0005_with_data():
         await drop_schema(conn, SCHEMA)
         await conn.close()
 
+
+@pytest.mark.anyio
+async def test_migration_chain_0003_to_0005():
+    """
+    The chain 0003 -> 0004 (quick wins: text keys) -> 0005 (releases and labels) on a database as the branch
+    postgres-fast-v3 left it, with documents; and a fresh database from nothing to the head. The two migrations were
+    written on separate branches, both on top of 0003.
+    """
+    conn = await _connect()
+    try:
+        # a fresh database: 0001 to the head in one go, which is 0005 (one head, no branches)
+        await drop_schema(conn, SCHEMA)
+        await asyncio.to_thread(_migrate, "upgrade", "head")
+        assert await _one(conn, "SELECT version_num FROM alembic_version") == {"version_num": "0005"}
+        cur = await conn.execute("SELECT tgname FROM pg_trigger WHERE tgrelid = 'documents'::regclass AND NOT tgisinternal")
+        assert {row["tgname"] for row in await cur.fetchall()} == {"documents_text_keys", "documents_doc_pk"}
+        assert {"text_exists_ready", "label_table"} <= await _columns(conn, "fields")
+        assert {"created_seq", "retired_seq", "doc_pk"} <= await _columns(conn, "documents")
+
+        # a database at 0003 with documents, step by step
+        await drop_schema(conn, SCHEMA)
+        await asyncio.to_thread(_migrate, "upgrade", "0003")
+        bm25_0003 = await _bm25(conn, "documents_p1")
+        project, text_pk = await _insert_0003_data(conn)
+        key = f"f{text_pk}"
+        xmin = (await _one(conn, "SELECT max(xmin::text::bigint) AS x FROM documents"))["x"]
+
+        await asyncio.to_thread(_migrate, "upgrade", "0004")
+        assert await _one(conn, "SELECT version_num FROM alembic_version") == {"version_num": "0004"}
+        assert await _bm25(conn, "documents_p1") == bm25_0003  # (0004 does not touch the search index)
+        assert not {"created_seq", "retired_seq", "doc_pk"} & await _columns(conn, "documents")
+
+        await asyncio.to_thread(_migrate, "upgrade", "0005")
+        assert await _one(conn, "SELECT version_num FROM alembic_version") == {"version_num": "0005"}
+        await _check_0005(conn, project, text_pk, bm25_0003)
+        # neither migration wrote a document row
+        assert (await _one(conn, "SELECT max(xmin::text::bigint) AS x FROM documents"))["x"] == xmin
+        # 0004 is still in place: the old documents have no list of text keys yet and their field is marked
+        row = await _one(conn, "SELECT text_exists_ready FROM fields WHERE pk = %s", [text_pk])
+        assert row == {"text_exists_ready": False}
+        assert (await _one(conn, "SELECT count(*) AS n FROM documents WHERE exact_fields ? '_text'"))["n"] == 0
+        # a write of an old document gets the list from the trigger, and stays a current row without a number
+        row = await _one(
+            conn,
+            "UPDATE documents SET text_fields = text_fields WHERE doc_id = '6' "
+            "RETURNING exact_fields, created_seq, retired_seq, doc_pk",
+        )
+        assert row == {"exact_fields": {"_text": [key]}, "created_seq": 0, "retired_seq": 9223372036854775807, "doc_pk": None}
+        async with conn.transaction(force_rollback=True):
+            # a new document: both triggers (the list of text keys, and doc_pk = id)
+            new = await _one(
+                conn,
+                """INSERT INTO documents (partition_id, project_pk, doc_id, text_fields, created_seq)
+                   VALUES (1, %s, 'new', %s, 5) RETURNING id, doc_pk, exact_fields""",
+                [project, Jsonb({key: "word1 new"})],
+            )
+            assert new["doc_pk"] == new["id"] and new["exact_fields"] == {"_text": [key]}
+            # an old version of it, as a versioned write stores it: the given doc_pk is kept, and the row gets the
+            # list of its own text fields, whatever exact_fields it was given
+            old = await _one(
+                conn,
+                """INSERT INTO documents (partition_id, project_pk, doc_id, text_fields, exact_fields, created_seq,
+                                          retired_seq, doc_pk)
+                   VALUES (1, %s, 'new', '{}', %s, 1, 5, %s) RETURNING id, doc_pk, exact_fields""",
+                [project, Jsonb({"_text": [key], "f99": "x"}), new["id"]],
+            )
+            assert old["doc_pk"] == new["id"] != old["id"] and old["exact_fields"] == {"f99": "x"}
+            # the term on the text keys and the row-version clauses in one search (as the code sends them)
+            query = {
+                "boolean": {
+                    "must": [
+                        {"term": {"field": "exact_fields._text", "value": key}},
+                        {"term": {"field": "retired_seq", "value": 9223372036854775807}},
+                        {"match": {"field": f"text_fields.{key}", "value": "word1"}},
+                    ]
+                }
+            }
+            row = await _one(conn, "SELECT count(*) AS n FROM documents_p1 WHERE id @@@ %s::jsonb", [Jsonb(query)])
+            assert row["n"] == 1  # (of the old documents with word1 none has the list; the new document has)
+
+        # down to 0003 again (through 0004) and up: the same schema as a fresh database
+        await asyncio.to_thread(_migrate, "downgrade", "0003")
+        assert not {"created_seq", "retired_seq", "doc_pk"} & await _columns(conn, "documents")
+        assert "text_exists_ready" not in await _columns(conn, "fields")
+        assert await _one(conn, "SELECT 1 FROM pg_trigger WHERE tgrelid = 'documents'::regclass AND NOT tgisinternal") is None
+        assert (await _one(conn, "SELECT count(*) AS n FROM documents"))["n"] == 300
+        await asyncio.to_thread(_migrate, "upgrade", "head")
+        assert (
+            await _one(
+                conn, "SELECT count(*) AS n, count(*) FILTER (WHERE retired_seq = 9223372036854775807) AS live FROM documents"
+            )
+        ) == {"n": 300, "live": 300}
+    finally:
+        await drop_schema(conn, SCHEMA)
+        await conn.close()

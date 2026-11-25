@@ -270,10 +270,22 @@ What it would add:
 
 ## Merge notes
 
-- Migration 0005 has `down_revision = "0003"`. Point it at 0004 when the quick-wins branch is merged. It does not
-  depend on 0004.
-- `search.py`: the changes are `scope_clauses` (project + row versions) and reading label values for a page.
-  A cutoff sort added on another branch must skip fields with `in_labels`.
-- New plain SQL reads of `documents` on other branches need the live condition
-  (`project_filter(conn, pk, live=True)`).
+Done on `postgres-fast-v3-all` (25 Nov 2026):
+
+- Migration 0005 follows 0004 (`down_revision = "0004"`). It does not depend on 0004; the chain 0003 -> 0004 -> 0005
+  is tested in `tests/test_migrations.py`.
+- The cutoff sort skips a tag field in the label table (`sort_key` in `cutoff_sort.py`), and the tag order of the
+  cutoff sort (smallest / largest tag) is computed from the label rows for such a field (`labels.sort_value`).
+- The statements of the cutoff sort take the search from `compile_search`, so they carry the clause for current
+  rows or for a release. The quick-wins reads (field values, statistics) do the same, and their original statements
+  use `project_filter(conn, pk, live=True)`.
+- The jobs that fill derived values (sort slots, quarter keys, the list of text keys of migration 0004) work on
+  every row version, on purpose: a release filters and sorts on them too.
+- The new query API renders the row-version clauses (`retired_seq` term, `created_seq` / `retired_seq` ranges)
+  as predicates on the real columns; no fallback to the legacy format.
+- `tests/test_v3_together.py` tests these combinations.
+
+For later branches:
+
+- New plain SQL reads of `documents` need the live condition (`project_filter(conn, pk, live=True)`).
 - New INSERTs into `documents` must give `created_seq`.

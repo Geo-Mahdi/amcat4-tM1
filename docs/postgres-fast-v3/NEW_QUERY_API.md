@@ -45,7 +45,7 @@ The switch can be changed at any time; no data depends on it.
 | `{"match": {field, value}}` | `K \|\|\| value` | any word of the value; `&&&` with `conjunction_mode` |
 | `{"term": {field, value}}`, text | `K === value` | |
 | `{"term": {field, value}}`, number or boolean | `K @@@ pdb.term(value::bigint)` (or `float8`, `boolean`) | whole numbers as bigint, see `term_value` in fields.py |
-| `{"term_set": {field, terms}}` | `K @@@ pdb.term_set(values)` | not used by AmCAT today |
+| `{"term_set": {field, terms}}`, or `{"term_set": {terms: [{field, value}, ...]}}` with one field | `K @@@ pdb.term_set(values)` | the cutoff sort ("one of these values", text fields) |
 | `{"fuzzy_term": {field, value, distance}}` | `K === value::pdb.fuzzy(distance, f, t)` | `t`: see below |
 | `{"phrase": {field, phrases, slop}}` | `K ### words::text[]::pdb.slop(slop)` | |
 | `{"phrase_prefix": {field, phrases, max_expansions}}` | `K @@@ pdb.phrase_prefix(words, max_expansions)` | prefix (`econ*`) and phrase prefix |
