@@ -1,4 +1,3 @@
-import json
 import logging
 from datetime import UTC, datetime
 from typing import AsyncIterable
@@ -13,6 +12,7 @@ from amcat4.models import IndexId, ProjectSettings, RoleRule, Roles, User
 from amcat4.objectstorage.multimedia import delete_project_multimedia
 from amcat4.postgres.connection import connection, fetch_all, fetch_one
 from amcat4.postgres.layout import partition_table, project_filter
+from amcat4.postgres.pdb_sql import search_condition
 from amcat4.systemdata.roles import list_user_project_roles
 from amcat4.systemdata.settings import (
     _project_from_row,
@@ -149,14 +149,12 @@ async def index_size_in_bytes(index_id: IndexId) -> int:
         # While the project is being moved, its documents are in two partitions (partition_id and moving_to): both
         # are counted and sampled (before, only partition_id was, so the size shrank during the move)
         partitions = [project["partition_id"]] + ([project["moving_to"]] if project["moving_to"] is not None else [])
-        query = sql.Literal(json.dumps({"term": {"field": "project_pk", "value": project["pk"]}}))
+        condition, params = search_condition({"term": {"field": "project_pk", "value": project["pk"]}}, table="d")
         counts, total = [], 0.0
         async with connection() as conn:
             for partition_id in partitions:
                 table = sql.Identifier(partition_table(partition_id))
-                cur = await conn.execute(
-                    sql.SQL("SELECT count(*) AS n FROM {} d WHERE d.id @@@ {}::jsonb").format(table, query)
-                )
+                cur = await conn.execute(sql.SQL("SELECT count(*) AS n FROM {} d WHERE {}").format(table, condition), params)
                 counts.append((table, (await cur.fetchone())["n"]))  # type: ignore[index, call-overload]
             if sum(n for _, n in counts) > SIZE_SAMPLE:
                 for table, n in counts:
@@ -164,9 +162,9 @@ async def index_size_in_bytes(index_id: IndexId) -> int:
                         continue
                     cur = await conn.execute(
                         sql.SQL(
-                            "SELECT avg(pg_column_size(s.*)) AS size"
-                            " FROM (SELECT d.* FROM {} d WHERE d.id @@@ {}::jsonb LIMIT {}) s"
-                        ).format(table, query, sql.Literal(SIZE_SAMPLE))
+                            "SELECT avg(pg_column_size(s.*)) AS size FROM (SELECT d.* FROM {} d WHERE {} LIMIT {}) s"
+                        ).format(table, condition, sql.Literal(SIZE_SAMPLE)),
+                        params,
                     )
                     total += float((await cur.fetchone())["size"] or 0) * n  # type: ignore[index, call-overload]
                 return int(total)

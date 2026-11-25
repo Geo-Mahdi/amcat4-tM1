@@ -20,7 +20,6 @@ from typing import Any, Literal
 import psycopg
 from psycopg import AsyncConnection, IsolationLevel, sql
 from psycopg.pq import TransactionStatus
-from psycopg.types.json import Jsonb
 
 from amcat4.config import get_settings
 from amcat4.models import FilterSpec, SnippetParams
@@ -29,6 +28,7 @@ from amcat4.postgres.connection import must_not_fall_back, spare_connection
 from amcat4.postgres.fields import FieldInfo, FieldSet, QueryError
 from amcat4.postgres.filters import compile_filters, field_sql
 from amcat4.postgres.layout import partition_table
+from amcat4.postgres.pdb_sql import score_sql, search_condition, snippet_positions_sql
 from amcat4.postgres.querystring import highlight_patterns, match_positions, parse_query, query_string_to_json
 from amcat4.postgres.snippets import byte_to_char_positions, make_snippet
 from amcat4.postgres.snippets import highlight as highlight_text
@@ -188,7 +188,9 @@ def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False, b
         extra_params.append(list(query.ids))
     sql_clauses, params = [*base_clauses, *extra_clauses], [*base_params, *extra_params]
     json_query = json_query_of(selection, scored)
-    where = sql.SQL(" AND ").join([sql.SQL("documents.id @@@ %s::jsonb"), *sql_clauses])
+    # the json query as a SQL condition: the legacy json object, or (AMCAT4_NEW_QUERY_API) new-API predicates
+    condition, condition_params = search_condition(json_query)
+    where = sql.SQL(" AND ").join([condition, *sql_clauses])
     plain_where, plain_params = None, []
     if not scored and len(selection) == 1:
         # only the project clause is in the json query. The partition condition is also needed on a partition table:
@@ -198,7 +200,7 @@ def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False, b
     return CompiledSearch(
         json_query,
         where,
-        [Jsonb(json_query), *params],
+        [*condition_params, *params],
         table=table,
         fast=use_partition_table,
         plain_where=plain_where,
@@ -250,7 +252,7 @@ def order_items(
     for name, order in sort or []:
         direction = sql.SQL("DESC NULLS LAST" if order == "desc" else "ASC NULLS LAST")
         if name == "_score":
-            items.append((sql.SQL("paradedb.score(documents.id)"), direction))
+            items.append((score_sql(), direction))
         elif name == "?":
             items.append((sql.SQL("random()"), None))
         elif name == "_id":
@@ -291,7 +293,7 @@ def order_items(
 def order_by(fieldset: FieldSet, sort: list[tuple[str, Literal["asc", "desc"]]] | None, scored: bool) -> sql.Composable:
     items = [cutoff_sort.order_item(expr, direction) for expr, direction in order_items(fieldset, sort)]
     if not items and scored:
-        items.append(sql.SQL("paradedb.score(documents.id) DESC"))
+        items.append(sql.SQL("{} DESC").format(score_sql()))
     items.append(sql.SQL("documents.id"))
     return sql.SQL(", ").join(items)
 
@@ -393,12 +395,10 @@ async def search(
             columns.append(sql.SQL("{} AS {}").format(field_select(f), sql.Identifier(f.key)))
             if scored and f.type == "text" and (name in snippets or highlight):
                 columns.append(
-                    sql.SQL("paradedb.snippet_positions({}->{}) AS {}").format(
-                        sql.Identifier(f.column), sql.Literal(f.key), sql.Identifier("_pos_" + f.key)
-                    )
+                    sql.SQL("{} AS {}").format(snippet_positions_sql(f.column, f.key), sql.Identifier("_pos_" + f.key))
                 )
     if scored:
-        columns.append(sql.SQL("paradedb.score(documents.id) AS _score"))
+        columns.append(sql.SQL("{} AS _score").format(score_sql()))
     columns.append(sql.SQL("documents.id AS _internal_id"))
 
     where, params = c.where, list(c.params)

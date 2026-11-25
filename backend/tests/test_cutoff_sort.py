@@ -423,7 +423,9 @@ async def test_tag_groups(project, cutoff_calls, statements, monkeypatch):
     await _page([("tags", "asc")], 0, 10)
     searches = [s for s in statements if "@@@" in s and "count(*) AS n FROM" not in s]
     assert len(searches) == 3 and "pdb.agg" in searches[0]
-    assert searches[1].endswith("WHERE documents.id @@@ %s::jsonb ORDER BY documents.id LIMIT %s OFFSET %s")
+    # (the search condition itself is the legacy json object or, with AMCAT4_NEW_QUERY_API, new-API predicates)
+    assert searches[1].startswith("SELECT documents.id FROM ")
+    assert searches[1].endswith(" ORDER BY documents.id LIMIT %s OFFSET %s") and searches[1].count("ORDER BY") == 1
 
 
 # ---------------------------------------------------------------- tag order

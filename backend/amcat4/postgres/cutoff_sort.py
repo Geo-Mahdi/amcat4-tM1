@@ -49,6 +49,7 @@ from typing import Any, Callable
 from psycopg import AsyncConnection, sql
 
 from amcat4.postgres.fields import FieldInfo, FieldSet
+from amcat4.postgres.pdb_sql import search_condition
 
 # The most buckets pg_search returns for a terms aggregation (paradedb.max_term_agg_buckets). Every bucket has at
 # least one document, so offset + per_page + 2 buckets are always enough; deeper pages use the late fetch
@@ -250,19 +251,18 @@ class _Sorter:
     async def fetch(self, extra: list[dict], level: int, offset: int, limit: int) -> list[int]:
         """Ids of the documents of the search plus these clauses, ordered by the sort keys from this level on"""
         ordering = sql.SQL(", ").join([*(order_item(*item) for item in self.order_items[level:]), _ID])
+        condition, params = search_condition(self.json_query(extra))
         cur = await self.conn.execute(
-            sql.SQL("SELECT documents.id FROM {} WHERE documents.id @@@ %s::jsonb ORDER BY {} LIMIT %s OFFSET %s").format(
-                self.table, ordering
+            sql.SQL("SELECT documents.id FROM {} WHERE {} ORDER BY {} LIMIT %s OFFSET %s").format(
+                self.table, condition, ordering
             ),
-            [json.dumps(self.json_query(extra)), limit, offset],
+            [*params, limit, offset],
         )
         return [row["id"] for row in await cur.fetchall()]  # type: ignore[index, call-overload]
 
     async def count(self, extra: list[dict]) -> int:
-        cur = await self.conn.execute(
-            sql.SQL("SELECT count(*) AS n FROM {} WHERE documents.id @@@ %s::jsonb").format(self.table),
-            [json.dumps(self.json_query(extra))],
-        )
+        condition, params = search_condition(self.json_query(extra))
+        cur = await self.conn.execute(sql.SQL("SELECT count(*) AS n FROM {} WHERE {}").format(self.table, condition), params)
         return (await cur.fetchone())["n"]  # type: ignore[index, call-overload]
 
     async def aggregate(self, extra: list[dict], *requests: dict) -> list[dict]:
@@ -271,9 +271,9 @@ class _Sorter:
             sql.SQL("pdb.agg({}::jsonb) AS {}").format(sql.Literal(json.dumps(r)), sql.Identifier(f"r{i}"))
             for i, r in enumerate(requests)
         ]
+        condition, params = search_condition(self.json_query(extra))
         cur = await self.conn.execute(
-            sql.SQL("SELECT {} FROM {} WHERE documents.id @@@ %s::jsonb").format(sql.SQL(", ").join(aggs), self.table),
-            [json.dumps(self.json_query(extra))],
+            sql.SQL("SELECT {} FROM {} WHERE {}").format(sql.SQL(", ").join(aggs), self.table, condition), params
         )
         row: dict = await cur.fetchone()  # type: ignore[assignment]
         results = [row[f"r{i}"] for i in range(len(requests))]
@@ -469,13 +469,15 @@ async def small_page_ids(
     """
     columns = [sql.SQL("{} AS {}").format(expr, sql.Identifier(f"o{i}")) for i, (expr, _) in enumerate(order_items)]
     ordering = [order_item(sql.Identifier(f"o{i}"), direction) for i, (_, direction) in enumerate(order_items)]
+    # (search_condition: the legacy json object, or the new query API with AMCAT4_NEW_QUERY_API, as in _Sorter)
+    condition, params = search_condition(json_query)
     cur = await conn.execute(
         sql.SQL(
-            "WITH hits AS MATERIALIZED (SELECT {} FROM {} WHERE documents.id @@@ %s::jsonb LIMIT %s) "
+            "WITH hits AS MATERIALIZED (SELECT {} FROM {} WHERE {} LIMIT %s) "
             "SELECT (SELECT count(*) FROM hits) AS n, "
             "ARRAY(SELECT id FROM hits ORDER BY {} LIMIT %s OFFSET %s) AS ids"
-        ).format(sql.SQL(", ").join([_ID, *columns]), table, sql.SQL(", ").join([*ordering, sql.Identifier("id")])),
-        [json.dumps(json_query), SMALL_HITS + 1, limit, offset],
+        ).format(sql.SQL(", ").join([_ID, *columns]), table, condition, sql.SQL(", ").join([*ordering, sql.Identifier("id")])),
+        [*params, SMALL_HITS + 1, limit, offset],
     )
     row: dict = await cur.fetchone()  # type: ignore[assignment]
     return list(row["ids"]) if row["n"] <= SMALL_HITS else None
