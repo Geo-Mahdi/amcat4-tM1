@@ -12,7 +12,7 @@ from typing import Any
 from psycopg import sql
 
 from amcat4.models import FilterSpec
-from amcat4.postgres.fields import DATE_DERIVED, FieldInfo, FieldSet, QueryError, normalize_value
+from amcat4.postgres.fields import DATE_DERIVED, FieldInfo, FieldSet, QueryError, normalize_value, term_value
 from amcat4.postgres.querystring import range_query
 
 
@@ -98,7 +98,8 @@ def _compile_filter(f: FieldInfo, spec: FilterSpec) -> tuple[list[dict], list[sq
         elif f.type == "date":
             clauses.append({"boolean": {"should": [range_query(f, v, v) for v in values]}})
         else:
-            clauses.append({"boolean": {"should": [{"term": {"field": f.path, "value": _value(f, v)}} for v in values]}})
+            terms = [{"term": {"field": f.path, "value": term_value(v, f.type)}} for v in values]
+            clauses.append({"boolean": {"should": terms}})
 
     bounds = {k: d.pop(k) for k in ("gt", "gte", "lt", "lte") if k in d}
     if bounds:

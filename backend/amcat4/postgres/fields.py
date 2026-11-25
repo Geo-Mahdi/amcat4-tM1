@@ -215,6 +215,25 @@ def normalize_value(value: Any, field_type: str) -> Any:
             return value
 
 
+def term_value(value: Any, field_type: str) -> Any:
+    """
+    Normalize a value for an exact-match (term) query in the search index.
+
+    Number fields are stored as json numbers inside exact_fields. pg_search indexes a json number without a fraction
+    (17 or 17.0) as the whole number 17, and a term query with the float 17.0 then matches nothing, while the integer 17
+    matches (pg_search 0.27.0, 25 Nov 2026: values=[17] gave 0 hits of 40,002). So a whole number is sent as an integer
+    and other numbers as a float. (A real double precision column is the other way round: it refuses an integer term.
+    Number fields are never queried as a term on such a column.) Range bounds keep using normalize_value: float bounds
+    are correct for whole and fractional values.
+    """
+    v = normalize_value(value, field_type)
+    if isinstance(v, list):
+        v = v[0]
+    if field_type == "number" and isinstance(v, float) and v.is_integer():
+        return int(v)
+    return v
+
+
 def normalize_geo(value: Any) -> dict[str, float]:
     """
     Normalize a geo point to {"lat": .., "lon": ..}. Accepts a dict with lat/lon, a "lat,lon" string,

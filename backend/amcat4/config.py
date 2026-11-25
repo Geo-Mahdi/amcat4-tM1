@@ -88,6 +88,21 @@ class Settings(BaseSettings):
         ),
     ] = True
 
+    score_partition_condition: Annotated[
+        bool,
+        Field(
+            description=(
+                "On the fast read path, keep the SQL condition on partition_id when results are ordered by relevance. "
+                "Why: pg_search 0.27.0 returns a wrong top list (not the documents with the highest scores) when the "
+                "search condition is the only condition of the statement and the order is by score; with one more "
+                "plain condition the top list is correct (25 Nov 2026, 6 of 6 test queries wrong without it, 6 of 6 "
+                "correct with it). Other orders (date, sort columns, id) were correct and do not get the condition. "
+                "false = the statement of postgres-fast-v2, e.g. to test whether a new pg_search version still "
+                "needs this (AMCAT4_SCORE_PARTITION_CONDITION=false)"
+            ),
+        ),
+    ] = True
+
     filter_clauses: Annotated[
         bool,
         Field(

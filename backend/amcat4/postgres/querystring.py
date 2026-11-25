@@ -28,7 +28,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, Sequence
 
-from amcat4.postgres.fields import FieldInfo, FieldSet, QueryError, normalize_value
+from amcat4.postgres.fields import FieldInfo, FieldSet, QueryError, normalize_value, term_value
 
 Occur = Literal["must", "should", "must_not"]
 
@@ -417,11 +417,9 @@ def _compile_exact(node: Term | Phrase | Range, f: FieldInfo) -> dict:
             return range_query(f, value, value + "T23:59:59.999999", True, True)
         return range_query(f, value, value, True, True)
     try:
-        normalized = normalize_value(value, f.type)
+        normalized = term_value(value, f.type)
     except ValueError as e:
         raise QueryError(f"Invalid value for field {f.name}: {value!r}") from e
-    if isinstance(normalized, list):
-        normalized = normalized[0]
     return {"term": {"field": path, "value": normalized}}
 
 

@@ -109,7 +109,7 @@ def _equals_any(column: str, values: list[int]) -> tuple[sql.Composable, Any]:
     return sql.SQL("{} = ANY(%s)").format(sql.SQL(column)), list(values)
 
 
-def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False) -> CompiledSearch:
+def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False, by_score: bool = False) -> CompiledSearch:
     """
     Compile a search into a json query for the BM25 index plus SQL conditions.
 
@@ -136,11 +136,18 @@ def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False) -
     use_partition_table = fast and get_settings().fast_path and len(partitions) == 1 and "_id" not in filters and not query.ids
     project_cond, project_param = _equals_any("documents.project_pk", list(fieldset.project_pks))
     partition_cond, partition_param = _equals_any("documents.partition_id", partitions)
-    if use_partition_table:
-        # every row of documents_p<N> has partition_id N, so no partition condition is needed
-        base_clauses: list[sql.Composable] = []
-        base_params: list[Any] = []
+    if use_partition_table and by_score and get_settings().score_partition_condition:
+        # Ordered by relevance: keep the partition condition. Every row of documents_p<N> has partition_id N, so it
+        # selects nothing, but without any plain condition next to `@@@` pg_search 0.27.0 returns a wrong top list
+        # when ordering by score (see score_partition_condition in config.py)
+        base_clauses: list[sql.Composable] = [partition_cond]
+        base_params: list[Any] = [partition_param]
         table: sql.Composable = sql.SQL("{} AS documents").format(sql.Identifier(partition_table(partitions[0])))
+    elif use_partition_table:
+        # every row of documents_p<N> has partition_id N, so no partition condition is needed
+        base_clauses = []
+        base_params = []
+        table = sql.SQL("{} AS documents").format(sql.Identifier(partition_table(partitions[0])))
     else:
         base_clauses = [partition_cond, project_cond]
         base_params = [partition_param, project_param]
@@ -337,8 +344,10 @@ async def search(
     """
     from amcat4.postgres.documents import field_select
 
-    c = compile_search(fieldset, query, fast=not similar)
     scored = bool(query.queries)
+    # ordered by relevance: explicitly, or by default for a search with a query string
+    by_score = not keyset and not similar and (any(name == "_score" for name, _ in sort or []) or (scored and not sort))
+    c = compile_search(fieldset, query, fast=not similar, by_score=by_score)
     snippets = snippets or {}
 
     columns: list[sql.Composable] = [sql.SQL("documents.doc_id"), sql.SQL("documents.project_pk")]
