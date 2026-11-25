@@ -681,3 +681,87 @@ async def test_no_automatic_slot_while_it_is_cleared(index, monkeypatch):
     assert (await _slots(index))["count2"] == "sort_num1"
     await upload(index, [{"_id": "n1", "count2": 5}, {"_id": "n2", "count2": -1}])
     assert (await _sorted_ids(index, "count2", "asc"))[:2] == ["n2", "n1"]
+
+
+############ 5. lz4 for new values of exact_fields and stored_fields ############
+
+
+async def _compression_settings() -> dict[str, set[str]]:
+    """The compression setting ('l' = lz4, '' = the server's default) of the two columns, per table"""
+    from amcat4.postgres.connection import fetch_all
+
+    rows = await fetch_all(
+        """SELECT attrelid::regclass::text AS tbl, attcompression AS c FROM pg_attribute
+           WHERE attname IN ('exact_fields', 'stored_fields')
+             AND attrelid IN (SELECT 'documents'::regclass
+                              UNION ALL SELECT inhrelid FROM pg_inherits WHERE inhparent = 'documents'::regclass)"""
+    )
+    out: dict[str, set[str]] = {}
+    for row in rows:
+        out.setdefault(row["tbl"], set()).add(row["c"])
+    return out
+
+
+@pytest.mark.anyio
+async def test_lz4_for_new_json_values(index, monkeypatch):
+    """
+    With the switch on (the default, set at startup), new values of exact_fields and stored_fields are compressed with
+    lz4, on every partition; rows written before keep their compression (nothing is rewritten) and all rows read the
+    same. With the switch off, new values get the server's default again.
+    """
+    from amcat4.postgres.connection import connection, fetch_all
+    from amcat4.postgres.layout import ensure_json_compression
+    from amcat4.postgres.projects import project_pk
+    from amcat4.projects.documents import fetch_document
+
+    async def ensure() -> list[str]:
+        async with connection() as conn:
+            return await ensure_json_compression(conn)
+
+    async def compression() -> dict[str, tuple]:
+        rows = await fetch_all(
+            """SELECT doc_id, pg_column_compression(text_fields) AS text, pg_column_compression(exact_fields) AS exact,
+                      pg_column_compression(stored_fields) AS stored
+               FROM documents WHERE project_pk = %s""",
+            [await project_pk(index)],
+        )
+        return {row["doc_id"]: (row["text"], row["exact"], row["stored"]) for row in rows}
+
+    default = (await fetch_all("SHOW default_toast_compression"))[0]["default_toast_compression"]
+    if default == "lz4":
+        pytest.skip("the server's default compression is lz4 already")
+    settings = await _compression_settings()
+    assert len(settings) >= 2 and set().union(*settings.values()) == {"l"}  # (set when the tests started)
+
+    def doc(i: str) -> dict:
+        # values that postgres compresses (more than 2 kB, and repetitive)
+        return {
+            "_id": i,
+            "text": f"{i} " + "consectetur adipiscing elit " * 400,
+            "kw": f"{i} " + "lorem ipsum " * 400,
+            "obj": {"words": ["dolor sit amet"] * 400, "id": i},
+        }
+
+    fields = {"text": "text", "kw": "keyword", "obj": "object"}
+    # (with the switch off, uploads are as before: the text keeps the compression of the staging table, although
+    # text_fields is set to lz4 since migration 0002. exact_fields is written again by the trigger of migration 0004.)
+    try:
+        monkeypatch.setattr(get_settings(), "lz4_json_columns", False)
+        assert sorted(await ensure()) == sorted(settings)
+        assert set().union(*(await _compression_settings()).values()) == {""}
+        await upload(index, [doc("old")], fields=fields)  # type: ignore[arg-type]
+        assert await compression() == {"old": (default, default, default)}
+        monkeypatch.setattr(get_settings(), "lz4_json_columns", True)
+        assert sorted(await ensure()) == sorted(settings)
+        assert await ensure() == []  # nothing to change the second time
+        await upload(index, [doc("new")])
+        assert await compression() == {"old": (default, default, default), "new": ("lz4", "lz4", "lz4")}
+        # a merge writes new values: lz4 now, also for the old document
+        await upload(index, [doc("old")])
+        assert (await compression())["old"] == ("lz4", "lz4", "lz4")
+        for i in ("old", "new"):
+            assert await fetch_document(index, i) == {k: v for k, v in doc(i).items() if k != "_id"}
+    finally:
+        monkeypatch.setattr(get_settings(), "lz4_json_columns", True)
+        await ensure()
+    assert await _compression_settings() == settings

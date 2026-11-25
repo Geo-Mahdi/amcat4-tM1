@@ -270,6 +270,25 @@ class Settings(BaseSettings):
         ),
     ] = True
 
+    lz4_json_columns: Annotated[
+        bool,
+        Field(
+            description=(
+                "Compress new values of exact_fields and stored_fields with lz4 instead of postgres' default "
+                "(pglz), as text_fields since migration 0002, and give the staging table of uploads the same "
+                "settings. Set at startup on the documents table and its partitions; existing rows are not "
+                "rewritten and keep their compression. "
+                "Why: lz4 is faster to compress and to read. An uploaded value kept the compression of the "
+                "staging table (pglz), so until now uploaded texts were not lz4 either (seen with "
+                "pg_column_compression, 25 Nov 2026). Postgres only compresses values of about 2 kB and more, so "
+                "for exact_fields and stored_fields this matters for documents with much metadata or large "
+                "objects. The effect on speed is not measured. Skipped with a warning if the server has no lz4. "
+                "false = the server's default for new values of the two columns, and uploads as before "
+                "(AMCAT4_LZ4_JSON_COLUMNS=false)"
+            ),
+        ),
+    ] = True
+
     sort_slot_job_rows: Annotated[
         int,
         Field(

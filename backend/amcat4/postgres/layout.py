@@ -19,6 +19,8 @@ Documents:
     - exact_fields:  untokenized fields (keyword, tag, url, number, integer, boolean, date, geo_point, multimedia
                      paths), stored as fast (columnar) fields for filtering, sorting and aggregation
     - stored_fields: values that are stored but not indexed (object)
+  New values of exact_fields and stored_fields are compressed with lz4 too (AMCAT4_LZ4_JSON_COLUMNS, set at startup
+  by ensure_json_compression, not by a migration; postgres only compresses values of about 2 kB and more).
 - Vectors are stored in the document_vectors table (pgvector), with a vector index per field.
 - A BM25 index covers partition_id, project_pk, the standard columns and sort slots (see below), text_fields and
   exact_fields. New fields are new json keys, so adding a field never requires rebuilding the index.
@@ -81,6 +83,7 @@ import logging
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import AsyncGenerator, Callable
 
+import psycopg
 from psycopg import AsyncConnection, sql
 from psycopg.errors import LockNotAvailable
 from psycopg.pq import TransactionStatus
@@ -337,6 +340,52 @@ async def create_partition(conn: AsyncConnection, partition_id: int, lock_timeou
             sql.SQL("ALTER TABLE documents ATTACH PARTITION {} FOR VALUES IN ({})").format(table, sql.Literal(partition_id))
         )
         await conn.execute("SET LOCAL lock_timeout = DEFAULT")
+
+
+# The json columns whose compression AMCAT4_LZ4_JSON_COLUMNS sets (text_fields has lz4 since migration 0002)
+LZ4_COLUMNS = ("exact_fields", "stored_fields")
+
+
+async def ensure_json_compression(conn: AsyncConnection, lock_timeout: str = "5s") -> list[str]:
+    """
+    Set the compression of new values of exact_fields and stored_fields to lz4 (AMCAT4_LZ4_JSON_COLUMNS, the
+    default), or back to the server's default (false), on documents and every partition that has another setting.
+    Returns the tables that were changed. Called at startup, after the migrations; it only reads the catalog when
+    nothing has to change.
+    Only new values: SET COMPRESSION does not rewrite existing rows, which keep their compression and stay readable.
+    New partitions copy the setting of documents (create_partition, INCLUDING COMPRESSION).
+    If a table cannot be changed (the server has no lz4, or the table stays locked for lock_timeout), a warning is
+    logged, nothing else changes, and the next start tries again.
+    """
+    wanted = "l" if get_settings().lz4_json_columns else ""
+    cur = await conn.execute(
+        """SELECT a.attrelid::regclass::text AS tbl FROM pg_attribute a
+           WHERE a.attname = ANY(%s) AND a.attcompression <> %s
+             AND a.attrelid IN (SELECT 'documents'::regclass
+                                UNION ALL SELECT inhrelid FROM pg_inherits WHERE inhparent = 'documents'::regclass)
+           GROUP BY 1 ORDER BY 1""",
+        [list(LZ4_COLUMNS), wanted],
+    )
+    method = sql.SQL("lz4" if wanted else "default")
+    changed = []
+    for row in await cur.fetchall():
+        table = row["tbl"]  # type: ignore[index, call-overload]
+        alter = sql.SQL("ALTER TABLE {} {}").format(
+            sql.SQL(table),  # (regclass text: quoted where needed, as in the migrations)
+            sql.SQL(", ").join(
+                sql.SQL("ALTER COLUMN {} SET COMPRESSION {}").format(sql.Identifier(c), method) for c in LZ4_COLUMNS
+            ),
+        )
+        try:
+            async with conn.transaction():
+                # (an exclusive lock, for a catalog change only; with a timeout, so a long query cannot make every
+                # other query on documents wait behind this statement)
+                await conn.execute(sql.SQL("SET LOCAL lock_timeout = {}").format(sql.Literal(lock_timeout)))
+                await conn.execute(alter)
+            changed.append(table)
+        except psycopg.Error as e:
+            logging.warning(f"Could not set {method.as_string(None)} compression on {table} ({e}); keeping it as it is")
+    return changed
 
 
 async def assign_partition(conn: AsyncConnection) -> int:
