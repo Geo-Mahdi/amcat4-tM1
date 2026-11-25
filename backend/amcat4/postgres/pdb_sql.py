@@ -34,6 +34,7 @@ Rules that come from pg_search 0.27.0 (tested 25 Nov 2026):
 
 import json
 import logging
+import math
 import re
 from typing import Any
 
@@ -95,6 +96,8 @@ class _Renderer:
                 raise NotRenderable(f"number {value!r}")
             return self.param(value, "bigint")
         if isinstance(value, float):
+            if not math.isfinite(value):
+                raise NotRenderable(f"number {value!r}")  # (an error in the legacy form: not valid json)
             return self.param(value, "float8")
         if isinstance(value, str):
             return self.param(value, "text")
@@ -250,7 +253,8 @@ class _Renderer:
             # work: the same range as in the legacy form, but on the json key like every other predicate.
             # The bounds are data inside a json text made here, sent as a parameter.
             bounds = {"lower_bound": q.get("lower_bound"), "upper_bound": q.get("upper_bound")}
-            return "@@@", self.param(json.dumps({"range": bounds}), "pdb.query")
+            # (allow_nan=False: with a text that is not valid json, pdb.query would read the text as a query string)
+            return "@@@", self.param(json.dumps({"range": bounds}, allow_nan=False), "pdb.query")
         raise NotRenderable("range with bounds of several types")
 
     def pg_range(self, function: str, pgtype: str, lower, upper, comparable) -> sql.Composable:

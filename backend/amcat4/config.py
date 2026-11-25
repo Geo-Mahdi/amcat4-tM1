@@ -112,8 +112,9 @@ class Settings(BaseSettings):
                 "pdb.snippet_positions. "
                 "Why: ParadeDB deprecated the legacy json objects and will remove them (no date yet). AmCAT's own "
                 "query parser, filters and aggregations do not change: only the statement that is sent does "
-                "(amcat4/postgres/pdb_sql.py). Hits, counts, scores and the relevance order are the same in both "
-                "formats (tests/test_new_query_api.py). "
+                "(amcat4/postgres/pdb_sql.py). Hits and counts are the same in both formats; scores are the same up to "
+                "the last digit of a 32-bit float, so two documents with nearly the same score can change places "
+                "(tests/test_new_query_api.py). "
                 "false (the default for now) = the legacy json objects, as before "
                 "(AMCAT4_NEW_QUERY_API=true switches to the new API; see docs/postgres-fast-v3/NEW_QUERY_API.md)"
             ),

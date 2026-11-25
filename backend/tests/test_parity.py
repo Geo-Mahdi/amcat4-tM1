@@ -27,6 +27,7 @@ from amcat4.config import get_settings
 from amcat4.models import FieldSpec, FilterSpec, ProjectSettings, SortSpec
 from amcat4.postgres import cutoff_sort
 from amcat4.postgres.connection import connection
+from amcat4.postgres.pdb_sql import score_sql
 from amcat4.postgres.search import SearchQuery, compile_search
 from amcat4.projects.index import create_project_index, delete_project_index
 from amcat4.projects.query import query_documents
@@ -270,10 +271,11 @@ async def _reference_by_score(queries: dict[str, str], filters: dict[str, dict],
     c = compile_search(
         fieldset, SearchQuery(queries=queries, filters={k: FilterSpec(**v) for k, v in filters.items()} or None)
     )
+    # (score_sql: paradedb.score, or pdb.score with AMCAT4_NEW_QUERY_API=true)
     stmt = sql.SQL(
-        "WITH hits AS MATERIALIZED (SELECT documents.id, documents.doc_id, paradedb.score(documents.id) AS s "
+        "WITH hits AS MATERIALIZED (SELECT documents.id, documents.doc_id, {} AS s "
         "FROM {} WHERE {}) SELECT doc_id FROM hits ORDER BY s DESC, id LIMIT {}"
-    ).format(c.table, c.where, sql.Literal(limit))
+    ).format(score_sql(), c.table, c.where, sql.Literal(limit))
     async with connection() as conn:
         cur = await conn.execute(stmt, c.params)
         return [row["doc_id"] for row in await cur.fetchall()]  # type: ignore[index, call-overload]

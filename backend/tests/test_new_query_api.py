@@ -19,6 +19,7 @@ import random
 from contextlib import contextmanager
 from typing import Any
 
+import psycopg
 import pytest
 from psycopg import sql
 
@@ -216,7 +217,9 @@ def _same_order(ids: list[str], new_ids: list[str], scores: dict[str, float | No
     return len(ids) == len(new_ids) and all(a == b or _close(scores[a], scores[b]) for a, b in zip(ids, new_ids))
 
 
-async def compare(index, queries=None, filters=None, queryable=None, sorts=((),), count_is_hits=True, exact=False) -> int:
+async def compare(
+    index, queries=None, filters=None, queryable=None, sorts=((),), count_is_hits=True, exact=False, retry=True
+) -> int:
     """
     Run the search in both formats and compare all hits, their scores, the count and the first pages in every given
     sort order (() is the default order: relevance with a query string, else the order of storing).
@@ -241,6 +244,13 @@ async def compare(index, queries=None, filters=None, queryable=None, sorts=((),)
         assert new_hits == hits and new_n == n and new_pages == pages, f"{what}: another error"
         return 0
     assert [h[:2] for h in new_hits] == [h[:2] for h in hits], f"{what}: other hits ({len(new_hits)} and {len(hits)})"
+    if retry and not all(_close(a[2], b[2]) for a, b in zip(hits, new_hits)):
+        # The scores depend on the state of the index (deleted rows count until segments are merged, and
+        # merging runs in the background). If the legacy scores themselves changed in the meantime, compare again.
+        with query_api(False):
+            again = await _run(_all_hits, index, queries, filters, queryable)
+        if again != hits:
+            return await compare(index, queries, filters, queryable, sorts, count_is_hits, exact, retry=False)
     if exact:
         assert new_hits == hits, f"{what}: other scores"
     assert all(_close(a[2], b[2]) for a, b in zip(hits, new_hits)), f"{what}: other scores"
@@ -654,7 +664,7 @@ async def test_sorts(projects, monkeypatch):
     for queries, filters in (
         ({"q": "w1 w2"}, None),
         (None, {"num": {"gt": -3}}),
-        ({"q": "w1 OR econ*"}, {"kw": {"exists": True}, "date": {"gte": "2012-01-01"}}),
+        ({"q": "(w1 AND w2) OR (w1 AND econ*)"}, {"kw": {"exists": True}, "date": {"gte": "2012-01-01"}}),
     ):
         assert await compare(A, queries, filters, sorts=sorts) > 30
     # the cutoff sort gave the page as often in the new format as in the legacy one
@@ -669,7 +679,15 @@ async def test_sorts(projects, monkeypatch):
 async def test_highlight_and_snippets(projects):
     """Highlighting and snippets use the match positions of pg_search: the same text in both formats"""
     fields = [FieldSpec(name="title"), FieldSpec(name="text", snippet=SnippetParams(nomatch_words=5, max_matches=2))]
-    for q in ("w1 w2", '"w1 w2"~2', "econ* OR title:w5", "ecnoomy~1 w3", '"house of repr*" OR w4^2'):
+    queries = (
+        "w1 w2",
+        '"w1 w2"~2',
+        "econ* OR title:w5",
+        "ecnoomy~1 w3",
+        '"house of repr*" OR w4^2',
+        "(w1 AND w2) OR (w1 AND w3)",
+    )
+    for q in queries:
         results = []
         for new in (False, True):
             with query_api(new):
@@ -704,7 +722,7 @@ async def test_aggregations(projects, monkeypatch, small_result):
             ({"q": "w1 OR w2"}, None),
             (None, {"num": {"gte": 0.1, "lt": 18}, "tags": {"exists": True}}),
             (
-                {"a": "w1", "b": "title:w3 AND NOT w5"},
+                {"a": "w1", "b": "w1 AND NOT title:w5"},
                 {"date": {"gte": "2012-06-01"}, "kw": {"values": ["alpha", "Beta", "10"]}},
             ),
         ):
@@ -754,7 +772,8 @@ async def test_update_and_delete_by_query():
     await create_project_index(ProjectSettings(id=name))
     try:
         await upload(name, make_docs(298, 9), fields=FIELDS)  # type: ignore[arg-type]
-        queries, filters = {"q": "w1 OR title:w2"}, {"num": {"gt": 0.05}, "kw": {"exists": True}}
+        # (with a word in two branches: a marked copy, see pdb_sql._Renderer.distinct)
+        queries, filters = {"q": "(w1 AND w2) OR (w1 AND title:w3) OR w4"}, {"num": {"gt": 0.05}, "kw": {"exists": True}}
         for new in (False, True):
             with query_api(new):
                 done = await update_tag_query(name, "add", "tags", "new" if new else "legacy", queries, _specs(filters))
@@ -1013,6 +1032,9 @@ def test_render_ranges():
         {"match": {"value": "a"}},
         {"term": {"field": "exact_fields.f2", "value": None}},
         {"term": {"field": "exact_fields.f2", "value": 2**70}},
+        {"term": {"field": "exact_fields.f2", "value": float("nan")}},
+        {"range": {"field": "exact_fields.f2", "lower_bound": {"included": float("inf")}, "upper_bound": None}},
+        {"range": {"field": "exact_fields.f2", "lower_bound": {"included": 0.5}, "upper_bound": {"included": float("nan")}}},
         {"range": {"field": "exact_fields.f2", "lower_bound": None, "upper_bound": None}},
         {"range": {"field": "exact_fields.f2", "lower_bound": {"included": 1}, "upper_bound": {"included": "a"}}},
         {"range": {"field": "exact_fields.f2", "lower_bound": {"from": 1}, "upper_bound": None}},
@@ -1034,6 +1056,22 @@ def test_not_renderable(query, monkeypatch):
         condition, params = search_condition(query)
     assert condition.as_string(None) == '"documents".id @@@ %s::jsonb' and params[0].obj == query
     assert len(warnings) == 1
+
+
+async def test_numbers_that_are_not_json(projects, monkeypatch):
+    """
+    "nan" and "inf" as a number: not valid json, so the legacy format gives a database error. The new format has no
+    form for them and sends the legacy one: the same error (and never a text that pdb.query reads as a query string)
+    """
+    monkeypatch.setattr(pdb_sql.logging, "warning", lambda *args, **kwargs: None)
+    for filters in ({"num": {"values": ["nan"]}}, {"num": {"gt": "inf"}}, {"num": {"gte": "-inf", "lt": "nan"}}):
+        errors = []
+        for new in (False, True):
+            with query_api(new):
+                with pytest.raises(psycopg.Error) as e:
+                    await _count(A, None, filters)
+                errors.append(type(e.value))
+        assert errors[0] == errors[1] == psycopg.errors.InvalidTextRepresentation
 
 
 def test_switch_off_is_the_legacy_form(monkeypatch):
@@ -1065,7 +1103,8 @@ async def _plan(statement: sql.Composable, params: list) -> str:
 def _shape(plan: str) -> list[str]:
     """The nodes of a plan and how pg_search runs its scan, without the query itself"""
     keep = ("Scan", "Exec Method", "TopK", "Sort", "Limit", "Aggregate", "Gather", "Append", "Filter")
-    return [line.strip() for line in plan.splitlines() if any(k in line for k in keep) and "Tantivy Query" not in line]
+    lines = [line.strip() for line in plan.splitlines() if any(k in line for k in keep)]
+    return [line for line in lines if "Tantivy Query" not in line and "query=" not in line]
 
 
 async def test_plans(projects):
@@ -1130,6 +1169,42 @@ async def test_plans(projects):
             assert "TopKScanExecState" in text, (name, shape[True])
         if name.endswith(("count", "terms aggregation")):
             assert "ParadeDB Aggregate Scan" in text, (name, shape[True])
+
+
+async def test_prepared_statements(projects):
+    """
+    With a generic plan (a prepared statement that postgres plans once, without the values of its parameters:
+    AMCAT4_CUSTOM_PLANS=false) pg_search gets the values of the new format when the statement starts. Same results.
+    """
+    fieldset = await get_fieldset([A, B])
+    filters = _specs({"num": {"gt": 0.5}, "date": {"gte": "2012-01-01"}, "kw": {"values": ["alpha", "Beta"]}})
+    for words in (("w1", "w2", "w3"), ("economy", "w5", "w1")):
+        results: dict[bool, list] = {False: [], True: []}
+        for new in (False, True):
+            with query_api(new):
+                async with connection() as conn:
+                    await conn.execute("SET plan_cache_mode = force_generic_plan")
+                    try:
+                        for word in words:
+                            queries = {"a": f'{word} OR "w1 w2"~2^2', "b": f"title:{word} AND NOT w9"}
+                            c = compile_search(
+                                fieldset, SearchQuery(queries=queries, filters=filters), fast=True, by_score=True
+                            )
+                            top = sql.SQL(
+                                "SELECT documents.doc_id, {s} AS s FROM {t} WHERE {w} ORDER BY {s} DESC, documents.id LIMIT 20"
+                            )
+                            for statement in (
+                                top.format(s=pdb_sql.score_sql(), t=c.table, w=c.where),
+                                sql.SQL("SELECT count(*) AS n FROM {} WHERE {}").format(c.table, c.where),
+                            ):
+                                cur = await conn.execute(statement, c.params, prepare=True)
+                                results[new].append([tuple(row.values()) for row in await cur.fetchall()])  # type: ignore[union-attr]
+                    finally:
+                        await conn.execute("RESET plan_cache_mode")
+        assert len(results[True]) == 6 and all(r for r in results[True])
+        for legacy, new_rows in zip(results[False], results[True]):
+            assert [row[0] for row in new_rows] == [row[0] for row in legacy]
+            assert all(_close(a[-1], b[-1]) for a, b in zip(legacy, new_rows) if len(a) == 2)
 
 
 # ---------------------------------------------------------------- why some predicates are written as they are
