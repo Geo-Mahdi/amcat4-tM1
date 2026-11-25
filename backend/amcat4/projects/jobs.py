@@ -40,7 +40,7 @@ from amcat4.postgres.fields import FIELD_COLUMNS, FieldInfo, FieldSet, quarter_s
 from amcat4.postgres.layout import project_filter, writing
 from amcat4.postgres.projects import project_partitions, project_pk
 from amcat4.postgres.search import SearchQuery, compile_search
-from amcat4.projects import maintenance, partitions, releases
+from amcat4.projects import label_jobs, maintenance, partitions, releases
 
 BATCH_SIZE = 2000
 # Documents per transaction when filling a sort slot or adding quarter keys. Every transaction adds a segment to the
@@ -571,9 +571,11 @@ HANDLERS: dict[str, Callable[[Job], Awaitable[dict[str, Any]]]] = {
     "vacuum": maintenance.vacuum_job,
     "move_project": partitions.move_project_job,
     "purge_releases": releases.purge_job,
+    "backfill_labels": label_jobs.backfill_labels_job,
 }
 
 PERIODIC: dict[str, PeriodicTask] = {
     "partition_maintenance": PeriodicTask(interval=maintenance.CHECK_INTERVAL, run=maintenance.check_partitions),
     "quarter_backfill": PeriodicTask(interval=timedelta(minutes=1), run=schedule_quarter_backfill),
+    "label_backfill": PeriodicTask(interval=timedelta(minutes=1), run=label_jobs.schedule_label_backfill),
 }

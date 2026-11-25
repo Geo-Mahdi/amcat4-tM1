@@ -24,6 +24,7 @@ from amcat4.models import FilterSpec, SnippetParams
 from amcat4.postgres.connection import spare_connection
 from amcat4.postgres.fields import FieldInfo, FieldSet, QueryError
 from amcat4.postgres.filters import compile_filters, field_sql
+from amcat4.postgres.labels import page_values
 from amcat4.postgres.layout import partition_table
 from amcat4.postgres.querystring import highlight_patterns, match_positions, parse_query, query_string_to_json
 from amcat4.postgres.snippets import byte_to_char_positions, make_snippet
@@ -368,8 +369,13 @@ async def search(
     # fields that do not exist (in any of the projects) are simply not returned
     fields = [name for name in fields if name in fieldset.by_name]
     snippets = {name: s for name, s in snippets.items() if name in fieldset.by_name}
+    label_fields: list[FieldInfo] = []
     for name in dict.fromkeys([*fields, *snippets.keys()]):
         for f in fieldset.by_name[name]:
+            if f.in_labels:
+                # tags in the label table: read for the documents of the page with one extra statement (below)
+                label_fields.append(f)
+                continue
             columns.append(sql.SQL("{} AS {}").format(field_select(f), sql.Identifier(f.key)))
             if scored and f.type == "text" and (name in snippets or highlight):
                 columns.append(
@@ -380,6 +386,8 @@ async def search(
     if scored:
         columns.append(sql.SQL("paradedb.score(documents.id) AS _score"))
     columns.append(sql.SQL("documents.id AS _internal_id"))
+    if label_fields:
+        columns.append(sql.SQL("documents.doc_pk AS _doc_pk"))
 
     where, params = c.where, list(c.params)
     join: sql.Composable = sql.SQL("")
@@ -462,6 +470,8 @@ async def search(
     else:
         rows = await page_rows()
 
+    label_values = await page_values(conn, label_fields, [row["_doc_pk"] for row in rows]) if label_fields else {}  # type: ignore[index, call-overload]
+
     # Patterns to find query matches for highlighting / snippets (combined with the positions reported by pg_search,
     # which does not report positions for all query types)
     nodes = [parse_query(q) for q in (query.queries or {}).values()]
@@ -479,7 +489,10 @@ async def search(
             f = project_fields.get(name)
             if f is None:
                 continue
-            value = row[f.key]  # type: ignore[index, call-overload]
+            if f.in_labels:
+                value = label_values.get((row["_doc_pk"], f.pk))  # type: ignore[index, call-overload]
+            else:
+                value = row[f.key]  # type: ignore[index, call-overload]
             positions = None
             if isinstance(value, str) and nodes and (name in snippets or highlight):
                 positions = byte_to_char_positions(value, row.get("_pos_" + f.key)) or []  # type: ignore[union-attr]

@@ -12,6 +12,7 @@ from typing import Any
 from psycopg import sql
 
 from amcat4.models import FilterSpec
+from amcat4.postgres import labels
 from amcat4.postgres.fields import DATE_DERIVED, FieldInfo, FieldSet, QueryError, normalize_value, term_value
 from amcat4.postgres.querystring import range_query
 
@@ -23,6 +24,9 @@ def field_sql(f: FieldInfo, table: str = "documents") -> sql.Composable:
         raw = sql.SQL("{}.{}#>>{}::text[]").format(sql.Identifier(table), sql.Identifier(f.column), path)
     else:
         raw = sql.SQL("{}.{}->>{}").format(sql.Identifier(table), sql.Identifier(f.column), sql.Literal(f.key))
+    if f.in_labels:
+        # (the text of the json array of the values, as for a tag field in json)
+        return sql.SQL("{}::text").format(labels.values_select(f))
     match f.type:
         case "number" | "integer":
             return sql.SQL("({})::numeric").format(raw)
@@ -58,8 +62,21 @@ def compile_filters(filters: dict[str, FilterSpec], fieldset: FieldSet) -> Compi
     out = CompiledFilters()
     for name, spec in filters.items():
         json_alternatives, sql_alternatives = [], []
-        for f in fieldset.resolve(name):
+        fs = fieldset.resolve(name)
+        mixed = len({f.in_labels for f in fs}) > 1
+        for f in fs:
             json_clauses, sql_clauses = _compile_filter(f, spec)
+            if mixed:
+                # Tags of some projects are in the label table (SQL conditions) and of others in json: the rule below
+                # ("OR the json parts and the sql parts separately") then needs the project in both parts. The json
+                # part lets every document of a label project through, and the SQL part decides about those.
+                pk = next(pk for pk, fields in fieldset.project_fields.items() if fields.get(f.name) is f)
+                in_project = sql.SQL("documents.project_pk = {}").format(sql.Literal(pk))
+                if f.in_labels:
+                    json_clauses = [{"term": {"field": "project_pk", "value": pk}}]
+                    sql_clauses = [in_project, *sql_clauses]
+                else:
+                    sql_clauses = [in_project]
             json_alternatives.append(_all_of_json(json_clauses))
             sql_alternatives.append(sql.SQL(" AND ").join(sql_clauses) if sql_clauses else None)
         if any(sql_alternatives):
@@ -92,6 +109,13 @@ def _compile_filter(f: FieldInfo, spec: FilterSpec) -> tuple[list[dict], list[sq
     values = d.pop("values", None)
     if "value" in d:
         values = (values or []) + [d.pop("value")]
+    if f.in_labels:
+        # a tag field whose values are rows of doc_labels: plain SQL conditions (see amcat4.postgres.labels)
+        bounds = {k: d.pop(k) for k in ("gt", "gte", "lt", "lte") if k in d}
+        sql_clauses = labels.filter_clauses(f, values, bounds, d.pop("exists", None))
+        if d:
+            raise QueryError(f"Unknown filter type(s): {d}")
+        return [], sql_clauses
     if values is not None:
         if f.type == "text":
             clauses.append({"boolean": {"should": [{"match": {"field": f.path, "value": str(v)}} for v in values]}})

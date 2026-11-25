@@ -15,6 +15,7 @@ from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
 from amcat4.errors import ConflictError
+from amcat4.postgres import labels
 from amcat4.postgres.fields import (
     DATE_DERIVED,
     SLOT_TYPES,
@@ -77,6 +78,8 @@ class SplitDocument:
         self.columns: dict[str, dict[str, Any]] = {"text_fields": {}, "exact_fields": {}, "stored_fields": {}}
         self.standard: dict[str, Any] = {c: None for c in STANDARD_COLUMNS}
         self.vectors: dict[int, list[float]] = {}
+        # field pk -> values, for tag fields whose values are rows of the label table (not in the json columns)
+        self.labels: dict[int, list[str]] = {}
         for name, value in document.items():
             if name == "_id":
                 continue
@@ -88,6 +91,9 @@ class SplitDocument:
             try:
                 if f.column == "vector":
                     self.vectors[f.pk] = normalize_value(value, f.type)
+                    continue
+                if f.in_labels:
+                    self.labels[f.pk] = labels.unique_values(normalize_value(value, f.type))
                     continue
                 values = stored_values(f, value)
             except (ValueError, TypeError) as e:
@@ -193,6 +199,20 @@ _REPLACE = (
 _LIVE = "d.retired_seq = 9223372036854775807"
 
 
+async def fields_are_current(conn: AsyncConnection, project_pk: int, fields: Iterable[FieldInfo]) -> None:
+    """
+    Call inside the write lock, before writing tags into the json: the backfill_labels job may have moved a tag field
+    to the label table after this request read the field definitions (the job holds the write lock exclusively, so
+    from here on it cannot happen any more). Then the write is refused; the next try reads the new definitions.
+    """
+    in_json = [f.pk for f in fields if f.type == "tag" and not f.in_labels]
+    if not in_json:
+        return
+    cur = await conn.execute("SELECT 1 FROM fields WHERE pk = ANY(%s) AND label_table LIMIT 1", [in_json])
+    if await cur.fetchone() is not None:
+        raise ConflictError(f"The tag fields of project {project_pk} were just moved to the label table; please try again")
+
+
 def _examples(rows: Sequence[Any], key: str = "doc_id") -> str:
     ids = [str(r[key]) for r in rows[:5]]
     return ", ".join(ids) + (f" (and {len(rows) - 5} more)" if len(rows) > 5 else "")
@@ -221,6 +241,7 @@ async def upload_documents(
     async with conn.transaction():
         project = [await partition_of(conn, project_pk), project_pk]
         w = await write_seq(conn, project_pk)
+        await fields_are_current(conn, project_pk, fields.values())
         await conn.execute(_STAGING)  # type: ignore[arg-type]
         async with conn.cursor().copy(
             "COPY staging_documents (rn, doc_id, new_doc_id, text_fields, exact_fields, stored_fields, copied_from, "
@@ -330,6 +351,26 @@ async def upload_documents(
             if vector_rows:
                 await store_vectors(conn, project_pk, vector_rows)
 
+        # Tags in the label table: one staged row per (document, field) whose values this upload sets. A replace
+        # sets every field (a field that is not given loses its values), the other operations only the given fields
+        label_fields = [f for f in fields.values() if f.in_labels]
+        if label_fields:
+            await labels.stage(conn)
+            async with conn.cursor().copy("COPY staging_labels (rn, field_pk, vals) FROM STDIN") as copy:
+                for rn, d in enumerate(split):
+                    for f in label_fields:
+                        if f.pk in d.labels or op_type == "replace":
+                            await copy.write_row([rn, f.pk, d.labels.get(f.pk, [])])
+            await conn.execute(
+                f"""UPDATE staging_labels sl SET doc_pk = coalesce(d.doc_pk, d.id)
+                    FROM staging_documents s JOIN documents d
+                      ON d.partition_id = %s AND d.project_pk = %s AND {_LIVE}
+                         AND d.doc_id = coalesce(s.target_doc_id, s.doc_id, s.new_doc_id)
+                    WHERE s.rn = sl.rn""",  # type: ignore[arg-type]
+                project,
+            )
+            await labels.apply_staged(conn, project_pk, w)
+
     return {"created": len(created), "updated": len(updated)}
 
 
@@ -372,6 +413,9 @@ async def delete_field_values(conn: AsyncConnection, project_pk: int, f: FieldIn
     if f.column == "vector":
         await conn.execute("DELETE FROM document_vectors WHERE field_pk = %s", [f.pk])
         await conn.execute(sql.SQL("DROP INDEX IF EXISTS {}").format(sql.Identifier(f"document_vectors_f{f.pk}")))
+        return
+    if f.in_labels:
+        await labels.delete_field(conn, f)
         return
     column = sql.Identifier(f.column)
     sort = sql.SQL(", {} = NULL").format(sql.Identifier(f.sort_column)) if f.sort_column else sql.SQL("")
@@ -503,6 +547,8 @@ def field_select(f: FieldInfo) -> sql.Composable:
     """SQL expression to select the value of a field"""
     if f.column == "vector":
         return vector_select(f)
+    if f.in_labels:
+        return labels.values_select(f)
     return sql.SQL("documents.{}->{}").format(sql.Identifier(f.column), sql.Literal(f.key))
 
 
@@ -556,16 +602,23 @@ async def copy_batch(
             raise ValueError(f"Cannot copy {s.name} ({s.type}) to {d.name} ({d.type})")
 
     def remap(column: str) -> str:
+        # (tag fields in the label table are not in the json: see the labels below)
         pairs = [
             (s_key, d_key)
             for s, d in field_map.items()
-            if s.column == column
+            if s.column == column and not s.in_labels and not d.in_labels
             for s_key, d_key in zip(stored_keys(s), stored_keys(d))
         ]
-        if not pairs:
+        args = [f"'{d_key}', {column}->'{s_key}'" for s_key, d_key in pairs]
+        # from the label table of the source to a json tag field of the destination
+        args += [
+            f"'{d.key}', to_jsonb({labels.values_array(s).as_string(conn)})"
+            for s, d in field_map.items()
+            if s.column == column and s.in_labels and not d.in_labels
+        ]
+        if not args:
             return "'{}'::jsonb"
-        args = ", ".join(f"'{d_key}', {column}->'{s_key}'" for s_key, d_key in pairs)
-        return f"jsonb_strip_nulls(jsonb_build_object({args}))"
+        return f"jsonb_strip_nulls(jsonb_build_object({', '.join(args)}))"
 
     def sort_value(slot_column: str) -> str:
         # The value for a slot column of the destination: from the source field's slot column if that is filled and
@@ -600,6 +653,25 @@ async def copy_batch(
         copied = [row["id"] for row in await cur.fetchall()]  # type: ignore[index, call-overload]
         if any(f.unique for f in dest_fields.values()):
             await update_dedup_hashes(conn, to_project_pk, dest_fields, copied)
+        for s, d in field_map.items():
+            if not d.in_labels:
+                continue
+            # to a tag field in the label table (from json or from labels): as an upload that sets the field for the
+            # documents that have values in the source (a document without values keeps what it has, as _MERGE does)
+            await labels.stage(conn)
+            await conn.execute(
+                sql.SQL(
+                    """INSERT INTO staging_labels (rn, doc_pk, field_pk, vals)
+                       SELECT 0, coalesce(new.doc_pk, new.id), {field}, src.vals
+                       FROM documents old
+                       JOIN documents new ON new.partition_id = %s AND new.project_pk = %s AND new.doc_id = old.doc_id
+                                             AND {live}
+                       CROSS JOIN LATERAL (SELECT {values} AS vals) src
+                       WHERE old.partition_id = %s AND old.project_pk = %s AND old.id = ANY(%s) AND src.vals IS NOT NULL"""
+                ).format(field=sql.Literal(d.pk), live=live("new"), values=labels.values_array(s, "old")),
+                [*to_project, *from_project, ids],
+            )
+            await labels.apply_staged(conn, to_project_pk, w)
         for s, d in field_map.items():
             if s.column != "vector":
                 continue
@@ -647,6 +719,17 @@ async def update_tag_by_query(
     for f in fieldset.by_name[field]:
         if f.type != "tag":
             raise ValueError(f"Field {field} is not a tag field")
+        if f.in_labels:
+            # the tag is a row of the label table: no document row is written (and so nothing is indexed again)
+            pk = _project_of_field(fieldset, f)
+            where = sql.SQL("{} AND {}").format(c.where, _project_condition(fieldset, f))
+            async with conn.transaction():
+                w = await write_seq(conn, pk)
+                if action == "add":
+                    updated += await labels.add_by_query(conn, pk, f, str(tag), where, c.params, w)
+                else:
+                    updated += await labels.remove_by_query(conn, f, str(tag), where, c.params, w)
+            continue
         key = sql.Literal(f.key)
         # existing values can be a single string (e.g. after changing a keyword field to a tag field)
         current = sql.SQL(
@@ -668,6 +751,7 @@ async def update_tag_by_query(
             )
             params = [tag, tag, *c.params, tag]
         project = _project_condition(fieldset, f)
+        await fields_are_current(conn, _project_of_field(fieldset, f), [f])
         w = await write_seq(conn, _project_of_field(fieldset, f))
         update = stmt.format(key=key, current=current, where=c.where, project=project, version=version_assignments(w))
         cur = await conn.execute(versioned_update(update, w), params)
@@ -685,6 +769,14 @@ async def update_by_query(conn: AsyncConnection, fieldset: FieldSet, query: "Sea
     for f in fieldset.by_name[field]:
         if f.column == "vector":
             raise ValueError("Cannot update vector fields by query")
+        if f.in_labels:
+            pk = _project_of_field(fieldset, f)
+            where = sql.SQL("{} AND {}").format(c.where, _project_condition(fieldset, f))
+            values = [] if value is None else labels.unique_values(normalize_value(value, f.type))
+            async with conn.transaction():
+                w = await write_seq(conn, pk)
+                updated += await labels.set_by_query(conn, pk, f, values, where, c.params, w)
+            continue
         column = sql.Identifier(f.column)
         sort = sql.SQL(", {} = %s").format(sql.Identifier(f.sort_column)) if f.sort_column else sql.SQL("")
         project = _project_condition(fieldset, f)
@@ -708,6 +800,7 @@ async def update_by_query(conn: AsyncConnection, fieldset: FieldSet, query: "Sea
         pk = _project_of_field(fieldset, f)
         async with conn.transaction():
             w = await write_seq(conn, pk)
+            await fields_are_current(conn, pk, [f])
             update = stmt.format(col=column, sort=sort, where=c.where, project=project, version=version_assignments(w))
             cur = await conn.execute(versioned_update(update, w), [*params, *c.params])
             updated += cur.rowcount
@@ -753,6 +846,8 @@ async def convert_field(conn: AsyncConnection, project_pk: int, old: FieldInfo, 
     transaction) if a value cannot be converted.
     """
     await _refuse_with_releases(conn, project_pk, "change the type of a field")
+    if old.in_labels:
+        raise ValueError(f"Cannot change the type of tag field {old.name}: its values are in the label table")
     project = await project_filter(conn, project_pk)
     if (old.column == "vector") != (new.column == "vector"):
         cur = await conn.execute(

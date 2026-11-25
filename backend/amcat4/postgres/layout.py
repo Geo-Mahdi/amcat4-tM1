@@ -57,6 +57,15 @@ Documents:
   field, and a keyword field called "source", are mapped automatically. Adding a standard column later means
   rebuilding the BM25 indexes.
 - copied_from records the original project and document of copied documents.
+- Row versions (migration 0005): a row of documents is one version of a document. created_seq and retired_seq (numbers
+  from the sequence change_seq) say from which write to which write it was current; a current row has the largest
+  bigint as retired_seq, and doc_pk is the same for all versions of a document. A frozen release of a project is one
+  number R: the rows with created_seq <= R < retired_seq. Rows that are in a release are never changed or deleted
+  (amcat4.postgres.versions, amcat4.projects.releases); other rows are written in place as before. Every read of
+  "the documents of a project" therefore also selects the current rows: a term on retired_seq in the json query, or
+  project_filter(live=True) in plain SQL. The three columns are real columns of the BM25 index.
+- Tags can be rows of the table doc_labels instead of a json key (fields.label_table, AMCAT4_LABEL_TABLES;
+  amcat4.postgres.labels), with their own created_seq and retired_seq. See docs/postgres-fast-v3/RELEASES_AND_LABELS.md.
 - Date fields also get derived keys (f12_year, f12_quarter, f12_month, f12_dayofweek, ...) in exact_fields, so date
   histograms and date-part filters run inside the index. (The quarter key came with migration 0002: older documents
   get it from a background job, see fields.quarter_ready.)

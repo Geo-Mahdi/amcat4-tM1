@@ -172,6 +172,10 @@ async def create_fields(index: str, fields: Mapping[str, FieldType | CreateDocum
         async with conn.transaction():
             cur = await conn.execute("SELECT sort_slot FROM fields WHERE project_pk = %s AND sort_slot IS NOT NULL", [pk])
             used_slots = {row["sort_slot"] for row in await cur.fetchall()}  # type: ignore[index, call-overload]
+            # New tag fields store their values in the label table if the switch is on and every document of the
+            # project has its doc_pk (see amcat4.postgres.labels). Not unique fields: their hash is over the json
+            cur = await conn.execute("SELECT labels_ready FROM projects WHERE pk = %s", [pk])
+            label_table = get_settings().label_tables and (await cur.fetchone())["labels_ready"]  # type: ignore[index, call-overload]
             for name, f in new_fields.items():
                 # The first date field, and a keyword field called source, automatically get the standard columns
                 # (the other slots only with fast_sort)
@@ -182,8 +186,8 @@ async def create_fields(index: str, fields: Mapping[str, FieldType | CreateDocum
                     used_slots.add(slot)
                 await conn.execute(
                     """INSERT INTO fields (project_pk, name, type, unique_field, metareader, reader, client_settings,
-                                           sort_slot)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                                           sort_slot, label_table)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                     [
                         pk,
                         name,
@@ -193,6 +197,7 @@ async def create_fields(index: str, fields: Mapping[str, FieldType | CreateDocum
                         Jsonb(f.reader.model_dump(exclude_none=True)),
                         Jsonb(f.client_settings),
                         slot,
+                        bool(label_table and f.type == "tag" and not f.unique),
                     ],
                 )
             if any(f.unique for f in new_fields.values()):
@@ -244,6 +249,8 @@ async def update_fields(index: str, fields: dict[str, UpdateDocumentField]):
                     )
                     recompute_unique = recompute_unique or info.unique
                 if update.unique is not None and update.unique != current.unique:
+                    if update.unique and info.in_labels:
+                        raise ValueError(f"Tag field {name} cannot be unique: its values are in the label table")
                     settings["unique"] = update.unique
                     recompute_unique = True
                 for key in ["metareader", "reader", "client_settings"]:
@@ -521,6 +528,14 @@ async def field_values(index: str, field: str, size: int) -> list[str]:
     pk, f = await _field_info(index, field)
     if f.column != "exact_fields":
         raise ValueError(f"Cannot list values of {f.type} field {field}")
+    if f.in_labels:
+        # tags in the label table: count the current labels (a value occurs once per document)
+        rows = await fetch_all(
+            """SELECT value, count(*) AS n FROM doc_labels WHERE field_pk = %s AND retired_seq = 9223372036854775807
+               GROUP BY value ORDER BY n DESC, value LIMIT %s""",
+            [f.pk, size],
+        )
+        return [row["value"] for row in rows]
     value = sql.SQL("documents.exact_fields->{}").format(sql.Literal(f.key))
     elements = sql.SQL("CASE jsonb_typeof({v}) WHEN 'array' THEN {v} ELSE jsonb_build_array({v}) END").format(v=value)
     async with connection() as conn:

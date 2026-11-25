@@ -161,8 +161,9 @@ def versioned_update(update: sql.Composable, w: WriteSeq) -> sql.Composable:
 
 async def retire_or_delete(conn: AsyncConnection, where: sql.Composable, params: list, w: WriteSeq) -> list[int]:
     """
-    Delete the current documents that match `where` (a condition on the table "documents"). Rows that are in a release
-    are kept and get retired_seq = S; the others are really deleted. Returns the doc_pk of every deleted document.
+    Delete the current documents that match `where` (a condition on the table "documents"), and their labels. Rows that
+    are in a release are kept and get retired_seq = S; the others are really deleted. Returns the doc_pk of every
+    deleted document.
     The two statements see different rows (the second only rows that are in no release), so a document is never both.
     """
     doc_pks: list[int] = []
@@ -184,4 +185,8 @@ async def retire_or_delete(conn: AsyncConnection, where: sql.Composable, params:
             params,
         )
         doc_pks += [row["doc_pk"] for row in await cur.fetchall()]  # type: ignore[index, call-overload]
+        # the labels of these documents (tags in the label table) go the same way
+        from amcat4.postgres.labels import remove_of_documents
+
+        await remove_of_documents(conn, doc_pks, w)
     return doc_pks

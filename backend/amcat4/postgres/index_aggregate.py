@@ -49,8 +49,8 @@ def _axis_field(fieldset: FieldSet, axis) -> tuple[FieldInfo, str]:
     if len(fs) != 1:
         raise _NotSupported("field of several projects")
     f = fs[0]
-    if f.subkey:
-        raise _NotSupported("sub-field")
+    if f.subkey or f.in_labels:  # (in_labels: a tag field in the label table is aggregated with a join, see labels.py)
+        raise _NotSupported("sub-field or label table")
     if f.type in ("keyword", "tag") and axis.interval is None:
         return f, f.path
     if f.type == "date" and axis.interval in DATE_DERIVED and axis.interval != "quarter":
