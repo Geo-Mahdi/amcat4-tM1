@@ -12,6 +12,8 @@ This module handles the common shapes and returns None for everything else, so t
   backfill job is done) compute quarters from the month buckets. Nested axes become nested terms aggregations.
 - metrics: avg, min, max, sum of number and integer fields (not with a quarter axis computed from months), from a
   stats aggregation, so that a bucket without values gives null (as GROUP BY) for every function.
+- with AMCAT4_INDEX_AGG_TYPES (version 3, on by default): axes on number, integer and boolean fields (without an
+  interval), min and max of date fields, and metrics without any axis. See the notes at _typed_key and _date_seconds.
 - a single project per field (fields of several projects have different keys: GROUP BY handles that).
 The query must use the partition table (CompiledSearch.fast), because pdb.agg does not work on the parent.
 
@@ -25,6 +27,7 @@ of GROUP BY, except for tags, where GROUP BY (a lateral join over the tag list) 
 import json
 import logging
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 import psycopg
@@ -37,6 +40,19 @@ from amcat4.postgres.fields import DATE_DERIVED, FieldInfo, FieldSet, use_quarte
 # A smaller size would make pg_search leave out the smallest buckets, which GROUP BY never does.
 MAX_BUCKETS = 65_000
 METRICS = {"avg", "min", "max", "sum"}
+# pg_search computes aggregations with 64-bit floats, which hold whole numbers exactly only below 2^53. Larger integer
+# keys or date values could be rounded, so results with such values are not used (GROUP BY runs instead)
+EXACT_FLOAT = 2**53
+# pdb.agg returns dates as microseconds since 2000-01-01 (the postgres epoch); GROUP BY as seconds since 1970-01-01
+POSTGRES_EPOCH = 946_684_800
+TYPED_AXES = ("number", "integer", "boolean")
+
+
+def _typed() -> bool:
+    """The switch AMCAT4_INDEX_AGG_TYPES (see amcat4.config)"""
+    from amcat4.config import get_settings
+
+    return get_settings().index_agg_types
 
 
 class _NotSupported(Exception):
@@ -53,6 +69,9 @@ def _axis_field(fieldset: FieldSet, axis) -> tuple[FieldInfo, str]:
         raise _NotSupported("sub-field")
     if f.type in ("keyword", "tag") and axis.interval is None:
         return f, f.path
+    if f.type in TYPED_AXES and axis.interval is None and _typed():
+        # (a number interval is floor(x / interval) in GROUP BY; that stays there)
+        return f, f.path
     if f.type == "date" and axis.interval in DATE_DERIVED and axis.interval != "quarter":
         return f, f.derived_path(axis.interval)
     if f.type == "date" and axis.interval == "quarter":
@@ -61,12 +80,20 @@ def _axis_field(fieldset: FieldSet, axis) -> tuple[FieldInfo, str]:
     raise _NotSupported(f"{f.type} axis with interval {axis.interval}")
 
 
-def _metric_path(fieldset: FieldSet, metric) -> str:
-    """The index path of a metric field: only avg/min/max/sum of a number or integer field of one project"""
+def _metric_field(fieldset: FieldSet, metric) -> FieldInfo:
+    """
+    The field of a metric: avg/min/max/sum of a number or integer field of one project, or (AMCAT4_INDEX_AGG_TYPES)
+    min/max of a date field. Not avg and sum of dates: the index adds up 64-bit floats, GROUP BY exact numerics, so
+    the average date could differ in its last digits.
+    """
     fs = fieldset.resolve(metric.field)
-    if len(fs) != 1 or fs[0].type not in ("number", "integer") or fs[0].subkey or metric.function not in METRICS:
+    if len(fs) != 1 or fs[0].subkey or metric.function not in METRICS:
         raise _NotSupported("metric")
-    return fs[0].path
+    if fs[0].type in ("number", "integer"):
+        return fs[0]
+    if fs[0].type == "date" and metric.function in ("min", "max") and _typed():
+        return fs[0]
+    raise _NotSupported("metric")
 
 
 def _key(value: Any) -> Any:
@@ -80,6 +107,41 @@ def _key(value: Any) -> Any:
     return str(value)
 
 
+def _typed_key(bucket: dict, ftype: str) -> Any:
+    """
+    The key of a bucket of a number, integer or boolean axis, as text that postprocess_value converts like the value
+    of GROUP BY. Checked by hand and in tests (pg_search 0.27.0, 25 Nov 2026):
+    - boolean: the key is 0 or 1, with key_as_string "false" or "true";
+    - number: whole values come back as json integers (17, also 1e22 in full), others as decimals; a field that
+      mixes both gives one bucket per value (in no particular order, also over several index segments);
+    - integer: keys are computed as 64-bit floats, so from 2^53 on they could be rounded: not used.
+    """
+    key = bucket.get("key")
+    if key is None:
+        return None
+    if ftype == "boolean":
+        text = bucket.get("key_as_string")
+        if text not in ("true", "false"):
+            raise _NotSupported(f"boolean key {key!r}")
+        return text
+    if isinstance(key, bool) or not isinstance(key, (int, float)):
+        raise _NotSupported(f"{ftype} key {key!r}")
+    if ftype == "integer" and (abs(key) >= EXACT_FLOAT or not float(key).is_integer()):
+        raise _NotSupported(f"integer key {key!r}")
+    return _key(key)
+
+
+def _date_seconds(value: Any) -> Decimal:
+    """
+    A date from a stats aggregation (microseconds since 2000-01-01, as a float) as seconds since 1970-01-01, exact to
+    the microsecond like extract(epoch ...) in GROUP BY. Dates more than 2^53 microseconds (285 years) from 2000 cannot
+    be exact in a float: not used.
+    """
+    if not isinstance(value, (int, float)) or abs(value) >= EXACT_FLOAT or not float(value).is_integer():
+        raise _NotSupported(f"date value {value!r}")
+    return Decimal(int(value)) / 1_000_000 + POSTGRES_EPOCH
+
+
 def _quarter(month: str | None) -> datetime | None:
     """The first day of the quarter of a month key (2024-05 -> 2024-04-01), as date_trunc('quarter') in GROUP BY"""
     if month is None:
@@ -89,7 +151,10 @@ def _quarter(month: str | None) -> datetime | None:
 
 
 def build_request(fieldset: FieldSet, axes: list, metrics: list) -> tuple[dict, list[FieldInfo]]:
-    """The pdb.agg json for these axes and metrics (raises _NotSupported)"""
+    """
+    The pdb.agg json for these axes and metrics, and the fields of the axes (raises _NotSupported).
+    Without axes: {m0: stats, m1: stats, ...}, one pdb.agg each (see index_aggregate).
+    """
     fields = []
     paths = []
     for axis in axes:
@@ -100,9 +165,12 @@ def build_request(fieldset: FieldSet, axes: list, metrics: list) -> tuple[dict, 
         raise _NotSupported("metrics with a quarter axis computed from months")
     # stats, not the function itself: its count says whether the bucket has values. sum alone gives 0.0 for a bucket
     # without any value, where GROUP BY (and Elasticsearch's min/max/avg) give null
-    leaf = {f"m{j}": {"stats": {"field": _metric_path(fieldset, m)}} for j, m in enumerate(metrics)}
+    metric_fields = [_metric_field(fieldset, m) for m in metrics]
+    leaf = {f"m{j}": {"stats": {"field": f.path}} for j, f in enumerate(metric_fields)}
     if not axes:
-        raise _NotSupported("no axes")  # a single count (with metrics): GROUP BY handles it
+        if not metrics or not _typed():
+            raise _NotSupported("no axes")  # a single count: GROUP BY handles it
+        return leaf, fields
     # pdb.agg takes one (unnamed) aggregation at the top; nested aggregations are named a1, a2, ... and m0, m1, ...
     sub: dict = leaf
     agg: dict = {}
@@ -114,7 +182,9 @@ def build_request(fieldset: FieldSet, axes: list, metrics: list) -> tuple[dict, 
     return agg, fields
 
 
-def _rows(result: dict, axes: list, fields: list[FieldInfo], metrics: list, level: int, prefix: tuple) -> list[dict]:
+def _rows(
+    result: dict, axes: list, fields: list[FieldInfo], metrics: list, metric_fields: list[FieldInfo], level: int, prefix: tuple
+) -> list[dict]:
     """
     Flatten the (nested) terms buckets into rows {a0.., n, m0..}, one per combination of axis values.
     Raises _NotSupported if pg_search left out buckets, so a cut result is never returned.
@@ -126,26 +196,29 @@ def _rows(result: dict, axes: list, fields: list[FieldInfo], metrics: list, leve
         raise _NotSupported("buckets left out")
     rows = []
     for bucket in agg.get("buckets", []):
-        key = _key(bucket.get("key"))
-        if key is None and fields[level].type == "tag":
+        ftype = fields[level].type
+        key = _typed_key(bucket, ftype) if ftype in TYPED_AXES else _key(bucket.get("key"))
+        if key is None and ftype == "tag":
             continue  # documents without tags: GROUP BY (a lateral join over the tag list) has no such group
         if axes[level].interval == "quarter":
             key = _quarter(key)
         if level + 1 < len(axes):
-            rows.extend(_rows(bucket, axes, fields, metrics, level + 1, (*prefix, key)))
+            rows.extend(_rows(bucket, axes, fields, metrics, metric_fields, level + 1, (*prefix, key)))
         else:
             row = {f"a{i}": v for i, v in enumerate((*prefix, key))}
             row["n"] = bucket["doc_count"]
             for j, metric in enumerate(metrics):
-                row[f"m{j}"] = _metric_value(bucket.get(f"m{j}", {}), metric.function)
+                row[f"m{j}"] = _metric_value(bucket.get(f"m{j}", {}), metric.function, metric_fields[j].type)
             rows.append(row)
     return rows
 
 
-def _metric_value(stats: dict, function: str) -> Any:
+def _metric_value(stats: dict | None, function: str, ftype: str = "number") -> Any:
     """The value of a metric from a stats result: None (like GROUP BY) if no document of the bucket has a value"""
-    if not stats.get("count"):
+    if not stats or not stats.get("count"):
         return None
+    if ftype == "date":
+        return _date_seconds(stats.get(function))
     return stats.get(function)
 
 
@@ -174,26 +247,53 @@ async def index_aggregate(
     """
     try:
         request, fields = build_request(fieldset, axes, metrics)
+        metric_fields = [_metric_field(fieldset, m) for m in metrics]
     except _NotSupported:
         return None
-    stmt = sql.SQL("SELECT pdb.agg({}::jsonb) AS result FROM {} WHERE {}").format(
-        sql.Literal(json.dumps(request)), table, where
-    )
+    if axes:
+        select: sql.Composable = sql.SQL("pdb.agg({}::jsonb) AS result").format(sql.Literal(json.dumps(request)))
+    else:
+        # metrics without an axis: the count and one stats aggregation per metric, in one scan of the index
+        select = sql.SQL(", ").join(
+            [sql.SQL("count(*) AS n")]
+            + [
+                sql.SQL("pdb.agg({}::jsonb) AS {}").format(sql.Literal(json.dumps(r)), sql.Identifier(m))
+                for m, r in request.items()
+            ]
+        )
+    stmt = sql.SQL("SELECT {} FROM {} WHERE {}").format(select, table, where)
     try:
         cur = await conn.execute(stmt, params)
-        result = (await cur.fetchone())["result"]  # type: ignore[index, call-overload]
+        row: dict = await cur.fetchone()  # type: ignore[assignment]
     except psycopg.Error as e:
         if must_not_fall_back(e):
             raise
         logging.warning(f"pdb.agg failed, using GROUP BY instead: {e}")
         return None
-    if isinstance(result, str):
-        result = json.loads(result)
     try:
-        rows = _rows(result, axes, fields, metrics, 0, ())
+        if not axes:
+            return [_single_row(row, metrics, metric_fields)]
+        rows = _rows(_json(row["result"]), axes, fields, metrics, metric_fields, 0, ())
+        if any(a.interval == "quarter" for a in axes):
+            rows = _merge_quarters(rows, len(axes))
+        elif len({tuple(row[f"a{i}"] for i in range(len(axes))) for row in rows}) != len(rows):
+            # (never seen; GROUP BY cannot return the same group twice, so such a result is not used)
+            raise _NotSupported("the same key in two buckets")
     except _NotSupported as e:
         logging.info(f"pdb.agg result not usable ({e}), using GROUP BY instead")
         return None
-    if any(a.interval == "quarter" for a in axes):
-        rows = _merge_quarters(rows, len(axes))
     return rows
+
+
+def _json(value: Any) -> Any:
+    return json.loads(value) if isinstance(value, str) else value
+
+
+def _single_row(row: dict | None, metrics: list, metric_fields: list[FieldInfo]) -> dict:
+    """The one row {n, m0, ...} of an aggregation without axes"""
+    if row is None or row.get("n") is None:
+        raise _NotSupported("no result")
+    out = {"n": row["n"]}
+    for j, metric in enumerate(metrics):
+        out[f"m{j}"] = _metric_value(_json(row[f"m{j}"]), metric.function, metric_fields[j].type)
+    return out

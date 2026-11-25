@@ -201,6 +201,22 @@ class Settings(BaseSettings):
         ),
     ] = True
 
+    index_agg_types: Annotated[
+        bool,
+        Field(
+            description=(
+                "Aggregate inside the search index (pdb.agg) also for: group by a number, integer or boolean field, "
+                "the minimum and maximum of a date field, and metrics without any axis. "
+                "Why: these read every matching row before (group by an integer field: 199 ms, a keyword axis with "
+                "max(date): 409 ms, against 2-23 ms for the same aggregation in the index, tried by hand on 200k "
+                "documents, pg_search 0.27.0, 25 Nov 2026; not re-measured on this code). "
+                "The rows are the same as GROUP BY (tested, also for number fields with whole and decimal values). "
+                "Still read from the rows: number intervals, hour and minute, url axes, avg and sum of dates. "
+                "false = these use GROUP BY, as in postgres-fast-v2 (AMCAT4_INDEX_AGG_TYPES=false)"
+            ),
+        ),
+    ] = True
+
     sort_slot_job_rows: Annotated[
         int,
         Field(
