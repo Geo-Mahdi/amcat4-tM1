@@ -60,6 +60,9 @@ Documents:
 - Date fields also get derived keys (f12_year, f12_quarter, f12_month, f12_dayofweek, ...) in exact_fields, so date
   histograms and date-part filters run inside the index. (The quarter key came with migration 0002: older documents
   get it from a background job, see fields.quarter_ready.)
+- exact_fields also has the key _text: the list of the keys of the text fields of the document that have a value
+  (migration 0004, written by a trigger on documents), so "this text field has a value" is a term inside the index.
+  Older documents get it from a background job, see fields.text_exists_ready.
 - Sort slots: migration 0002 added five generic slot columns (sort_kw1..3 as text COLLATE "C", sort_num1,
   sort_date2) next to date and source, also in the BM25 index, so sorting on them is a Top-K scan inside the index.
   fast_sort puts a field in a free slot of its kind (see amcat4.postgres.fields). For a large project a background

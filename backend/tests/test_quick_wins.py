@@ -323,3 +323,199 @@ async def test_field_stats_no_values_and_old_dates(index, index_field_calls, mon
         assert on == off
     assert on["count"] == 2
     assert [r is not None for r in index_field_calls] == [True, False]
+
+
+############ 3. "Text field exists" inside the index ############
+
+
+async def _text_keys_wrong(index: str) -> int:
+    """The number of documents of the project whose list of text keys is not the list of the keys of their text fields"""
+    from psycopg import sql
+
+    from amcat4.postgres.connection import fetch_one
+    from amcat4.postgres.fields import with_text_keys_sql
+    from amcat4.postgres.projects import project_pk
+
+    row = await fetch_one(
+        sql.SQL(
+            "SELECT count(*) FILTER (WHERE exact_fields IS DISTINCT FROM {}) AS wrong, count(*) AS n "
+            "FROM documents WHERE project_pk = %s"
+        ).format(with_text_keys_sql()),
+        [await project_pk(index)],
+    )
+    assert row is not None and row["n"] > 0
+    return row["wrong"]
+
+
+async def _hits(index, **kwargs) -> tuple[int, list[str]]:
+    from amcat4.projects.query import query_documents
+
+    r = await query_documents(index, per_page=200, **kwargs)
+    return r.total_count, sorted(d["_id"] for d in r.data)
+
+
+EXISTS_QUERIES = [
+    {"filters": {"title": FilterSpec(exists=True)}},
+    {"filters": {"title": FilterSpec(exists=False)}},
+    {"filters": {"text": FilterSpec(exists=False)}},
+    {"filters": {"title": FilterSpec(exists=True), "pub": FilterSpec(value="A")}},
+    {"filters": {"title": FilterSpec(exists=False)}, "queries": {"q": "word1 OR word2"}},
+    {"filters": {"title": FilterSpec(exists=True), "text": FilterSpec(exists=True)}, "queries": {"q": "common"}},
+]
+
+
+async def _exists_results(index) -> list:
+    out: list = [await _hits(index, **kwargs) for kwargs in EXISTS_QUERIES]
+    out.append(await _aggregate(index, [Axis("pub")], filters={"title": FilterSpec(exists=True)}))
+    out.append(await _aggregate(index, [Axis("flag")], filters={"title": FilterSpec(exists=False)}))
+    return out
+
+
+def _exists_in_index(fieldset, name: str = "title") -> bool:
+    """Whether an exists filter on the field compiles to a clause of the search index (and no SQL condition)"""
+    from amcat4.postgres.filters import compile_filters
+
+    c = compile_filters({name: FilterSpec(exists=True)}, fieldset)
+    assert len(c.json_clauses) + len(c.sql_clauses) == 1
+    return bool(c.json_clauses)
+
+
+@pytest.mark.anyio
+async def test_text_exists_same_hits(project, index_paths, monkeypatch):  # noqa: F811
+    """'exists' on a text field gives the same hits, counts and aggregations inside the index as the SQL condition"""
+    from amcat4.systemdata.fields import get_fieldset
+
+    assert await _text_keys_wrong(project) == 0
+    assert _exists_in_index(await get_fieldset([project]))
+    original, off, new = await _old_and_new(monkeypatch, "text_exists_key", lambda: _exists_results(project))
+    assert new == off == original
+    # a title that is an empty string is a value too; documents without any text field have none
+    assert new[0][0] == sum(1 for prefix, n in [("a", 40), ("b", 40), ("c", 80)] for i in range(n) if i % 4)
+    assert new[2] == (5, [f"d{i}" for i in range(5)])
+    monkeypatch.setattr(get_settings(), "text_exists_key", False)
+    assert not _exists_in_index(await get_fieldset([project]))
+
+
+@pytest.mark.anyio
+async def test_text_keys_follow_every_write(project, index_paths, monkeypatch):  # noqa: F811
+    """
+    The list of text keys stays right, and the filter gives the same hits as the SQL condition, after every kind of
+    write: upload (new, merged, replaced), update and delete by query, deleting a field, changing a field to and from
+    text, copying to another project and moving to another partition
+    """
+    from amcat4.models import UpdateDocumentField
+    from amcat4.postgres.projects import project_partitions, project_pk
+    from amcat4.projects.documents import create_or_update_documents, update_document
+    from amcat4.projects.jobs import create_job, get_job, run_pending_jobs
+    from amcat4.projects.partitions import start_move
+    from amcat4.projects.query import update_query
+    from amcat4.systemdata.fields import delete_fields, update_fields
+
+    async def check(index=project, queries=EXISTS_QUERIES[:3]):
+        assert await _text_keys_wrong(index) == 0
+
+        async def run():
+            return [await _hits(index, **kwargs) for kwargs in queries]
+
+        original, off, new = await _old_and_new(monkeypatch, "text_exists_key", run)
+        assert new == off == original
+        return new
+
+    before = await check()
+    # merge: a2 gets a title, a1 keeps its title; replace: a3 loses its title, a5 its text
+    await create_or_update_documents(project, [{"_id": "a4", "title": "new"}, {"_id": "a1", "pub": "Z"}], op_type="update")
+    await create_or_update_documents(project, [{"_id": "a3", "text": "only text"}, {"_id": "a5", "title": "only title"}])
+    await update_document(project, "a8", {"title": "another"})
+    after = await check()
+    assert after[0][0] == before[0][0] + 2 - 1 and "a4" in after[0][1] and "a3" in after[1][1] and "a5" in after[2][1]
+    # update by query: set and remove a text field
+    await update_query(project, "title", "set by query", filters={"pub": FilterSpec(value="D")})
+    await update_query(project, "text", None, filters={"pub": FilterSpec(value="B")})
+    after = await check()
+    assert {f"d{i}" for i in range(5)} <= set(after[0][1])
+    assert after[2][0] > 5
+    # a keyword field becomes a text field and back; a text field is deleted
+    await update_fields(project, {"pub": UpdateDocumentField(type="text")})
+    # (the two replaced documents have no pub any more)
+    assert (await check(queries=[{"filters": {"pub": FilterSpec(exists=True)}}]))[0][0] == 163
+    await update_fields(project, {"pub": UpdateDocumentField(type="keyword")})
+    await check()
+    # copy to another project (new field keys) and move the copy to a partition of its own
+    copy = "amcat4_unittest_quick_copy"
+    await delete_project_index(copy, ignore_missing=True)
+    try:
+        await create_project_index(ProjectSettings(id=copy))
+        await create_job("copy", project, None, {"source": project, "destination": copy})
+        await run_pending_jobs()
+        assert (await check(copy))[0] == (await check())[0]
+        job = await start_move(copy, None)
+        await run_pending_jobs()
+        assert (await get_job(job["id"]))["status"] == "done"
+        partitions = await project_partitions([await project_pk(project), await project_pk(copy)])
+        assert len(set(partitions.values())) == 2
+        assert (await check(copy))[0] == (await check())[0]
+        # documents written in the new partition get the list too
+        await upload(copy, [{"_id": "x1", "title": "in the new partition"}, {"_id": "x2", "pub": "A"}])
+        assert "x1" in (await check(copy))[0][1]
+    finally:
+        await delete_project_index(copy, ignore_missing=True)
+    await delete_fields(project, ["title"])
+    assert await _text_keys_wrong(project) == 0
+    assert await _hits(project, filters={"text": FilterSpec(exists=True)}) == (165 - after[2][0], after_ids(after))
+
+
+def after_ids(after) -> list[str]:
+    missing = set(after[2][1])
+    return sorted(
+        i for i in [f"{p}{i}" for p, n in [("a", 40), ("b", 40), ("c", 80), ("d", 5)] for i in range(n)] if i not in missing
+    )
+
+
+@pytest.mark.anyio
+async def test_text_keys_backfill(project, index_paths, monkeypatch):  # noqa: F811
+    """
+    Documents stored before migration 0004 have no list of text keys: their text fields are not ready, the filter
+    uses the SQL condition (same hits), and the background job writes the lists (also correcting a wrong one), in
+    batches, once; after it the filter runs inside the index, with the same hits
+    """
+    from amcat4.postgres.connection import execute, fetch_all
+    from amcat4.postgres.projects import project_pk
+    from amcat4.projects import jobs
+    from amcat4.systemdata.fields import create_fields, field_infos, get_fieldset
+
+    pk = await project_pk(project)
+    expected = await _exists_results(project)
+    # as after the migration: no lists (this statement does not write text_fields, so the trigger does not fire), a
+    # wrong list on some documents, and the text fields not ready
+    await execute("UPDATE documents SET exact_fields = exact_fields - '_text' WHERE project_pk = %s", [pk])
+    await execute(
+        """UPDATE documents SET exact_fields = exact_fields || '{"_text": ["f0"]}' WHERE project_pk = %s AND id %% 9 = 0""",
+        [pk],
+    )
+    await execute("UPDATE fields SET text_exists_ready = false WHERE project_pk = %s AND type = 'text'", [pk])
+    assert await _text_keys_wrong(project) > 100
+    assert not _exists_in_index(await get_fieldset([project]))
+    assert await _exists_results(project) == expected
+    # a text field that is created now is ready at once: every document that gets it, gets the list from the trigger
+    await create_fields(project, {"summary": "text"})
+    await upload(project, [{"_id": "a1", "summary": "new"}, {"_id": "new", "summary": "new"}])
+    infos = await field_infos(project)
+    assert infos["summary"].text_exists_ready and not infos["title"].text_exists_ready
+    assert _exists_in_index(await get_fieldset([project]), "summary")
+    assert await _hits(project, filters={"summary": FilterSpec(exists=True)}) == (2, ["a1", "new"])
+    expected = await _exists_results(project)
+
+    monkeypatch.setattr(jobs, "FILL_BATCH_SIZE", 25)
+    await jobs.schedule_text_keys_backfill({})
+    await jobs.schedule_text_keys_backfill({})  # (not twice)
+    assert len(await fetch_all("SELECT 1 FROM jobs WHERE type = 'backfill_text_keys' AND project_pk = %s", [pk])) == 1
+    await jobs.run_pending_jobs()
+    [job] = await fetch_all("SELECT status FROM jobs WHERE type = 'backfill_text_keys' AND project_pk = %s", [pk])
+    assert job["status"] == "done"
+    assert await _text_keys_wrong(project) == 0
+    assert all(f.text_exists_ready for f in (await field_infos(project)).values())
+    assert _exists_in_index(await get_fieldset([project]))
+    assert await _exists_results(project) == expected
+    await jobs.schedule_text_keys_backfill({})  # nothing left to do
+    assert len(await fetch_all("SELECT 1 FROM jobs WHERE type = 'backfill_text_keys' AND project_pk = %s", [pk])) == 1
+    await fetch_all("DELETE FROM jobs WHERE type = 'backfill_text_keys' RETURNING id")

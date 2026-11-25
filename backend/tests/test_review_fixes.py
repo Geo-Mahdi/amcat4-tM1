@@ -245,7 +245,7 @@ async def test_statement_timeout_is_not_a_fallback_error():
 IN_INDEX = {
     # pdb.agg (a keyword axis)
     "pdb.agg": ("pub", lambda text: "pdb.agg" in text),
-    # GROUP BY on the partition table (an integer axis, which pdb.agg does not do)
+    # GROUP BY on the partition table (an integer axis, which pdb.agg does not do with AMCAT4_INDEX_AGG_TYPES=false)
     "in-index GROUP BY": ("n", lambda text: "GROUP BY" in text and '"documents_p' in text),
 }
 
@@ -265,6 +265,7 @@ async def test_aggregate_fallbacks(two, monkeypatch, path):
 
     monkeypatch.setattr(aggregate_module, "SMALL_RESULT", 0)
     monkeypatch.setattr(search_module, "COUNT_STEP", 0)
+    monkeypatch.setattr(get_settings(), "index_agg_types", False)
     axis, marker = IN_INDEX[path]
     a, _ = two
     await upload(

@@ -93,6 +93,8 @@ class FieldInfo:
     sort_ready: bool = True
     # False for date fields whose documents do not all have the derived quarter key yet (see DATE_DERIVED)
     quarter_ready: bool = True
+    # False for text fields whose documents do not all have the list of text keys yet (see TEXT_KEYS)
+    text_exists_ready: bool = True
     subkey: str | None = None  # for sub-fields, e.g. the lat/lon of a geo_point
 
     @property
@@ -255,7 +257,7 @@ def normalize_geo(value: Any) -> dict[str, float]:
 
 
 # The columns of the fields table that field_info_from_row reads
-FIELD_COLUMNS = "pk, name, type, unique_field, sort_slot, sort_slot_ready, quarter_ready"
+FIELD_COLUMNS = "pk, name, type, unique_field, sort_slot, sort_slot_ready, quarter_ready, text_exists_ready"
 
 
 def field_info_from_row(row: dict) -> FieldInfo:
@@ -267,6 +269,7 @@ def field_info_from_row(row: dict) -> FieldInfo:
         sort_slot=row["sort_slot"],
         sort_ready=row.get("sort_slot_ready", True),
         quarter_ready=row.get("quarter_ready", True),
+        text_exists_ready=row.get("text_exists_ready", True),
     )
 
 
@@ -284,6 +287,32 @@ def use_quarter_key(fs: list[FieldInfo]) -> bool:
     from amcat4.config import get_settings
 
     return get_settings().quarter_key and all(f.quarter_ready for f in fs)
+
+
+# The key in exact_fields with the list of the keys of the text fields of the document that have a value, e.g.
+# ["f1", "f2"] (no key if there are none). Written by a trigger on documents (migration 0004) whenever text_fields is
+# written; documents stored before that get it from a background job (fields.text_exists_ready). exact_fields is
+# columnar in the search index, text_fields is not, so "this text field has a value" can be a term on this list.
+TEXT_KEYS = "_text"
+
+
+def with_text_keys_sql(table: str = "documents") -> sql.Composable:
+    """SQL for the exact_fields of a row with its list of text keys (the same expression as the trigger of 0004)"""
+    return sql.SQL(
+        "(SELECT CASE WHEN count(k) = 0 THEN {t}.exact_fields - {key} "
+        "ELSE {t}.exact_fields || jsonb_build_object({key}, jsonb_agg(k)) END FROM jsonb_object_keys({t}.text_fields) AS k)"
+    ).format(t=sql.Identifier(table), key=sql.Literal(TEXT_KEYS))
+
+
+def use_text_keys(f: FieldInfo) -> bool:
+    """
+    Whether an 'exists' filter on this text field can use the list of text keys inside the search index: the switch
+    AMCAT4_TEXT_EXISTS_KEY is on and every document of the project has the list (text_exists_ready). Otherwise the
+    filter is the SQL condition of the original.
+    """
+    from amcat4.config import get_settings
+
+    return get_settings().text_exists_key and f.text_exists_ready and f.column == "text_fields" and not f.subkey
 
 
 async def list_field_infos(conn: AsyncConnection, project_pk: int) -> dict[str, FieldInfo]:

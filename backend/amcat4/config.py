@@ -235,6 +235,23 @@ class Settings(BaseSettings):
         ),
     ] = True
 
+    text_exists_key: Annotated[
+        bool,
+        Field(
+            description=(
+                "Filter on 'this text field has a value' (exists) inside the search index, on the list of text keys "
+                "that every document has in exact_fields since migration 0004 (written by a database trigger). "
+                "Why: it was the only filter outside the index, a SQL condition that reads the long text of every "
+                "hit (a page 180 ms and a count 260 ms on 200k documents, measured by hand on postgres-fast-v2, "
+                "25 Nov 2026; the new filter is a term like any keyword filter, not measured on this code). "
+                "Text fields whose older documents do not have the list yet keep the SQL condition until the "
+                "background job of their project is done (results are the same). "
+                "false = always the SQL condition, as in the original (AMCAT4_TEXT_EXISTS_KEY=false). The list is "
+                "written in both cases"
+            ),
+        ),
+    ] = True
+
     sort_slot_job_rows: Annotated[
         int,
         Field(

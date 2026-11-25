@@ -2,7 +2,8 @@
 Filters for the postgres backend.
 
 A filter compiles to pg_search json clauses where possible (so filtering happens inside the BM25 index),
-and to plain SQL conditions otherwise (currently only 'exists' on text fields). Date part filters (month number,
+and to plain SQL conditions otherwise (only 'exists' on text fields whose documents do not all have the list of
+text keys yet, see amcat4.postgres.fields.TEXT_KEYS). Date part filters (month number,
 day of week) use the derived keys that are stored for every date field.
 """
 
@@ -12,7 +13,16 @@ from typing import Any
 from psycopg import sql
 
 from amcat4.models import FilterSpec
-from amcat4.postgres.fields import DATE_DERIVED, FieldInfo, FieldSet, QueryError, normalize_value, term_value
+from amcat4.postgres.fields import (
+    DATE_DERIVED,
+    TEXT_KEYS,
+    FieldInfo,
+    FieldSet,
+    QueryError,
+    normalize_value,
+    term_value,
+    use_text_keys,
+)
 from amcat4.postgres.querystring import range_query
 
 
@@ -112,8 +122,14 @@ def _compile_filter(f: FieldInfo, spec: FilterSpec) -> tuple[list[dict], list[sq
         if f.column == "exact_fields":
             q = {"exists": {"field": f.path}}
             clauses.append(q if exists else {"boolean": {"must": [{"all": None}], "must_not": [q]}})
+        elif use_text_keys(f):
+            # pg_search 'exists' requires columnar fields, which text fields are not. The keys of the text fields of
+            # a document are also a (columnar) list in exact_fields (TEXT_KEYS), so this is a term inside the index
+            q = {"term": {"field": f"exact_fields.{TEXT_KEYS}", "value": f.key}}
+            clauses.append(q if exists else {"boolean": {"must": [{"all": None}], "must_not": [q]}})
         else:
-            # pg_search 'exists' requires columnar fields, so for text we check the jsonb key in SQL
+            # ... and until every document has that list (or with AMCAT4_TEXT_EXISTS_KEY=false), we check the jsonb
+            # key in SQL, which reads the text of every hit
             cond = sql.SQL("{}.{} ? {}").format(sql.Identifier("documents"), sql.Identifier(f.column), sql.Literal(f.key))
             sql_clauses.append(cond if exists else sql.SQL("NOT ({})").format(cond))
 
