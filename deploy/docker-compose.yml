@@ -47,12 +47,12 @@ services:
   # PostgreSQL with the pg_search (BM25 full-text search) and pgvector extensions.
   # The version is pinned: a new major postgres version cannot open an existing data directory, and a new pg_search
   # version can need a reindex. Upgrade deliberately (see https://hub.docker.com/r/paradedb/paradedb/tags).
-  # Tested with 0.26.0 and 0.27.0. The image installs the extension only when it creates a new database: after
+  # Tested with 0.26.0, 0.27.0 and 0.27.1. The image installs the extension only when it creates a new database: after
   # upgrading the image of an existing database, the extension must be updated (ALTER EXTENSION pg_search UPDATE).
   # AmCAT's migration 0002 does this (and rebuilds the search index once) when it finds an older extension version.
   db: &db_base
     profiles: [deploy]
-    image: paradedb/paradedb:${PARADEDB_VERSION:-0.27.0-pg18}
+    image: paradedb/paradedb:${PARADEDB_VERSION:-0.27.1-pg18}
     restart: unless-stopped
     environment:
       - POSTGRES_USER=amcat
