@@ -17,6 +17,7 @@ from typing import Any, Literal
 
 from psycopg import sql
 
+from amcat4.postgres import labels
 from amcat4.postgres.fields import DATE_DERIVED, FieldInfo, QueryError, use_quarter_key
 from amcat4.postgres.filters import DATE_TRUNC, field_sql
 
@@ -39,8 +40,15 @@ RAW_GROUP_TYPES = {"keyword", "url", "image", "video", "audio", "text"}
 def axis_expr(axis: Axis, fs: list[FieldInfo], lateral_alias: str) -> tuple[sql.Composable, sql.Composable | None]:
     """Returns the SQL expression for the axis, and an optional LATERAL join (for tags)"""
     ftype = fs[0].type
+    if ftype == "tag" and all(f.in_labels for f in fs):
+        # tags in the label table: a join gives one row per label, as the lateral join below does per json value
+        return sql.SQL("{}.value").format(sql.Identifier(lateral_alias)), labels.axis_join(fs, lateral_alias)
     if ftype == "tag":
-        arrays = [sql.SQL("documents.exact_fields->{}").format(sql.Literal(f.key)) for f in fs]
+        # (a field in the label table next to fields in json, in a query on several projects: its values as an array)
+        arrays = [
+            labels.values_select(f) if f.in_labels else sql.SQL("documents.exact_fields->{}").format(sql.Literal(f.key))
+            for f in fs
+        ]
         arr = arrays[0] if len(arrays) == 1 else sql.SQL("coalesce({})").format(sql.SQL(", ").join(arrays))
         lateral = sql.SQL("CROSS JOIN LATERAL jsonb_array_elements_text({}) AS {}(value)").format(
             arr, sql.Identifier(lateral_alias)

@@ -54,7 +54,7 @@ from amcat4.systemdata.roles import get_user_project_role, role_is_at_least
 
 _COLUMNS = (
     "pk, name, type, unique_field, metareader, reader, client_settings, sort_slot, sort_slot_ready, quarter_ready, "
-    "text_exists_ready"
+    "text_exists_ready, label_table"
 )
 
 
@@ -110,10 +110,11 @@ async def field_infos(index: str) -> dict[str, FieldInfo]:
     return {row["name"]: field_info_from_row(row) for row in await _field_rows(index)}
 
 
-async def get_fieldset(indices: str | list[str], queryable: set[str] | None = None) -> FieldSet:
+async def get_fieldset(indices: str | list[str], queryable: set[str] | None = None, release: int | None = None) -> FieldSet:
     """
     Get the fields of one or more indices, for searching. queryable restricts which fields can be used in queries
-    and filters (None = all fields).
+    and filters (None = all fields). release: the sequence number of a release (of the one index): searches with this
+    fieldset see the documents of that release instead of the current ones (amcat4.projects.releases).
     """
     indices = [indices] if isinstance(indices, str) else indices
     pks = await project_pks(indices)
@@ -127,7 +128,7 @@ async def get_fieldset(indices: str | list[str], queryable: set[str] | None = No
     # partition and move target in one statement (one snapshot): read separately, a move that finished in between
     # made the request search only the old, by then empty, partition
     partitions, moving = await project_layout(list(pks.values()))
-    return FieldSet(project_fields, queryable=queryable, partitions=partitions, moving=moving)
+    return FieldSet(project_fields, queryable=queryable, partitions=partitions, moving=moving, release=release)
 
 
 def _standardize_createfields(fields: Mapping[str, FieldType | CreateDocumentField]) -> dict[str, CreateDocumentField]:
@@ -176,6 +177,10 @@ async def create_fields(index: str, fields: Mapping[str, FieldType | CreateDocum
             auto = get_settings().auto_sort_slot
             # (not a slot that a job is still clearing, or failed to clear, for a field that left it)
             busy = await _slots_with_fill_job(conn, pk) if auto else set()
+            # New tag fields store their values in the label table if the switch is on and every document of the
+            # project has its doc_pk (see amcat4.postgres.labels). Not unique fields: their hash is over the json
+            cur = await conn.execute("SELECT labels_ready FROM projects WHERE pk = %s", [pk])
+            label_table = get_settings().label_tables and (await cur.fetchone())["labels_ready"]  # type: ignore[index, call-overload]
             for name, f in new_fields.items():
                 # The first date field, and a keyword field called source, automatically get the standard columns
                 slot = sort_slot_for_type(f.type)
@@ -191,8 +196,8 @@ async def create_fields(index: str, fields: Mapping[str, FieldType | CreateDocum
                     used_slots.add(slot)
                 await conn.execute(
                     """INSERT INTO fields (project_pk, name, type, unique_field, metareader, reader, client_settings,
-                                           sort_slot)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                                           sort_slot, label_table)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                     [
                         pk,
                         name,
@@ -202,6 +207,7 @@ async def create_fields(index: str, fields: Mapping[str, FieldType | CreateDocum
                         Jsonb(f.reader.model_dump(exclude_none=True)),
                         Jsonb(f.client_settings),
                         slot,
+                        bool(label_table and f.type == "tag" and not f.unique),
                     ],
                 )
             if any(f.unique for f in new_fields.values()):
@@ -253,6 +259,8 @@ async def update_fields(index: str, fields: dict[str, UpdateDocumentField]):
                     )
                     recompute_unique = recompute_unique or info.unique
                 if update.unique is not None and update.unique != current.unique:
+                    if update.unique and info.in_labels:
+                        raise ValueError(f"Tag field {name} cannot be unique: its values are in the label table")
                     settings["unique"] = update.unique
                     recompute_unique = True
                 for key in ["metareader", "reader", "client_settings"]:
@@ -560,6 +568,14 @@ async def field_values(index: str, field: str, size: int) -> list[str]:
     pk, f = await _field_info(index, field)
     if f.column != "exact_fields":
         raise ValueError(f"Cannot list values of {f.type} field {field}")
+    if f.in_labels:
+        # tags in the label table: count the current labels (a value occurs once per document)
+        rows = await fetch_all(
+            """SELECT value, count(*) AS n FROM doc_labels WHERE field_pk = %s AND retired_seq = 9223372036854775807
+               GROUP BY value ORDER BY n DESC, value LIMIT %s""",
+            [f.pk, size],
+        )
+        return [row["value"] for row in rows]
     c = await _index_search(index)
     value = sql.SQL("documents.exact_fields->{}").format(sql.Literal(f.key))
     elements = sql.SQL("CASE jsonb_typeof({v}) WHEN 'array' THEN {v} ELSE jsonb_build_array({v}) END").format(v=value)
@@ -574,7 +590,7 @@ async def field_values(index: str, field: str, size: int) -> list[str]:
             sql.SQL(
                 """SELECT value, count(*) AS n FROM documents, jsonb_array_elements_text({}) AS value
                    WHERE {} AND documents.exact_fields ? {} GROUP BY value ORDER BY n DESC, value LIMIT %s"""
-            ).format(elements, await project_filter(conn, pk), sql.Literal(f.key)),
+            ).format(elements, await project_filter(conn, pk, live=True), sql.Literal(f.key)),
             [size],
         )
         rows: list[dict] = await cur.fetchall()  # type: ignore[assignment]
@@ -596,14 +612,15 @@ async def field_stats(index: str, field: str) -> dict[str, Any]:
     else:
         x = sql.SQL("{}::double precision").format(raw)
     async with connection() as conn:
-        # A stats aggregation inside the search index if possible, else the original statement (every document)
+        # A stats aggregation inside the search index if possible, else the original statement (every document;
+        # live=True: only the current rows, not the old versions that releases keep)
         row = await index_field_stats(conn, c.table, c.where, c.params, f) if c is not None else None
         if row is None:
             cur = await conn.execute(
                 sql.SQL(
                     "SELECT count({x}) AS count, min({x}) AS min, max({x}) AS max, avg({x}) AS avg "
                     "FROM documents WHERE {project}"
-                ).format(x=x, project=await project_filter(conn, pk))
+                ).format(x=x, project=await project_filter(conn, pk, live=True))
             )
             row = await cur.fetchone()  # type: ignore[assignment]
     assert row is not None

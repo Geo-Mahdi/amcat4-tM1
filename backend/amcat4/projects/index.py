@@ -7,12 +7,13 @@ from psycopg import sql
 
 from amcat4.config import get_settings
 from amcat4.connections import s3_enabled, with_server_defaults
-from amcat4.errors import NotFoundError
+from amcat4.errors import ConflictError, NotFoundError
 from amcat4.models import IndexId, ProjectSettings, RoleRule, Roles, User
 from amcat4.objectstorage.multimedia import delete_project_multimedia
 from amcat4.postgres.connection import connection, fetch_all, fetch_one
 from amcat4.postgres.layout import partition_table, project_filter
 from amcat4.postgres.pdb_sql import search_condition
+from amcat4.postgres.versions import has_releases
 from amcat4.systemdata.roles import list_user_project_roles
 from amcat4.systemdata.settings import (
     _project_from_row,
@@ -74,6 +75,9 @@ async def clear_project_index(index_id: str):
         except BotoCoreError as e:
             logging.warning(f"Could not delete multimedia for index {index_id}: {e}")
     async with connection() as conn:
+        if await has_releases(conn, row["pk"]):
+            # (deleting the whole project is still possible: its releases go with it)
+            raise ConflictError("Cannot clear this project: it has releases, which must stay as they are")
         async with conn.transaction():
             await conn.execute(sql.SQL("DELETE FROM documents WHERE {}").format(await project_filter(conn, row["pk"])))
             await conn.execute("DELETE FROM fields WHERE project_pk = %s", [row["pk"]])

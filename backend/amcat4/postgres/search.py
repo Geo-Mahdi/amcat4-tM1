@@ -27,11 +27,13 @@ from amcat4.postgres import cutoff_sort
 from amcat4.postgres.connection import must_not_fall_back, spare_connection
 from amcat4.postgres.fields import FieldInfo, FieldSet, QueryError
 from amcat4.postgres.filters import compile_filters, field_sql
+from amcat4.postgres.labels import page_values
 from amcat4.postgres.layout import partition_table
 from amcat4.postgres.pdb_sql import score_sql, search_condition, snippet_positions_sql
 from amcat4.postgres.querystring import highlight_patterns, match_positions, parse_query, query_string_to_json
 from amcat4.postgres.snippets import byte_to_char_positions, make_snippet
 from amcat4.postgres.snippets import highlight as highlight_text
+from amcat4.postgres.versions import visible, visible_clauses
 
 
 @dataclass
@@ -69,6 +71,15 @@ class CompiledSearch:
 def project_clause(project_pks: list[int]) -> dict:
     terms = [{"term": {"field": "project_pk", "value": pk}} for pk in project_pks]
     return terms[0] if len(terms) == 1 else {"boolean": {"should": terms}}
+
+
+def scope_clauses(fieldset: FieldSet) -> list[dict]:
+    """
+    The rows a search may see at all: the projects, and of these only the current rows (retired_seq = "current"), or,
+    for a query on a release (fieldset.release = R), the rows with created_seq <= R and retired_seq > R. Both are real
+    columns of the BM25 index (migration 0005), so this is decided inside the index, in the unscored block.
+    """
+    return [project_clause(fieldset.project_pks), *visible_clauses(fieldset.release)]
 
 
 def unscored(clauses: list[dict]) -> dict:
@@ -145,7 +156,9 @@ def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False, b
     partitions). AMCAT4_FAST_PATH=false always uses the parent table with both SQL conditions, as in the original.
     """
     # selection: the project clause first (built here, never from user input), then the user's filters
-    selection: list[dict] = [project_clause(fieldset.project_pks)]
+    # ... and "current rows only", or the rows of a release (real columns of the index, migration 0005)
+    selection: list[dict] = scope_clauses(fieldset)
+    n_scope = len(selection)
     scored: list[dict] = []
     if query.queries:
         qs = [_compile_query_string(label, q, fieldset) for label, q in query.queries.items()]
@@ -192,10 +205,12 @@ def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False, b
     condition, condition_params = search_condition(json_query)
     where = sql.SQL(" AND ").join([condition, *sql_clauses])
     plain_where, plain_params = None, []
-    if not scored and len(selection) == 1:
-        # only the project clause is in the json query. The partition condition is also needed on a partition table:
+    if not scored and len(selection) == n_scope:
+        # only the project clause (and the row versions) are in the json query. The partition condition is also needed
+        # on a partition table:
         # it is the first column of the B-tree index
-        plain_where = sql.SQL(" AND ").join([partition_cond, project_cond, *extra_clauses])
+        versions = visible(fieldset.release)
+        plain_where = sql.SQL(" AND ").join([partition_cond, project_cond, versions, *extra_clauses])
         plain_params = [partition_param, project_param, *extra_params]
     return CompiledSearch(
         json_query,
@@ -390,8 +405,13 @@ async def search(
     # fields that do not exist (in any of the projects) are simply not returned
     fields = [name for name in fields if name in fieldset.by_name]
     snippets = {name: s for name, s in snippets.items() if name in fieldset.by_name}
+    label_fields: list[FieldInfo] = []
     for name in dict.fromkeys([*fields, *snippets.keys()]):
         for f in fieldset.by_name[name]:
+            if f.in_labels:
+                # tags in the label table: read for the documents of the page with one extra statement (below)
+                label_fields.append(f)
+                continue
             columns.append(sql.SQL("{} AS {}").format(field_select(f), sql.Identifier(f.key)))
             if scored and f.type == "text" and (name in snippets or highlight):
                 columns.append(
@@ -400,6 +420,8 @@ async def search(
     if scored:
         columns.append(sql.SQL("{} AS _score").format(score_sql()))
     columns.append(sql.SQL("documents.id AS _internal_id"))
+    if label_fields:
+        columns.append(sql.SQL("documents.doc_pk AS _doc_pk"))
 
     where, params = c.where, list(c.params)
     join: sql.Composable = sql.SQL("")
@@ -556,6 +578,8 @@ async def search(
     else:
         rows = await page_rows()
 
+    label_values = await page_values(conn, label_fields, [row["_doc_pk"] for row in rows]) if label_fields else {}  # type: ignore[index, call-overload]
+
     # Patterns to find query matches for highlighting / snippets (combined with the positions reported by pg_search,
     # which does not report positions for all query types)
     nodes = [parse_query(q) for q in (query.queries or {}).values()]
@@ -573,7 +597,10 @@ async def search(
             f = project_fields.get(name)
             if f is None:
                 continue
-            value = row[f.key]  # type: ignore[index, call-overload]
+            if f.in_labels:
+                value = label_values.get((row["_doc_pk"], f.pk))  # type: ignore[index, call-overload]
+            else:
+                value = row[f.key]  # type: ignore[index, call-overload]
             positions = None
             if isinstance(value, str) and nodes and (name in snippets or highlight):
                 positions = byte_to_char_positions(value, row.get("_pos_" + f.key)) or []  # type: ignore[union-attr]

@@ -404,6 +404,9 @@ def _prefix_query(path: str, prefix: str) -> dict:
 
 
 def _compile_exact(node: Term | Phrase | Range, f: FieldInfo) -> dict:
+    if f.in_labels:
+        # the values are rows of the label table, not in the search index of documents (amcat4.postgres.labels)
+        raise QueryError(f"Tag field {f.name} cannot be used in a query string: use a filter on {f.name} instead")
     path = f.path
     if isinstance(node, Range):
         return range_query(f, node.lower, node.upper, node.include_lower, node.include_upper)

@@ -325,6 +325,47 @@ class Settings(BaseSettings):
         ),
     ] = True
 
+    versioned_writes: Annotated[
+        bool,
+        Field(
+            description=(
+                "Keep the old version of a document (or tag) when it is updated or deleted, if it belongs to a "
+                "release of its project (migration 0005). "
+                "Why: a frozen release must return the same documents, values and counts for ever. "
+                "It only acts on projects that have at least one release, and there only on rows that are in a "
+                "release: all other updates and deletes are done in place, as before, so projects without releases "
+                "pay nothing and the table does not grow. "
+                "false = always update and delete in place, as in the original. Releases can then not be created, "
+                "and EXISTING RELEASES ARE NO LONGER PROTECTED: a later update or delete changes them "
+                "(AMCAT4_VERSIONED_WRITES=false)"
+            ),
+        ),
+    ] = True
+
+    label_tables: Annotated[
+        bool,
+        Field(
+            description=(
+                "Store the values of tag fields in a separate table (doc_labels, with its own search index) instead "
+                "of inside the document. "
+                "Why: adding or removing a tag then writes one small row and does not rewrite and re-index the "
+                "whole document (measured on 40,000 documents: add a tag to 10,000 documents 266 ms against 483 ms, "
+                "remove 24 ms against 396 ms; 4 times faster once the documents are in a release), and a release "
+                "keeps old tags without keeping a copy of the document. The price: a filter on such a tag is "
+                "checked by postgres for every hit of the rest of the search, not inside the search index "
+                "(a tag filter alone: 23-48 ms against 3-5 ms at 40,000 documents, growing with the project; "
+                "with a text search 9 ms against 4-6 ms), and the tag cannot be used in a query string "
+                "(see docs/postgres-fast-v3/RELEASES_AND_LABELS.md). "
+                "With true, new tag fields use the table at once (not unique fields), and a background job "
+                "(backfill_labels) moves the tags of existing tag fields, project by project; until it is done for "
+                "a field, that field works as before. A field that uses the table keeps using it when the switch "
+                "is turned off again. "
+                "Default false (off): tags stay inside the document, exactly as in the original "
+                "(AMCAT4_LABEL_TABLES=true)"
+            ),
+        ),
+    ] = False
+
     sort_slot_job_rows: Annotated[
         int,
         Field(

@@ -48,6 +48,7 @@ from typing import Any, Callable
 
 from psycopg import AsyncConnection, sql
 
+from amcat4.postgres import labels
 from amcat4.postgres.fields import FieldInfo, FieldSet
 from amcat4.postgres.pdb_sql import search_condition
 
@@ -104,6 +105,9 @@ def tag_sort_sql(f: FieldInfo, desc: bool, byte_order: bool = True) -> sql.Compo
     ascending sort, the largest for a descending sort. NULL (sorted last) without tags: no key, null or an empty list.
     A value that is not a list (should not happen) counts as a single tag.
     """
+    if f.in_labels:
+        # tags in the label table (amcat4.postgres.labels): the same value from the label rows of the document
+        return labels.sort_value(f, desc, byte_order)
     value = sql.SQL("documents.{}->{}").format(sql.Identifier(f.column), sql.Literal(f.key))
     return sql.SQL(
         "(SELECT {fn}(tag{collate}) FROM jsonb_array_elements_text(CASE jsonb_typeof({v}) WHEN 'array' THEN {v} "
@@ -121,6 +125,10 @@ def sort_key(
         return None
     f = fs[0]
     if f.type not in CUTOFF_TYPES or f.column != "exact_fields" or f.subkey:
+        return None
+    if f.in_labels:
+        # a tag field whose values are rows of the label table (AMCAT4_LABEL_TABLES): they are not a json key in the
+        # search index of documents, so there is nothing to aggregate or to cut off on. The late fetch sorts it
         return None
     if has_slot(name):
         return None  # a real column: pg_search sorts it with a Top-K scan

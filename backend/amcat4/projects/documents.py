@@ -87,7 +87,7 @@ async def fetch_document(index: str, doc_id: str, _source: str | list[str] | Non
             sql.SQL(
                 """SELECT p.id AS project, d.copied_from->>'doc_id' AS doc_id FROM documents d
                    JOIN projects p ON p.pk = (d.copied_from->>'project_pk')::int WHERE {} AND d.doc_id = %s"""
-            ).format(await project_filter(conn, pk, "d")),
+            ).format(await project_filter(conn, pk, "d", live=True)),
             [doc_id],
         )
         row = await cur.fetchone()
