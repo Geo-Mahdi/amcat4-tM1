@@ -46,6 +46,7 @@ from typing import Any, Callable
 from psycopg import AsyncConnection, sql
 
 from amcat4.postgres.fields import FieldInfo, FieldSet
+from amcat4.postgres.pdb_sql import search_condition
 
 # The most buckets pg_search returns for a terms aggregation (paradedb.max_term_agg_buckets). Every bucket has at
 # least one document, so offset + per_page + 2 buckets are always enough; deeper pages use the late fetch
@@ -206,19 +207,18 @@ class _Sorter:
     async def fetch(self, extra: list[dict], level: int, offset: int, limit: int) -> list[int]:
         """Ids of the documents of the search plus these clauses, ordered by the sort keys from this level on"""
         ordering = sql.SQL(", ").join([*self.order_items[level:], _ID])
+        condition, params = search_condition(self.json_query(extra))
         cur = await self.conn.execute(
-            sql.SQL("SELECT documents.id FROM {} WHERE documents.id @@@ %s::jsonb ORDER BY {} LIMIT %s OFFSET %s").format(
-                self.table, ordering
+            sql.SQL("SELECT documents.id FROM {} WHERE {} ORDER BY {} LIMIT %s OFFSET %s").format(
+                self.table, condition, ordering
             ),
-            [json.dumps(self.json_query(extra)), limit, offset],
+            [*params, limit, offset],
         )
         return [row["id"] for row in await cur.fetchall()]  # type: ignore[index, call-overload]
 
     async def count(self, extra: list[dict]) -> int:
-        cur = await self.conn.execute(
-            sql.SQL("SELECT count(*) AS n FROM {} WHERE documents.id @@@ %s::jsonb").format(self.table),
-            [json.dumps(self.json_query(extra))],
-        )
+        condition, params = search_condition(self.json_query(extra))
+        cur = await self.conn.execute(sql.SQL("SELECT count(*) AS n FROM {} WHERE {}").format(self.table, condition), params)
         return (await cur.fetchone())["n"]  # type: ignore[index, call-overload]
 
     async def aggregate(self, extra: list[dict], *requests: dict) -> list[dict]:
@@ -227,9 +227,9 @@ class _Sorter:
             sql.SQL("pdb.agg({}::jsonb) AS {}").format(sql.Literal(json.dumps(r)), sql.Identifier(f"r{i}"))
             for i, r in enumerate(requests)
         ]
+        condition, params = search_condition(self.json_query(extra))
         cur = await self.conn.execute(
-            sql.SQL("SELECT {} FROM {} WHERE documents.id @@@ %s::jsonb").format(sql.SQL(", ").join(aggs), self.table),
-            [json.dumps(self.json_query(extra))],
+            sql.SQL("SELECT {} FROM {} WHERE {}").format(sql.SQL(", ").join(aggs), self.table, condition), params
         )
         row: dict = await cur.fetchone()  # type: ignore[assignment]
         results = [row[f"r{i}"] for i in range(len(requests))]
