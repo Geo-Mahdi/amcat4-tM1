@@ -189,7 +189,8 @@ def compile_search(fieldset: FieldSet, query: SearchQuery, fast: bool = False, b
     where = sql.SQL(" AND ").join([sql.SQL("documents.id @@@ %s::jsonb"), *sql_clauses])
     plain_where, plain_params = None, []
     if not scored and len(selection) == n_scope:
-        # only the project clause (and the row versions) are in the json query. The partition condition is also needed on a partition table:
+        # only the project clause (and the row versions) are in the json query. The partition condition is also needed
+        # on a partition table:
         # it is the first column of the B-tree index
         versions = visible(fieldset.release)
         plain_where = sql.SQL(" AND ").join([partition_cond, project_cond, versions, *extra_clauses])

@@ -20,6 +20,7 @@ from amcat4.api.index_documents import app_index_documents
 from amcat4.api.index_fields import app_index_fields
 from amcat4.api.index_multimedia import app_multimedia
 from amcat4.api.index_query import app_index_query
+from amcat4.api.index_releases import app_index_releases
 from amcat4.api.index_users import app_index_users
 from amcat4.api.jobs import app_jobs
 from amcat4.api.requests import app_requests
@@ -96,6 +97,7 @@ api_router.include_router(app_index_documents)
 api_router.include_router(app_index_fields)
 api_router.include_router(app_index_users)
 api_router.include_router(app_index_query)
+api_router.include_router(app_index_releases)
 api_router.include_router(app_requests)
 api_router.include_router(app_multimedia)
 api_router.include_router(app_api_keys)

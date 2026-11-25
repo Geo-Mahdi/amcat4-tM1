@@ -44,6 +44,20 @@ class QueryResult:
         return dict(meta=meta, results=self.data)
 
 
+async def release_seq_for_query(index: str | list[str], release: int | None, similar: bool = False) -> int | None:
+    """The sequence number of release `release` of the project, for a query on it (None: the current documents)"""
+    if release is None:
+        return None
+    from amcat4.projects.releases import release_seq
+
+    indices = [index] if isinstance(index, str) else index
+    if len(indices) != 1:
+        raise ValueError("A release belongs to one project: query it without other projects")
+    if similar:
+        raise ValueError("Vectors are not part of a release: a similarity search on a release is not possible")
+    return await release_seq(indices[0], release)
+
+
 def _search_query(queries, filters, ids=None) -> SearchQuery:
     return SearchQuery(queries=queries or None, filters=filters or None, ids=list(ids) if ids else None)
 
@@ -108,6 +122,7 @@ async def query_documents(
     highlight: bool = False,
     similar: tuple[str, list[float]] | None = None,
     queryable: set[str] | None = None,
+    release: int | None = None,
 ) -> QueryResult:
     """
     Conduct a query, returning the found documents.
@@ -131,10 +146,13 @@ async def query_documents(
     :param highlight: if True, add <em> tags to query matches in fields
     :param similar: (vector field, vector): order results by (cosine) similarity to this vector
     :param queryable: the fields that may be used in queries and filters (None = all fields)
+    :param release: the number of a release of the (one) project: query the documents of that release instead of the
+                    current ones (see amcat4.projects.releases). The relevance order of a release is not frozen.
     """
     if fields is not None and not isinstance(fields, list):
         raise ValueError("fields should be a list")
-    fieldset = await get_fieldset([index] if isinstance(index, str) else index, queryable=queryable)
+    release_seq = await release_seq_for_query(index, release, similar=similar is not None)
+    fieldset = await get_fieldset([index] if isinstance(index, str) else index, queryable=queryable, release=release_seq)
     fields = fields or []
     snippets: dict[str, SnippetParams] = {f.name: f.snippet for f in fields if f.snippet is not None}
     names = [f.name for f in fields if f.snippet is None]

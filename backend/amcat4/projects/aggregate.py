@@ -305,6 +305,7 @@ async def query_aggregate(
     order: Literal["axes", "count"] = "axes",
     limit: int = 1000,
     queryable: set[str] | None = None,
+    release: int | None = None,
 ) -> AggregateResult:
     """
     Conduct an aggregate query.
@@ -317,6 +318,7 @@ async def query_aggregate(
     :param order: sort the rows by the axis values (axes), or by the number of documents (count, descending)
     :param limit: return at most this many rows (max MAX_LIMIT). result.truncated says whether there were more rows.
     :param queryable: the fields that may be used in queries and filters (None = all fields)
+    :param release: the number of a release of the (one) project: aggregate the documents of that release
     """
     if not 1 <= limit <= MAX_LIMIT:
         raise ValueError(f"limit should be between 1 and {MAX_LIMIT}")
@@ -326,7 +328,9 @@ async def query_aggregate(
         raise ValueError("Only one aggregation axis may be by query")
 
     indices = index if isinstance(index, list) else [index]
-    fieldset = await get_fieldset(indices, queryable=queryable)
+    from amcat4.projects.query import release_seq_for_query
+
+    fieldset = await get_fieldset(indices, queryable=queryable, release=await release_seq_for_query(indices, release))
     for axis in axes:
         axis.ftype = "_query" if axis.field == "_query" else fieldset.resolve(axis.field)[0].type
     for aggregation in aggregations:

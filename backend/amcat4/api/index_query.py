@@ -114,6 +114,14 @@ class QueryDocumentsBody(BaseModel):
     similar: SimilarSpec | None = Field(
         default=None, description="Order results by similarity to this vector (cosine similarity on a vector field)"
     )
+    release: int | None = Field(
+        default=None,
+        description=(
+            "Query a frozen release of the project (its number, see /index/{index}/releases) instead of the current "
+            "documents. Only for a single project. The documents, values and counts of a release never change; "
+            "the relevance order is not frozen."
+        ),
+    )
 
 
 class AggregationSpec(BaseModel):
@@ -158,6 +166,9 @@ class QueryAggregateBody(BaseModel):
         "axes", description="Sort the results by the axis values, or by the number of documents (descending)"
     )
     limit: int = Field(1000, ge=1, le=MAX_LIMIT, description="Maximum number of rows to return")
+    release: int | None = Field(
+        default=None, description="Aggregate a frozen release of the project (its number) instead of the current documents"
+    )
 
 
 class UpdateTagsBody(BaseModel):
@@ -254,6 +265,7 @@ async def _query(indices: list[str], body: QueryDocumentsBody, user: User) -> Qu
         highlight=body.highlight,
         similar=similar,
         queryable=None if user.auth_disabled else access.queryable,
+        release=body.release,
     )
     return QueryResultDict(**r.as_dict())
 
@@ -308,6 +320,7 @@ async def _aggregate(indices: list[str], body: QueryAggregateBody, user: User):
         order=body.order,
         limit=body.limit,
         queryable=None if user.auth_disabled else access.queryable,
+        release=body.release,
     )
     return {
         "meta": {

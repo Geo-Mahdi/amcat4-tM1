@@ -6,6 +6,7 @@ name is only a project-level label. This module maps AmCAT field types to storag
 for storage, and has low-level functions for the `fields` table (see amcat4.systemdata.fields for the API layer).
 """
 
+import dataclasses
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Callable, Literal
@@ -94,6 +95,12 @@ class FieldInfo:
     # False for date fields whose documents do not all have the derived quarter key yet (see DATE_DERIVED)
     quarter_ready: bool = True
     subkey: str | None = None  # for sub-fields, e.g. the lat/lon of a geo_point
+    # True if the values of this (tag) field are rows of the doc_labels table, not a key in exact_fields
+    # (fields.label_table, migration 0005; see amcat4.postgres.labels)
+    in_labels: bool = False
+    # For a search on a release: its sequence number R (None: the current documents). Set by FieldSet, so that
+    # everything that builds SQL for a field (filters, values, aggregation axes) reads the labels of that release
+    release: int | None = None
 
     @property
     def key(self) -> str:
@@ -255,7 +262,7 @@ def normalize_geo(value: Any) -> dict[str, float]:
 
 
 # The columns of the fields table that field_info_from_row reads
-FIELD_COLUMNS = "pk, name, type, unique_field, sort_slot, sort_slot_ready, quarter_ready"
+FIELD_COLUMNS = "pk, name, type, unique_field, sort_slot, sort_slot_ready, quarter_ready, label_table"
 
 
 def field_info_from_row(row: dict) -> FieldInfo:
@@ -267,6 +274,7 @@ def field_info_from_row(row: dict) -> FieldInfo:
         sort_slot=row["sort_slot"],
         sort_ready=row.get("sort_slot_ready", True),
         quarter_ready=row.get("quarter_ready", True),
+        in_labels=row.get("label_table", False),
     )
 
 
@@ -322,6 +330,12 @@ class FieldSet:
         self.moving = moving or {}
         # None: the current documents. A number R: the release with this sequence number (see amcat4.postgres.versions)
         self.release = release
+        if release is not None:
+            project_fields = {
+                pk: {name: dataclasses.replace(f, release=release) for name, f in fields.items()}
+                for pk, fields in project_fields.items()
+            }
+            self.project_fields = project_fields
         self.by_name: dict[str, list[FieldInfo]] = {}
         for fields in project_fields.values():
             for name, f in fields.items():

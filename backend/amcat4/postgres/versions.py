@@ -13,11 +13,13 @@ Writes:
   number below R has committed, and every later write gets a number above R. (The order of the numbers alone is not the
   order of the commits; the lock is what makes R a clean cut.)
 - A row that belongs to a release (created_seq <= the newest release of its project) is never changed or deleted:
-    - an update keeps the old content as an extra row (same doc_pk and created_seq, retired_seq = S) and gives the
-      current row created_seq = S, in ONE statement (versioned_update), so no other write can come in between;
+    - an update leaves the old version where it is, with its id, its doc_pk and its created_seq, and retired_seq = S;
+      the changed document is a new row version with a new id, the same doc_pk, and created_seq = S. Both in ONE
+      statement (versioned_update), so no other write can come in between;
     - a delete sets retired_seq = S on the row (retire_or_delete).
-  The current row of a document keeps its id for as long as the document exists, so vectors, cursors and the unique
-  index on doc_id are not affected; the older versions are the extra rows, with doc_pk = the document.
+  So the rows of a release keep their ids for ever: its order by _seq and its cursors never change. The current row
+  of a document gets a new id when a released version of it is updated (its vectors follow: the foreign key of
+  document_vectors has ON UPDATE CASCADE); doc_pk is what stays the same.
 - A row that is in no release (a project without releases, or a document that was created or already changed after
   the newest release) is updated and deleted in place, exactly as before migration 0005. So projects without releases
   pay nothing but one sequence number per write, and the table does not grow.
@@ -43,8 +45,8 @@ CURRENT = 9223372036854775807
 # filled for every row of a project whose tags are in the label table, see projects.labels_ready)
 DOC_PK = sql.SQL("coalesce(documents.doc_pk, documents.id)")
 
-# The columns that are copied to keep an old version (everything but id, the version columns and dedup_hash: an old
-# version must not take part in the unique index on the hash)
+# The content columns that an old version keeps (not dedup_hash: an old version must not take part in the unique index
+# on the hash)
 VERSION_COLUMNS = [
     "partition_id",
     "project_pk",
@@ -124,11 +126,14 @@ async def has_releases(conn: AsyncConnection, project_pk: int) -> bool:
 def version_assignments(w: WriteSeq) -> sql.Composable:
     """
     Extra assignments (starting with a comma) for an UPDATE of current documents that goes through versioned_update:
-    a row that is in a release gets the number of this write, because its old content lives on in a copy.
+    a row that is in a release becomes the new version: a new id (the next value of the id sequence) and the number of
+    this write. Its old content, id and number go back into the table in the same statement (versioned_update).
     """
     if not w.versioned:
         return sql.SQL("")
     return sql.SQL(
+        ", id = CASE WHEN documents.created_seq <= {r} THEN nextval(pg_get_serial_sequence('documents', 'id'))"
+        " ELSE documents.id END"
         ", created_seq = CASE WHEN documents.created_seq <= {r} THEN {s} ELSE documents.created_seq END"
         ", doc_pk = coalesce(documents.doc_pk, documents.id)"
     ).format(r=sql.Literal(w.released), s=sql.Literal(w.seq))
@@ -137,18 +142,18 @@ def version_assignments(w: WriteSeq) -> sql.Composable:
 def versioned_update(update: sql.Composable, w: WriteSeq) -> sql.Composable:
     """
     Wrap an UPDATE (or INSERT ... ON CONFLICT DO UPDATE) of current rows of documents, without RETURNING, whose SET
-    list ends with version_assignments(w). The result is one statement that returns the id of every row it wrote.
-    With a release: the old content of every changed row that is in a release is kept as a new row with
-    retired_seq = S (RETURNING old.*, PostgreSQL 18), in the same statement and so in the same snapshot.
-    Without: the UPDATE as it is.
+    list ends with version_assignments(w). The result is one statement that returns the (new) id of every row it wrote.
+    With a release: for every changed row that is in a release, the old row (RETURNING old.*, PostgreSQL 18: its id,
+    content and created_seq) is put back with retired_seq = S, in the same statement and so in the same snapshot; the
+    UPDATE itself has moved the current row to a new id. Without a release: the UPDATE as it is.
     """
     if not w.versioned:
         return sql.SQL("{} RETURNING documents.id").format(update)
     columns = sql.SQL(", ").join(sql.Identifier(c) for c in VERSION_COLUMNS)
     return sql.SQL(
         """WITH changed AS ({update} RETURNING old.*, new.id AS _id),
-                kept AS (INSERT INTO documents ({columns}, doc_pk, created_seq, retired_seq)
-                         SELECT {columns}, coalesce(doc_pk, id), created_seq, {s} FROM changed
+                kept AS (INSERT INTO documents (id, {columns}, doc_pk, created_seq, retired_seq)
+                         SELECT id, {columns}, coalesce(doc_pk, id), created_seq, {s} FROM changed
                          WHERE created_seq <= {r})
            SELECT _id AS id FROM changed"""
     ).format(update=update, columns=columns, s=sql.Literal(w.seq), r=sql.Literal(w.released))
