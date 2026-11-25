@@ -193,7 +193,13 @@ async def _aggregate(
             # In-index aggregation has a floor of 10-25 ms; for a few hundred hits the original statement is faster
             c = compile_search(fieldset, query)
         # In-index aggregation with pdb.agg where possible (returns None for shapes it does not handle)
-        rows = await index_aggregate(conn, c.table, c.where, c.params, fieldset, axes, metrics) if c.fast else None
+        # Not with a filter on a tag field in the label table: that filter is a SQL condition on doc_labels
+        # (amcat4.postgres.labels), and pdb.agg refuses a statement with such a condition ("could not extract search
+        # query from quals"), so every such request would run a failing statement and log a warning before GROUP BY
+        label_filter = any(f.in_labels for name in query.filters or {} for f in fieldset.by_name.get(name, []))
+        rows = None
+        if c.fast and not label_filter:
+            rows = await index_aggregate(conn, c.table, c.where, c.params, fieldset, axes, metrics)
         if rows is None:
             try:
                 cur = await conn.execute(statement(c), c.params)

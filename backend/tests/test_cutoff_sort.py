@@ -33,10 +33,13 @@ def json_sort_fields():
     json fields, and a field that gets a slot is sorted on its slot column instead.
     """
     settings = get_settings()
-    before = settings.auto_sort_slot
+    before = settings.auto_sort_slot, settings.label_tables
     settings.auto_sort_slot = False
+    # ... and tags in json (AMCAT4_LABEL_TABLES=false): a tag field in the label table is not in the search index of
+    # documents, so the cutoff sort leaves it to the late fetch (tested in test_v3_together.py)
+    settings.label_tables = False
     yield
-    settings.auto_sort_slot = before
+    settings.auto_sort_slot, settings.label_tables = before
 
 
 PROJECT = "amcat4_unittest_cutoff"

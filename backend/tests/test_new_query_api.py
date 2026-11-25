@@ -107,6 +107,11 @@ async def projects():
     before = settings.auto_sort_slot
     # (as in test_parity.py: only the standard slots, so that "i", "num" and "day" are sorted on their json value)
     settings.auto_sort_slot = False
+    # Tags in json, also when the suite runs with AMCAT4_LABEL_TABLES=true: these tests are about the clauses of the
+    # search index, and a tag field in the label table has none (its filters are SQL conditions, and it is refused
+    # in a query string). The label table with the new query API: test_labels.py and test_v3_together.py
+    label_tables = settings.label_tables
+    settings.label_tables = False
     try:
         for name, fields, n, seed in ((A, FIELDS, 1198, 5), (B, dict(reversed(FIELDS.items())), 498, 6)):
             # (document ids start with d in project A and with e in project B)
@@ -118,6 +123,7 @@ async def projects():
         yield [A, B]
     finally:
         settings.auto_sort_slot = before
+        settings.label_tables = label_tables
         for name in (A, B):
             await delete_project_index(name, ignore_missing=True)
 

@@ -13,6 +13,21 @@ from amcat4.projects.index import create_project_index, delete_project_index
 from tests.conftest import upload
 from tests.test_fast_path import index_paths  # noqa: F401
 
+
+@pytest.fixture(scope="module", autouse=True)
+def tags_in_json():
+    """
+    Tags in json, also when the suite runs with AMCAT4_LABEL_TABLES=true: these tests compare the paths inside the
+    search index with the original statements, and a tag field in the label table uses neither (it is read from
+    doc_labels). Field values on the label table with old row versions: test_v3_together.py
+    """
+    settings = get_settings()
+    before = settings.label_tables
+    settings.label_tables = False
+    yield
+    settings.label_tables = before
+
+
 PROJECT = "amcat4_unittest_quick"
 FIELDS = {
     "text": "text",
