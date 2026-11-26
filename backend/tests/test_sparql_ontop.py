@@ -188,6 +188,17 @@ async def test_fields_of_a_release(endpoint):
     ]
 
 
+async def test_top_values_of_a_field(endpoint):
+    rows = sparql(
+        endpoint,
+        f"""SELECT ?value ?n WHERE {{
+              <{iri(1)}> schema:variableMeasured ?f . ?f schema:name "kw" ;
+                  schema:valueReference [ schema:value ?value ; amcat:documentCount ?n ; schema:position ?rank ] .
+            }} ORDER BY ?rank""",
+    )
+    assert rows == [{"value": f"cat{k}", "n": "4"} for k in range(3)]
+
+
 async def test_counts_equal_the_release_api(endpoint, client, admin):
     for number in (1, 2):
         release = await get_json(client, f"/index/{PUBLIC}/releases/{number}", user=admin)

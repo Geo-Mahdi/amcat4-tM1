@@ -47,10 +47,12 @@ VIEWS = {
         "field_iri",
         "field_name",
         "field_type",
-        "field_identifier",
+        "is_identifier",
+        "description",
         "field_position",
         "document_count",
     ],
+    "sparql_field_values": ["release_iri", "field_iri", "value_iri", "value", "document_count", "value_rank"],
 }
 
 
@@ -115,6 +117,22 @@ async def test_fields_hide_text_and_hidden_fields(projects):
         assert f["document_count"] == manifest["fields"][name]["documents"]
         assert f["field_iri"] == f"urn:amcat4:projects/{PUBLIC}/releases/1/fields/{name}"
     assert fields["kw"]["document_count"] == 12 and fields["tags"]["document_count"] == 6
+    assert not any(f["is_identifier"] for f in fields.values())
+
+
+async def test_top_values_from_golden_queries(projects):
+    rows = await fetch_all(
+        "SELECT * FROM sparql_field_values WHERE release_iri LIKE %s ORDER BY field_iri, value_rank", ["%/releases/1"]
+    )
+    by_field: dict = {}
+    for row in rows:
+        by_field.setdefault(row["field_iri"].rsplit("/", 1)[1], []).append((row["value"], row["document_count"]))
+    # (secret_kw is a keyword field too, but metareaders cannot see it)
+    assert by_field == {"kw": [("cat0", 4), ("cat1", 4), ("cat2", 4)], "tags": [("a", 6), ("b", 6)]}
+    assert rows[0]["value_iri"] == rows[0]["field_iri"] + "/values/1"
+
+
+async def test_nothing_secret(projects):
     # nothing in any view contains the word of the texts and of the hidden field
     for view in VIEWS:
         rows = await fetch_all(f"SELECT t::text AS row FROM {view} t")  # type: ignore[arg-type]

@@ -62,7 +62,8 @@ async def publish_release(index: str, number: int, public: bool = True, **column
     async with connection() as conn:
         await conn.execute(
             f"""UPDATE releases SET metadata_public = %s, field_definitions = coalesce(field_definitions,
-                    (SELECT jsonb_agg(jsonb_build_object('name', name, 'type', type, 'metareader', metareader)
+                    (SELECT jsonb_agg(jsonb_build_object('pk', pk, 'name', name, 'type', type, 'identifier', unique_field,
+                                                         'metareader', metareader)
                                       ORDER BY name)
                      FROM fields WHERE project_pk = %s)) {", " + sets if sets else ""}
                 WHERE project_pk = %s AND number = %s""",  # type: ignore[arg-type]

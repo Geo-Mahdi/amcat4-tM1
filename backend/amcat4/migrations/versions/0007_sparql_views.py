@@ -15,8 +15,9 @@ migrations have). See docs/postgres-fast-v3/sparql-ontop.md.
   of type text and that metareaders may see completely (metareader access "read": the same rule as the API, see
   amcat4.systemdata.fields._field_access_for_role), with the number of documents with a value from the manifest.
 
-There is no view of field values: the manifest (amcat4.projects.releases.compute_manifest) has counts per field, but
-no counts per value, so there is nothing to show without reading documents.
+- sparql_field_values: the top values (at most 10) of the keyword and tag fields of sparql_release_fields, with
+  their document counts, as the golden queries of the release (migration 0006) stored them. Not computed here: the
+  views never read documents.
 
 The views read only the tables releases and projects (never documents, doc_labels or users), and only the columns
 listed here. They are security barrier views: a condition that a client adds cannot see the rows that the view leaves
@@ -40,6 +41,21 @@ PROJECT_IRI = f"{BASE_IRI} || 'projects/' || p.id"
 RELEASE_IRI = f"{PROJECT_IRI} || '/releases/' || r.number"
 # what a release counts as public: its metadata is published, and the project still exists (the join)
 PUBLIC = "FROM releases r JOIN projects p ON p.pk = r.project_pk WHERE r.metadata_public"
+# the fields of a public release that may be shown (f.def: an entry of field_definitions, see
+# amcat4.projects.release_metadata.field_definitions): not text, and metareaders may read it completely
+FIELDS = """
+    FROM releases r JOIN projects p ON p.pk = r.project_pk
+    CROSS JOIN LATERAL jsonb_array_elements(
+        CASE jsonb_typeof(r.field_definitions) WHEN 'array' THEN r.field_definitions ELSE '[]'::jsonb END
+    ) WITH ORDINALITY AS f(def, position)
+    WHERE r.metadata_public
+      AND jsonb_typeof(f.def) = 'object'
+      AND f.def->>'name' IS NOT NULL
+      AND coalesce(f.def->>'type', 'text') <> 'text'
+      AND f.def->'metareader'->>'access' = 'read'
+"""
+FIELD_IRI = f"""{RELEASE_IRI} || '/fields/' || CASE WHEN f.def->>'name' ~ '^[A-Za-z0-9_.-]+$' THEN f.def->>'name'
+                                                    ELSE 'md5-' || md5(f.def->>'name') END"""
 
 VIEWS = {
     "sparql_projects": f"""
@@ -71,24 +87,44 @@ VIEWS = {
     """,
     "sparql_release_fields": f"""
         SELECT {RELEASE_IRI} AS release_iri,
-               {RELEASE_IRI} || '/fields/' || CASE WHEN f.def->>'name' ~ '^[A-Za-z0-9_.-]+$' THEN f.def->>'name'
-                                                   ELSE 'md5-' || md5(f.def->>'name') END AS field_iri,
+               {FIELD_IRI} AS field_iri,
                f.def->>'name' AS field_name,
                f.def->>'type' AS field_type,
-               f.def->>'identifier' AS field_identifier,
+               coalesce(f.def->'identifier' = 'true'::jsonb, false) AS is_identifier,
+               CASE WHEN jsonb_typeof(f.def->'description') = 'string' THEN f.def->>'description' END AS description,
                f.position AS field_position,
                CASE WHEN jsonb_typeof(r.manifest->'fields'->(f.def->>'name')->'documents') = 'number'
                     THEN (r.manifest->'fields'->(f.def->>'name')->>'documents')::bigint
                END AS document_count
-        FROM releases r JOIN projects p ON p.pk = r.project_pk
+        {FIELDS}
+    """,
+    # The top values of keyword and tag fields, from the golden queries of the release ("top_values:<field>", with
+    # field_pk; see amcat4.projects.release_metadata.golden_query_specs): only for the fields shown above
+    "sparql_field_values": f"""
+        SELECT fl.release_iri,
+               fl.field_iri,
+               fl.field_iri || '/values/' || v.rank AS value_iri,
+               v.item->>'value' AS value,
+               (v.item->>'n')::bigint AS document_count,
+               v.rank AS value_rank
+        FROM (
+            SELECT {RELEASE_IRI} AS release_iri, {FIELD_IRI} AS field_iri, f.def->'pk' AS field_pk,
+                   r.golden_queries
+            {FIELDS}
+              AND f.def->>'type' IN ('keyword', 'tag')
+        ) fl
         CROSS JOIN LATERAL jsonb_array_elements(
-            CASE jsonb_typeof(r.field_definitions) WHEN 'array' THEN r.field_definitions ELSE '[]'::jsonb END
-        ) WITH ORDINALITY AS f(def, position)
-        WHERE r.metadata_public
-          AND jsonb_typeof(f.def) = 'object'
-          AND f.def->>'name' IS NOT NULL
-          AND coalesce(f.def->>'type', 'text') <> 'text'
-          AND f.def->'metareader'->>'access' = 'read'
+            CASE jsonb_typeof(fl.golden_queries) WHEN 'array' THEN fl.golden_queries ELSE '[]'::jsonb END
+        ) AS g(query)
+        CROSS JOIN LATERAL jsonb_array_elements(
+            CASE jsonb_typeof(g.query->'result'->'values') WHEN 'array' THEN g.query->'result'->'values'
+                 ELSE '[]'::jsonb END
+        ) WITH ORDINALITY AS v(item, rank)
+        WHERE starts_with(g.query->>'name', 'top_values:')
+          AND jsonb_typeof(g.query) = 'object'
+          AND g.query->'field_pk' = fl.field_pk
+          AND jsonb_typeof(v.item->'n') = 'number'
+          AND jsonb_typeof(v.item->'value') IN ('string', 'number', 'boolean')
     """,
 }
 

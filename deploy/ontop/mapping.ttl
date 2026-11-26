@@ -1,7 +1,8 @@
 # R2RML mapping of the public release metadata of AmCAT 4 to RDF, for Ontop (a virtual knowledge graph: SPARQL is
 # translated to SQL on these views, nothing is copied).
 #
-# Only the views of migration 0007 are mapped (sparql_projects, sparql_releases, sparql_release_fields). They contain releases whose
+# Only the views of migration 0007 are mapped (sparql_projects, sparql_releases, sparql_release_fields,
+# sparql_field_values). They contain releases whose
 # metadata is public and fields that are not text and that metareaders may see. Documents, texts, tags and users are
 # not in the views, and the database role of Ontop (role.sql) cannot read anything else.
 #
@@ -57,7 +58,9 @@ map:Field a rr:TriplesMap ;
     rr:subjectMap [ rr:column "field_iri" ; rr:termType rr:IRI ; rr:class schema:PropertyValue ] ;
     rr:predicateObjectMap [ rr:predicate schema:name ; rr:objectMap [ rr:column "field_name" ] ] ;
     rr:predicateObjectMap [ rr:predicate amcat:fieldType ; rr:objectMap [ rr:column "field_type" ] ] ;
-    rr:predicateObjectMap [ rr:predicate schema:propertyID ; rr:objectMap [ rr:column "field_identifier" ] ] ;
+    # a unique field: its values identify a document
+    rr:predicateObjectMap [ rr:predicate amcat:isIdentifier ; rr:objectMap [ rr:column "is_identifier" ] ] ;
+    rr:predicateObjectMap [ rr:predicate schema:description ; rr:objectMap [ rr:column "description" ] ] ;
     rr:predicateObjectMap [ rr:predicate schema:position ; rr:objectMap [ rr:column "field_position" ] ] ;
     rr:predicateObjectMap [ rr:predicate amcat:documentCount ; rr:objectMap [ rr:column "document_count" ] ] ;
     rr:predicateObjectMap [
@@ -72,4 +75,21 @@ map:ReleaseFields a rr:TriplesMap ;
     rr:predicateObjectMap [
         rr:predicate schema:variableMeasured ;
         rr:objectMap [ rr:column "field_iri" ; rr:termType rr:IRI ]
+    ] .
+
+# The top values (at most 10) of keyword and tag fields, as the golden queries of the release stored them
+map:FieldValue a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "sparql_field_values" ] ;
+    rr:subjectMap [ rr:column "value_iri" ; rr:termType rr:IRI ; rr:class schema:PropertyValue ] ;
+    rr:predicateObjectMap [ rr:predicate schema:value ; rr:objectMap [ rr:column "value" ] ] ;
+    rr:predicateObjectMap [ rr:predicate amcat:documentCount ; rr:objectMap [ rr:column "document_count" ] ] ;
+    rr:predicateObjectMap [ rr:predicate schema:position ; rr:objectMap [ rr:column "value_rank" ] ] .
+
+# field -> its top values
+map:FieldValues a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "sparql_field_values" ] ;
+    rr:subjectMap [ rr:column "field_iri" ; rr:termType rr:IRI ] ;
+    rr:predicateObjectMap [
+        rr:predicate schema:valueReference ;
+        rr:objectMap [ rr:column "value_iri" ; rr:termType rr:IRI ]
     ] .
