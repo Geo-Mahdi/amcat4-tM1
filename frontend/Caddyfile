@@ -7,6 +7,16 @@
         reverse_proxy {$AMCAT4_API_HOST:api}:5000
     }
 
+    # SPARQL endpoint (Ontop, deploy/ontop), only with AMCAT4_SPARQL=on and the compose profile sparql.
+    # Otherwise /sparql is a page of the SPA like any other path.
+    @sparql {
+        path /sparql /sparql/*
+        expression `"{$AMCAT4_SPARQL:off}" == "on"`
+    }
+    handle @sparql {
+        reverse_proxy {$AMCAT4_SPARQL_HOST:ontop}:8080
+    }
+
     # S3 - Proxy to the S3 container
     handle /s3/* {
         reverse_proxy {$AMCAT4_S3_HOST} {

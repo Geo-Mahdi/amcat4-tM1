@@ -90,3 +90,6 @@ ignore = ["E203"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["amcat4"]
+
+[tool.pytest.ini_options]
+markers = ["ontop: needs the Ontop CLI (AMCAT4_ONTOP_CLI_DIR, see deploy/ontop/fetch-ontop-cli.sh)"]

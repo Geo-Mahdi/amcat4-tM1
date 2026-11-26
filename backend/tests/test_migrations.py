@@ -364,10 +364,16 @@ async def test_migration_chain_0003_to_0005():
     """
     conn = await _connect()
     try:
-        # a fresh database: 0001 to the head in one go, which is 0005 (one head, no branches)
+        # a fresh database: 0001 to the head in one go, which is 0007 (one head, no branches)
         await drop_schema(conn, SCHEMA)
         await asyncio.to_thread(_migrate, "upgrade", "head")
-        assert await _one(conn, "SELECT version_num FROM alembic_version") == {"version_num": "0005"}
+        assert await _one(conn, "SELECT version_num FROM alembic_version") == {"version_num": "0007"}
+        cur = await conn.execute("SELECT table_name FROM information_schema.views WHERE table_schema = %s", [SCHEMA])
+        assert {row["table_name"] for row in await cur.fetchall()} == {
+            "sparql_projects",
+            "sparql_releases",
+            "sparql_release_fields",
+        }
         cur = await conn.execute("SELECT tgname FROM pg_trigger WHERE tgrelid = 'documents'::regclass AND NOT tgisinternal")
         assert {row["tgname"] for row in await cur.fetchall()} == {"documents_text_keys", "documents_doc_pk"}
         assert {"text_exists_ready", "label_table"} <= await _columns(conn, "fields")

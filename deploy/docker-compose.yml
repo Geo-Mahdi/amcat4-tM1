@@ -13,6 +13,8 @@ services:
     environment:
       - AMCAT4_URL=${AMCAT4_URL:-http://localhost}
       - AMCAT4_S3_HOST
+      # on: /sparql goes to the ontop service (start it with --profile sparql)
+      - AMCAT4_SPARQL=${AMCAT4_SPARQL:-off}
     volumes:
       - caddy_data:/data
       - caddy_config:/config
@@ -83,6 +85,34 @@ services:
     profiles: [dev]
     ports:
       - "127.0.0.1:5432:5432"
+
+  # SPARQL over the public release metadata (a virtual knowledge graph: Ontop translates SPARQL to SQL on the
+  # sparql_* views of migration 0007; nothing is copied). Off by default: start it with --profile sparql, after
+  # creating its database role (ontop/role.sql) and ontop/ontop.properties (from ontop.properties.example).
+  # Caddy sends /sparql to it when AMCAT4_SPARQL=on. See ontop/README.md. The version is pinned.
+  ontop:
+    profiles: [sparql]
+    image: ontop/ontop:5.5.0
+    restart: unless-stopped
+    environment:
+      - ONTOP_MAPPING_FILE=/opt/ontop/input/mapping.ttl
+      - ONTOP_PROPERTIES_FILE=/opt/ontop/input/ontop.properties
+      # the password of the amcat_sparql role (overrides jdbc.password of ontop.properties)
+      - ONTOP_DB_PASSWORD=${SPARQL_DB_PASSWORD:-}
+      # the endpoint is public and read only: any web page may query it
+      - ONTOP_CORS_ALLOWED_ORIGINS=*
+    volumes:
+      - ./ontop/mapping.ttl:/opt/ontop/input/mapping.ttl:ro
+      - ./ontop/ontop.properties:/opt/ontop/input/ontop.properties:ro
+    # (listens on port 8080 inside the network; not published on the host)
+    expose:
+      - "8080"
+    networks:
+      - amcat-net
+    depends_on:
+      db:
+        condition: service_healthy
+        required: false
 
   # S3-compatible storage — only used in local dev (run with --profile dev)
   s3:

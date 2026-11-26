@@ -1,0 +1,75 @@
+# R2RML mapping of the public release metadata of AmCAT 4 to RDF, for Ontop (a virtual knowledge graph: SPARQL is
+# translated to SQL on these views, nothing is copied).
+#
+# Only the views of migration 0007 are mapped (sparql_projects, sparql_releases, sparql_release_fields). They contain releases whose
+# metadata is public and fields that are not text and that metareaders may see. Documents, texts, tags and users are
+# not in the views, and the database role of Ontop (role.sql) cannot read anything else.
+#
+# IRIs come from columns of the views: <base>projects/<project id> and <base>projects/<project id>/releases/<number>,
+# with <base> the setting amcat4.sparql_base_iri of the database session (see role.sql and README.md).
+#
+# Vocabularies: DCAT 3, Dublin Core terms, schema.org, PROV-O, and a few AmCAT terms (amcat:) where none of these has
+# one.
+
+@prefix rr:     <http://www.w3.org/ns/r2rml#> .
+@prefix xsd:    <http://www.w3.org/2001/XMLSchema#> .
+@prefix dcat:   <http://www.w3.org/ns/dcat#> .
+@prefix dct:    <http://purl.org/dc/terms/> .
+@prefix schema: <https://schema.org/> .
+@prefix prov:   <http://www.w3.org/ns/prov#> .
+@prefix amcat:  <https://amcat.nl/ns/amcat4#> .
+@prefix map:    <urn:amcat4:mapping#> .
+
+# A project with at least one public release: the series of its releases
+map:Project a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "sparql_projects" ] ;
+    rr:subjectMap [ rr:column "project_iri" ; rr:termType rr:IRI ; rr:class dcat:DatasetSeries ] ;
+    rr:predicateObjectMap [ rr:predicate dct:identifier, schema:identifier ; rr:objectMap [ rr:column "project_id" ] ] ;
+    rr:predicateObjectMap [ rr:predicate dct:title, schema:name ; rr:objectMap [ rr:column "project_name" ] ] ;
+    rr:predicateObjectMap [ rr:predicate amcat:releaseCount ; rr:objectMap [ rr:column "release_count" ] ] .
+
+# A release: a frozen version of the documents of a project
+map:Release a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "sparql_releases" ] ;
+    rr:subjectMap [
+        rr:column "release_iri" ; rr:termType rr:IRI ;
+        rr:class dcat:Dataset, schema:Dataset, prov:Entity
+    ] ;
+    rr:predicateObjectMap [
+        rr:predicate dcat:inSeries, schema:isPartOf ;
+        rr:objectMap [ rr:column "project_iri" ; rr:termType rr:IRI ]
+    ] ;
+    rr:predicateObjectMap [ rr:predicate dcat:version, schema:version ; rr:objectMap [ rr:column "release_number" ] ] ;
+    rr:predicateObjectMap [ rr:predicate dct:issued, prov:generatedAtTime ; rr:objectMap [ rr:column "created_at" ] ] ;
+    rr:predicateObjectMap [ rr:predicate dct:identifier, schema:identifier ; rr:objectMap [ rr:column "doi" ] ] ;
+    # only for a DOI that is registered or findable (a draft DOI does not resolve)
+    rr:predicateObjectMap [ rr:predicate schema:sameAs ; rr:objectMap [ rr:column "doi_iri" ; rr:termType rr:IRI ] ] ;
+    rr:predicateObjectMap [ rr:predicate amcat:doiStatus ; rr:objectMap [ rr:column "doi_status" ] ] ;
+    # a withdrawn release stays in the graph (its DOI must keep resolving), with the time it was withdrawn
+    rr:predicateObjectMap [ rr:predicate prov:invalidatedAtTime ; rr:objectMap [ rr:column "withdrawn_at" ] ] ;
+    rr:predicateObjectMap [ rr:predicate amcat:withdrawn ; rr:objectMap [ rr:column "withdrawn" ] ] ;
+    rr:predicateObjectMap [ rr:predicate amcat:metadataSha256 ; rr:objectMap [ rr:column "metadata_sha256" ] ] ;
+    rr:predicateObjectMap [ rr:predicate amcat:documentCount ; rr:objectMap [ rr:column "document_count" ] ] .
+
+# The fields (variables) of a release, as schema.org PropertyValue nodes
+map:Field a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "sparql_release_fields" ] ;
+    rr:subjectMap [ rr:column "field_iri" ; rr:termType rr:IRI ; rr:class schema:PropertyValue ] ;
+    rr:predicateObjectMap [ rr:predicate schema:name ; rr:objectMap [ rr:column "field_name" ] ] ;
+    rr:predicateObjectMap [ rr:predicate amcat:fieldType ; rr:objectMap [ rr:column "field_type" ] ] ;
+    rr:predicateObjectMap [ rr:predicate schema:propertyID ; rr:objectMap [ rr:column "field_identifier" ] ] ;
+    rr:predicateObjectMap [ rr:predicate schema:position ; rr:objectMap [ rr:column "field_position" ] ] ;
+    rr:predicateObjectMap [ rr:predicate amcat:documentCount ; rr:objectMap [ rr:column "document_count" ] ] ;
+    rr:predicateObjectMap [
+        rr:predicate dct:isPartOf ;
+        rr:objectMap [ rr:column "release_iri" ; rr:termType rr:IRI ]
+    ] .
+
+# release -> its fields
+map:ReleaseFields a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "sparql_release_fields" ] ;
+    rr:subjectMap [ rr:column "release_iri" ; rr:termType rr:IRI ] ;
+    rr:predicateObjectMap [
+        rr:predicate schema:variableMeasured ;
+        rr:objectMap [ rr:column "field_iri" ; rr:termType rr:IRI ]
+    ] .

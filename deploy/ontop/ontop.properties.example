@@ -1,0 +1,19 @@
+# Ontop settings for the AmCAT SPARQL endpoint. Copy to ontop.properties (next to this file) and fill in the password.
+# The password can also be given as the environment variable ONTOP_DB_PASSWORD (or a file: ONTOP_DB_PASSWORD_FILE),
+# which overrides this file.
+
+# The database of AmCAT. The user is the read-only role of role.sql: it can read the sparql_* views and nothing else.
+# currentSchema: the schema of the AmCAT tables (AMCAT4_POSTGRES_SCHEMA, default amcat).
+# options: the base IRI of the release IRIs (if role.sql did not set it for the role), and a statement timeout in
+# postgres as a second limit next to the one of Ontop.
+jdbc.url=jdbc:postgresql://db:5432/amcat?currentSchema=amcat&options=-c%20statement_timeout%3D10s
+jdbc.driver=org.postgresql.Driver
+jdbc.user=amcat_sparql
+jdbc.password=CHANGE_ME
+
+# Every SPARQL query is cancelled after this many seconds
+ontop.query.defaultTimeout=10
+
+# Do not show the system tables (pg_catalog) in the graph
+ontop.exposeSystemTables=false
+

@@ -45,3 +45,6 @@ node_modules
 # --- Static/Media ---
 backend/static/components/
 backend/navigator/media/static/
+
+# --- SPARQL endpoint (holds the database password) ---
+deploy/ontop/ontop.properties
