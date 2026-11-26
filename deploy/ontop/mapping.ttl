@@ -2,12 +2,13 @@
 # translated to SQL on these views, nothing is copied).
 #
 # Only the views of migration 0007 are mapped (sparql_projects, sparql_releases, sparql_release_fields,
-# sparql_field_values). They contain releases whose
-# metadata is public and fields that are not text and that metareaders may see. Documents, texts, tags and users are
-# not in the views, and the database role of Ontop (role.sql) cannot read anything else.
+# sparql_field_values). They contain releases whose metadata is public and fields that are not text and that
+# metareaders may see. Documents, texts and users are not in the views (keyword and tag values only as the top 10
+# with counts that the release froze), and the database role of Ontop (role.sql) cannot read anything else.
 #
-# IRIs come from columns of the views: <base>projects/<project id> and <base>projects/<project id>/releases/<number>,
-# with <base> the setting amcat4.sparql_base_iri of the database session (see role.sql and README.md).
+# IRIs come from columns of the views: <base>/index/<project id> and <base>/index/<project id>/releases/<number> (the
+# @id of the JSON-LD of the release), with <base> the setting amcat4.sparql_base_iri of the database session (see
+# role.sql and README.md): set it to AMCAT4_RELEASE_ID_BASE (or the host of AmCAT).
 #
 # Vocabularies: DCAT 3, Dublin Core terms, schema.org, PROV-O, and a few AmCAT terms (amcat:) where none of these has
 # one.
@@ -61,6 +62,8 @@ map:Field a rr:TriplesMap ;
     # a unique field: its values identify a document
     rr:predicateObjectMap [ rr:predicate amcat:isIdentifier ; rr:objectMap [ rr:column "is_identifier" ] ] ;
     rr:predicateObjectMap [ rr:predicate schema:description ; rr:objectMap [ rr:column "description" ] ] ;
+    # field:<pk>, as in the JSON-LD of the release
+    rr:predicateObjectMap [ rr:predicate schema:propertyID ; rr:objectMap [ rr:column "property_id" ] ] ;
     rr:predicateObjectMap [ rr:predicate schema:position ; rr:objectMap [ rr:column "field_position" ] ] ;
     rr:predicateObjectMap [ rr:predicate amcat:documentCount ; rr:objectMap [ rr:column "document_count" ] ] ;
     rr:predicateObjectMap [

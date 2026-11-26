@@ -23,7 +23,7 @@ PROPERTIES_EXAMPLE = Path(__file__).parents[2] / "deploy" / "ontop" / "ontop.pro
 PUBLIC = "amcat4_unittest_sparql_public"
 PRIVATE = "amcat4_unittest_sparql_private"
 SECRET_WORD = "zebracrossingsecret"  # occurs only in the texts and in a field that metareaders cannot see
-BASE_IRI = "https://amcat.test/"
+BASE_IRI = "https://amcat.test"
 
 READ = DocumentFieldMetareaderAccess(access="read")
 FIELDS = {

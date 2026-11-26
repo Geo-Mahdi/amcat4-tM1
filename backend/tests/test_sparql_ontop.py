@@ -155,7 +155,7 @@ def sparql(endpoint, query: str) -> list[dict]:
 
 
 def iri(number: int, project: str = PUBLIC) -> str:
-    return f"{BASE_IRI}projects/{project}/releases/{number}"
+    return f"{BASE_IRI}/index/{project}/releases/{number}"
 
 
 async def test_releases_of_a_public_project(endpoint):
@@ -170,7 +170,7 @@ async def test_releases_of_a_public_project(endpoint):
     assert [(r["release"], r["version"], r["n"]) for r in rows] == [(iri(1), "1", "12"), (iri(2), "2", "15")]
     # the private project is not in the graph at all
     assert sparql(endpoint, f'SELECT ?p WHERE {{ ?p dct:identifier "{PRIVATE}" }}') == []
-    assert sparql(endpoint, "SELECT ?p WHERE { ?p a dcat:DatasetSeries }") == [{"p": f"{BASE_IRI}projects/{PUBLIC}"}]
+    assert sparql(endpoint, "SELECT ?p WHERE { ?p a dcat:DatasetSeries }") == [{"p": f"{BASE_IRI}/index/{PUBLIC}"}]
 
 
 async def test_fields_of_a_release(endpoint):

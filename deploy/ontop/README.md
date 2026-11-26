@@ -6,15 +6,16 @@ has with how many documents have a value.
 
 It uses [Ontop](https://ontop-vkg.org), a *virtual* knowledge graph: Ontop translates each SPARQL query into SQL on
 the AmCAT database. Nothing is copied, so the answers are always current. Ontop reads only three views
-(`sparql_projects`, `sparql_releases`, `sparql_release_fields`, made by migration 0007), as a database role that
-can read nothing else.
+(`sparql_projects`, `sparql_releases`, `sparql_release_fields`, `sparql_field_values`, made by migration 0007), as a
+database role that can read nothing else.
 
 It is **off by default**.
 
 ## What is never exposed
 
 - Documents, their texts and their values, tags and annotations. The views do not read the tables of documents or
-  labels at all.
+  labels at all. The only values shown are the top 10 values (with counts) of keyword and tag fields that metareaders
+  may read, as the golden queries of the release froze them.
 - Users, roles, API keys, requests, settings.
 - Releases whose metadata is not public (`metadata_public` is false), and releases of deleted projects.
 - Fields of type text, and fields that metareaders may not see (metareader access other than `read`).
@@ -37,10 +38,11 @@ From the `deploy` directory, after AMCAT has run its migrations:
 
    ```sh
    docker compose exec -T db psql -U amcat -d amcat -v schema=amcat -v password='a long random password' \
-       -v base_iri=https://amcat.example.org/ < ontop/role.sql
+       -v base_iri=https://amcat.example.org < ontop/role.sql
    ```
 
-   `base_iri` is the start of the IRIs of projects and releases, e.g. `https://amcat.example.org/projects/x/releases/1`.
+   `base_iri` is the start of the IRIs of projects and releases: use the value of `AMCAT4_RELEASE_ID_BASE` (or the
+   host), so a release has the same IRI as the `@id` of its JSON-LD, e.g. `https://amcat.example.org/index/x/releases/1`.
    Run the script again after an upgrade that adds a `sparql_*` view.
 2. `cp ontop/ontop.properties.example ontop/ontop.properties` and set `jdbc.url` (database name and
    `currentSchema` = your `AMCAT4_POSTGRES_SCHEMA`, default `amcat`). Put the password there, or in `.env` as
@@ -87,6 +89,6 @@ SELECT ?release ?version ?documents ?field ?type WHERE {
 - The role is read only and has at most 20 connections.
 - Ontop has no setting for a maximum number of results. The graph is small (a few triples per release and field),
   so a full dump is cheap; if needed, limit the response size in the web server.
-- There are no counts per value of a field: the release manifest does not store them.
+- Counts per value only for the top 10 values of keyword and tag fields (what the release froze).
 - Not tested with the Docker image here (only with the Ontop 5.5.0 command line tool, see
   `backend/tests/test_sparql_ontop.py`).

@@ -12,9 +12,9 @@ migrations have). See docs/postgres-fast-v3/sparql-ontop.md.
 - sparql_releases: one row per release whose metadata is public (releases.metadata_public, migration 0006), of a
   project that still exists.
 - sparql_release_fields: one row per (public release, field) from releases.field_definitions, only fields that are not
-  of type text and that metareaders may see completely (metareader access "read": the same rule as the API, see
-  amcat4.systemdata.fields._field_access_for_role), with the number of documents with a value from the manifest.
-
+  of type text (or vector) and that metareaders may see completely (metareader access "read": the same rule as the
+  API, see amcat4.systemdata.fields._field_access_for_role), with the number of documents with a value from the
+  manifest (matched by field pk).
 - sparql_field_values: the top values (at most 10) of the keyword and tag fields of sparql_release_fields, with
   their document counts, as the golden queries of the release (migration 0006) stored them. Not computed here: the
   views never read documents.
@@ -24,7 +24,8 @@ listed here. They are security barrier views: a condition that a client adds can
 out. They are owned by the migration user, so the SPARQL role needs SELECT on the views only.
 
 The IRIs are built from a base IRI, the setting amcat4.sparql_base_iri of the session (role.sql sets it for the SPARQL
-role, or set it in the JDBC url), by default "urn:amcat4:". A release is <base>projects/<project id>/releases/<number>.
+role, or set it in the JDBC url), by default http://localhost:5000. A release is <base>/index/<project id>/releases/<n>,
+the same as the @id of its JSON-LD (migration 0006) when the base is AMCAT4_RELEASE_ID_BASE (or the host).
 """
 
 from typing import Sequence
@@ -36,8 +37,10 @@ down_revision: str | Sequence[str] | None = "0006"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
-BASE_IRI = "coalesce(nullif(current_setting('amcat4.sparql_base_iri', true), ''), 'urn:amcat4:')"
-PROJECT_IRI = f"{BASE_IRI} || 'projects/' || p.id"
+# The same IRIs as the @id of the JSON-LD of a release (amcat4.projects.release_metadata.release_url), when
+# amcat4.sparql_base_iri is set to AMCAT4_RELEASE_ID_BASE (or the host); the default is the default host
+BASE_IRI = "rtrim(coalesce(nullif(current_setting('amcat4.sparql_base_iri', true), ''), 'http://localhost:5000'), '/')"
+PROJECT_IRI = f"{BASE_IRI} || '/index/' || p.id"
 RELEASE_IRI = f"{PROJECT_IRI} || '/releases/' || r.number"
 # what a release counts as public: its metadata is published, and the project still exists (the join)
 PUBLIC = "FROM releases r JOIN projects p ON p.pk = r.project_pk WHERE r.metadata_public"
@@ -51,7 +54,7 @@ FIELDS = """
     WHERE r.metadata_public
       AND jsonb_typeof(f.def) = 'object'
       AND f.def->>'name' IS NOT NULL
-      AND coalesce(f.def->>'type', 'text') <> 'text'
+      AND coalesce(f.def->>'type', 'text') NOT IN ('text', 'vector')
       AND f.def->'metareader'->>'access' = 'read'
 """
 FIELD_IRI = f"""{RELEASE_IRI} || '/fields/' || CASE WHEN f.def->>'name' ~ '^[A-Za-z0-9_.-]+$' THEN f.def->>'name'
@@ -93,9 +96,13 @@ VIEWS = {
                coalesce(f.def->'identifier' = 'true'::jsonb, false) AS is_identifier,
                CASE WHEN jsonb_typeof(f.def->'description') = 'string' THEN f.def->>'description' END AS description,
                f.position AS field_position,
-               CASE WHEN jsonb_typeof(r.manifest->'fields'->(f.def->>'name')->'documents') = 'number'
-                    THEN (r.manifest->'fields'->(f.def->>'name')->>'documents')::bigint
-               END AS document_count
+               'field:' || (f.def->>'pk') AS property_id,
+               (SELECT (m.value->>'documents')::bigint FROM jsonb_each(
+                    CASE jsonb_typeof(r.manifest->'fields') WHEN 'object' THEN r.manifest->'fields' ELSE '{{}}'::jsonb END
+                ) m
+                WHERE jsonb_typeof(m.value) = 'object' AND m.value->'pk' = f.def->'pk'
+                  AND jsonb_typeof(m.value->'documents') = 'number'
+                LIMIT 1) AS document_count
         {FIELDS}
     """,
     # The top values of keyword and tag fields, from the golden queries of the release ("top_values:<field>", with

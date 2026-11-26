@@ -7,8 +7,10 @@ nothing else.
 import psycopg
 import pytest
 
+from amcat4.config import get_settings
 from amcat4.connections import db_schema
-from amcat4.postgres.connection import fetch_all
+from amcat4.postgres.connection import connection, fetch_all
+from amcat4.postgres.projects import project_pk
 from amcat4.projects.index import delete_project_index
 from tests.sparql_tools import (
     BASE_IRI,
@@ -50,6 +52,7 @@ VIEWS = {
         "is_identifier",
         "description",
         "field_position",
+        "property_id",
         "document_count",
     ],
     "sparql_field_values": ["release_iri", "field_iri", "value_iri", "value", "document_count", "value_rank"],
@@ -85,8 +88,8 @@ async def test_public_and_private_releases(projects):
     rows = await fetch_all("SELECT * FROM sparql_releases ORDER BY project_id, release_number")
     assert [(r["project_id"], r["release_number"]) for r in rows] == [(PUBLIC, 1), (PUBLIC, 2)]
     first, second = rows
-    assert first["release_iri"] == f"urn:amcat4:projects/{PUBLIC}/releases/1"  # (no base IRI set in this session)
-    assert first["project_iri"] == f"urn:amcat4:projects/{PUBLIC}"
+    assert first["release_iri"] == f"http://localhost:5000/index/{PUBLIC}/releases/1"  # (no base IRI set in this session)
+    assert first["project_iri"] == f"http://localhost:5000/index/{PUBLIC}"
     assert first["project_name"] == f"Project {PUBLIC}"
     assert first["document_count"] == (await release_row(PUBLIC, 1))["manifest"]["documents"] == 12
     assert second["document_count"] == 15
@@ -94,6 +97,18 @@ async def test_public_and_private_releases(projects):
     assert (first["doi"], first["doi_iri"], first["doi_status"], first["withdrawn"]) == (None, None, "none", False)
     assert second["doi_iri"] == "https://doi.org/10.5555/amcat.test.2"
     assert second["withdrawn"] and second["withdrawn_at"] is not None
+    # with the base of the JSON-LD of migration 0006, the IRI of a release is its @id there
+    async with connection() as conn:
+        base = get_settings().release_id_base or get_settings().host
+        await conn.execute("SELECT set_config('amcat4.sparql_base_iri', %s, false)", [base])
+        cur = await conn.execute(
+            """SELECT s.release_iri, r.metadata_jsonld->>'@id' AS id FROM sparql_releases s
+               JOIN releases r ON r.number = s.release_number AND r.project_pk = %s""",
+            [await project_pk(PUBLIC)],
+        )
+        rows = await cur.fetchall()
+        await conn.execute("RESET amcat4.sparql_base_iri")
+    assert len(rows) == 2 and all(r["release_iri"] == r["id"] for r in rows)  # type: ignore[index, call-overload]
     rows = await fetch_all("SELECT project_id, project_name, release_count FROM sparql_projects")
     assert rows == [{"project_id": PUBLIC, "project_name": f"Project {PUBLIC}", "release_count": 2}]
     # the project of a public release is deleted: its releases go with it
@@ -107,15 +122,19 @@ async def test_fields_hide_text_and_hidden_fields(projects):
     by_release: dict = {}
     for row in rows:
         by_release.setdefault(row["release_iri"], {})[row["field_name"]] = row
-    assert set(by_release) == {f"urn:amcat4:projects/{PUBLIC}/releases/1", f"urn:amcat4:projects/{PUBLIC}/releases/2"}
+    assert set(by_release) == {
+        f"http://localhost:5000/index/{PUBLIC}/releases/1",
+        f"http://localhost:5000/index/{PUBLIC}/releases/2",
+    }
     manifest = (await release_row(PUBLIC, 1))["manifest"]
-    fields = by_release[f"urn:amcat4:projects/{PUBLIC}/releases/1"]
+    fields = by_release[f"http://localhost:5000/index/{PUBLIC}/releases/1"]
     # text and title are text fields, secret_kw cannot be seen by metareaders
     assert set(fields) == {"kw", "date", "tags"}
     assert {name: f["field_type"] for name, f in fields.items()} == {"kw": "keyword", "date": "date", "tags": "tag"}
     for name, f in fields.items():
         assert f["document_count"] == manifest["fields"][name]["documents"]
-        assert f["field_iri"] == f"urn:amcat4:projects/{PUBLIC}/releases/1/fields/{name}"
+        assert f["property_id"] == f"field:{manifest['fields'][name]['pk']}"
+        assert f["field_iri"] == f"http://localhost:5000/index/{PUBLIC}/releases/1/fields/{name}"
     assert fields["kw"]["document_count"] == 12 and fields["tags"]["document_count"] == 6
     assert not any(f["is_identifier"] for f in fields.values())
 
@@ -146,8 +165,8 @@ async def test_role_reads_views_only(projects):
         try:
             cur = await conn.execute("SELECT release_iri FROM sparql_releases ORDER BY 1")
             assert [r["release_iri"] for r in await cur.fetchall()] == [
-                f"{BASE_IRI}projects/{PUBLIC}/releases/1",  # (role.sql set the base IRI for the role)
-                f"{BASE_IRI}projects/{PUBLIC}/releases/2",
+                f"{BASE_IRI}/index/{PUBLIC}/releases/1",  # (role.sql set the base IRI for the role)
+                f"{BASE_IRI}/index/{PUBLIC}/releases/2",
             ]
             cur = await conn.execute("SELECT count(*) AS n FROM sparql_release_fields")
             assert (await cur.fetchone())["n"] == 6  # type: ignore[index]

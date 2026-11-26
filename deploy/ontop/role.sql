@@ -3,12 +3,14 @@
 -- a migration that adds a sparql_* view:
 --
 --   psql "$DATABASE_URL" -v schema=amcat -v password="$SPARQL_DB_PASSWORD" \
---        -v base_iri=https://amcat.example.org/ -f deploy/ontop/role.sql
+--        -v base_iri=https://amcat.example.org -f deploy/ontop/role.sql
 --
 -- Variables:
 --   schema    the schema of the AmCAT tables (AMCAT4_POSTGRES_SCHEMA), default amcat
 --   password  the password of the role. Without it the role is NOLOGIN (it exists, but nobody can log in with it)
---   base_iri  the start of the IRIs of projects and releases (ends with / or :), default urn:amcat4:
+--   base_iri  the start of the IRIs of projects and releases: AMCAT4_RELEASE_ID_BASE (or the host of AmCAT), so a
+--             release has the IRI of the @id of its JSON-LD (<base>/index/<project>/releases/<n>).
+--             Default http://localhost:5000
 --   role      the name of the role, default amcat_sparql
 --
 -- The role gets: LOGIN (with the password), USAGE on the schema, SELECT on the sparql_* views. Everything else on the
@@ -27,7 +29,7 @@
 \endif
 \if :{?base_iri}
 \else
-  \set base_iri urn:amcat4:
+  \set base_iri http://localhost:5000
 \endif
 
 BEGIN;

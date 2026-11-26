@@ -20,7 +20,7 @@ nothing else.
 
 ## What is exposed
 
-Migration 0007 adds three security barrier views. They read the tables `releases` (with the columns of migration
+Migration 0007 adds four security barrier views. They read the tables `releases` (with the columns of migration
 0006) and `projects` only.
 
 `sparql_projects`: one row per project with at least one public release:
@@ -32,24 +32,28 @@ registered or findable DOI), doi_status, withdrawn_at, withdrawn, metadata_sha25
 manifest)`.
 
 `sparql_release_fields`: one row per (public release, field) from `releases.field_definitions`, only fields that
-are not of type text and whose metareader access is `read` (the same rule the API uses for metareaders):
-`release_iri, field_iri, field_name, field_type, field_identifier, field_position, document_count (from the
-manifest)`.
+are not of type text or vector and whose metareader access is `read` (the same rule the API uses for metareaders):
+`release_iri, field_iri, field_name, field_type, is_identifier (a unique field), description, field_position,
+property_id ("field:<pk>", as in the JSON-LD), document_count (from the manifest, matched by field pk)`. (The frozen
+JSON-LD of 0006 lists all fields by name; the SPARQL graph is stricter.)
 
-There is no view of field values: the manifest has counts per field, not per value, and computing them would mean
-reading documents.
+`sparql_field_values`: the top 10 values of the keyword and tag fields of `sparql_release_fields`, from the
+`top_values:<field>` golden queries of the release (matched by `field_pk`):
+`release_iri, field_iri, value_iri, value, document_count, value_rank`. Not computed from documents.
 
-IRIs are `<base>projects/<id>` and `<base>projects/<id>/releases/<n>` (fields: `.../fields/<name>`), with
-`<base>` the session setting `amcat4.sparql_base_iri` (set for the role by `role.sql`), by default `urn:amcat4:`.
+IRIs are `<base>/index/<id>` and `<base>/index/<id>/releases/<n>` (fields: `.../fields/<name>`, values:
+`.../values/<rank>`), with `<base>` the session setting `amcat4.sparql_base_iri` (set for the role by `role.sql`),
+by default `http://localhost:5000`. With `<base>` = `AMCAT4_RELEASE_ID_BASE` (or the host) a release has the IRI of
+the `@id` of its JSON-LD, so the two descriptions join.
 
 The mapping (`deploy/ontop/mapping.ttl`) uses DCAT 3 (`dcat:DatasetSeries` for a project, `dcat:Dataset` with
 `dcat:inSeries` and `dcat:version` for a release), Dublin Core (`dct:identifier`, `dct:issued`, `dct:title`),
 schema.org (`schema:Dataset`, `schema:variableMeasured` with `schema:PropertyValue` nodes for fields,
-`schema:sameAs` for the DOI), PROV-O (`prov:generatedAtTime`, `prov:invalidatedAtTime` for a withdrawn release)
+`schema:valueReference` to their top values, `schema:sameAs` for the DOI), PROV-O (`prov:generatedAtTime`, `prov:invalidatedAtTime` for a withdrawn release)
 and a few `amcat:` terms (`https://amcat.nl/ns/amcat4#`: `documentCount`, `fieldType`, `doiStatus`, `withdrawn`,
-`metadataSha256`, `releaseCount`).
+`metadataSha256`, `releaseCount`, `isIdentifier`).
 
-Never exposed: documents, texts, values, tags and annotations (the views do not touch `documents` or
+Never exposed: documents, texts, values (except the frozen top 10 described above), tags of documents and annotations (the views do not touch `documents` or
 `doc_labels`), users and roles, private releases, text fields, fields hidden from metareaders, the free-text reason
 of a withdrawal.
 
