@@ -1,5 +1,5 @@
 """
-Migrations 0002 to 0005 on a database that has data from 0001 or 0003: rows are kept, the new columns and indexes exist, the
+Migrations 0002 to 0006 on a database that has data from 0001 or 0003: rows are kept, the new columns and indexes exist, the
 search index is rebuilt with the slot columns, searching still works, documents reference project_partitions (0003),
 and the downgrade gives back the 0001 schema.
 Runs in its own schema, next to the test schema.
@@ -355,12 +355,65 @@ async def test_migration_0005_with_data():
         await conn.close()
 
 
+RELEASE_METADATA_COLUMNS = {
+    "metadata_jsonld",
+    "metadata_sha256",
+    "versions",
+    "field_definitions",
+    "golden_queries",
+    "metadata_public",
+    "withdrawn_at",
+    "withdrawn_reason",
+    "doi_status",
+}
+
+
+async def _check_0006(conn, project: int) -> None:
+    """0006 on a database at 0005 with a release: the new columns, their defaults and the check; and the downgrade"""
+    await conn.execute("INSERT INTO releases (project_pk, number, seq) VALUES (%s, 1, 5)", [project])
+    await asyncio.to_thread(_migrate, "upgrade", "0006")
+    assert await _one(conn, "SELECT version_num FROM alembic_version") == {"version_num": "0006"}
+    cur = await conn.execute(
+        """SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns
+           WHERE table_schema = %s AND table_name = 'releases'""",
+        [SCHEMA],
+    )
+    columns = {r["column_name"]: r for r in await cur.fetchall()}
+    types = {c: columns[c]["data_type"] for c in RELEASE_METADATA_COLUMNS}
+    assert types == {
+        "metadata_jsonld": "jsonb",
+        "metadata_sha256": "text",
+        "versions": "jsonb",
+        "field_definitions": "jsonb",
+        "golden_queries": "jsonb",
+        "metadata_public": "boolean",
+        "withdrawn_at": "timestamp with time zone",
+        "withdrawn_reason": "text",
+        "doi_status": "text",
+    }
+    assert columns["metadata_public"]["is_nullable"] == "NO" and columns["doi_status"]["is_nullable"] == "NO"
+    # the release made before 0006: no frozen metadata, the defaults for the live columns
+    row = await _one(conn, "SELECT metadata_jsonld, metadata_public, doi_status, withdrawn_at FROM releases")
+    assert row == {"metadata_jsonld": None, "metadata_public": False, "doi_status": "none", "withdrawn_at": None}
+    with pytest.raises(psycopg.errors.CheckViolation):
+        await conn.execute("UPDATE releases SET doi_status = 'published'")
+    await conn.execute("UPDATE releases SET doi_status = 'findable'")
+    # again (idempotent), then down to 0005: the columns are gone, the release is kept
+    await asyncio.to_thread(_migrate, "stamp", "0005")
+    await asyncio.to_thread(_migrate, "upgrade", "0006")
+    await asyncio.to_thread(_migrate, "downgrade", "0005")
+    assert not RELEASE_METADATA_COLUMNS & await _columns(conn, "releases")
+    assert (await _one(conn, "SELECT count(*) AS n FROM releases"))["n"] == 1
+    await conn.execute("DELETE FROM releases")
+    await asyncio.to_thread(_migrate, "upgrade", "0006")
+
+
 @pytest.mark.anyio
-async def test_migration_chain_0003_to_0005():
+async def test_migration_chain_0003_to_0006():
     """
-    The chain 0003 -> 0004 (quick wins: text keys) -> 0005 (releases and labels) on a database as the branch
-    postgres-fast-v3 left it, with documents; and a fresh database from nothing to the head. The two migrations were
-    written on separate branches, both on top of 0003.
+    The chain 0003 -> 0004 (quick wins: text keys) -> 0005 (releases and labels) -> 0006 (release metadata) on a
+    database as the branch postgres-fast-v3 left it, with documents; and a fresh database from nothing to the head.
+    0004 and 0005 were written on separate branches, both on top of 0003.
     """
     conn = await _connect()
     try:
@@ -368,11 +421,13 @@ async def test_migration_chain_0003_to_0005():
         await drop_schema(conn, SCHEMA)
         await asyncio.to_thread(_migrate, "upgrade", "head")
         assert await _one(conn, "SELECT version_num FROM alembic_version") == {"version_num": "0007"}
+        assert RELEASE_METADATA_COLUMNS <= await _columns(conn, "releases")
         cur = await conn.execute("SELECT table_name FROM information_schema.views WHERE table_schema = %s", [SCHEMA])
         assert {row["table_name"] for row in await cur.fetchall()} == {
             "sparql_projects",
             "sparql_releases",
             "sparql_release_fields",
+            "sparql_field_values",
         }
         cur = await conn.execute("SELECT tgname FROM pg_trigger WHERE tgrelid = 'documents'::regclass AND NOT tgisinternal")
         assert {row["tgname"] for row in await cur.fetchall()} == {"documents_text_keys", "documents_doc_pk"}
@@ -395,6 +450,7 @@ async def test_migration_chain_0003_to_0005():
         await asyncio.to_thread(_migrate, "upgrade", "0005")
         assert await _one(conn, "SELECT version_num FROM alembic_version") == {"version_num": "0005"}
         await _check_0005(conn, project, text_pk, bm25_0003)
+        await _check_0006(conn, project)
         # neither migration wrote a document row
         assert (await _one(conn, "SELECT max(xmin::text::bigint) AS x FROM documents"))["x"] == xmin
         # 0004 is still in place: the old documents have no list of text keys yet and their field is marked

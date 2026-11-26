@@ -33,8 +33,15 @@ from amcat4.postgres.fields import FieldInfo, list_field_infos
 from amcat4.postgres.layout import _WRITE_LOCK, project_filter
 from amcat4.postgres.projects import project_pk
 from amcat4.postgres.versions import CURRENT, DOC_PK, visible
+from amcat4.projects.release_metadata import make_release_metadata, read_field_rows, rerun_golden_query, sha256_hex
 
-_COLUMNS = "number, seq, created_at, created_by, doi, manifest"
+_COLUMNS = (
+    "number, seq, created_at, created_by, doi, manifest, metadata_sha256, metadata_public, withdrawn_at, "
+    "withdrawn_reason, doi_status"
+)
+# The frozen metadata of migration 0006 (see amcat4.projects.release_metadata): only read when asked for
+_FROZEN = "metadata_jsonld, versions, field_definitions, golden_queries"
+DOI_STATUSES = ("none", "draft", "registered", "findable")
 
 
 async def create_release(index: str, created_by: str | None = None, doi: str | None = None) -> dict:
@@ -57,19 +64,52 @@ async def create_release(index: str, created_by: str | None = None, doi: str | N
                 """INSERT INTO releases (project_pk, number, seq, created_by, doi)
                    VALUES (%s, (SELECT coalesce(max(number), 0) + 1 FROM releases WHERE project_pk = %s),
                            nextval('change_seq'), %s, %s)
-                   RETURNING number, seq""",
+                   RETURNING number, seq, created_at""",
                 [pk, pk, created_by, doi],
             )
             row: dict = await cur.fetchone()  # type: ignore[assignment]
-    await _store_manifest(pk, row["seq"])
+            # the field definitions as they are at the cut, read in the same transaction (frozen in the metadata)
+            field_rows = await read_field_rows(conn, pk)
+    await _store_frozen(index, pk, row, created_by, field_rows)
     return await get_release(index, row["number"])
 
 
-async def _store_manifest(pk: int, seq: int) -> dict:
+async def _store_frozen(index: str, pk: int, row: dict, created_by: str | None, field_rows: list[dict]) -> None:
+    """
+    The manifest and the frozen metadata (migration 0006) of a new release, computed from its rows (which can no longer
+    change) and stored once. The golden queries are run on the release, so this happens after its row has committed.
+    """
+    seq = row["seq"]
     async with connection() as conn:
         manifest = await compute_manifest(conn, pk, seq)
-        await conn.execute("UPDATE releases SET manifest = %s WHERE project_pk = %s AND seq = %s", [Jsonb(manifest), pk, seq])
-    return manifest
+        frozen = await make_release_metadata(
+            conn,
+            index=index,
+            pk=pk,
+            number=row["number"],
+            seq=seq,
+            created_at=row["created_at"],
+            created_by=created_by,
+            field_rows=field_rows,
+            manifest=manifest,
+        )
+        manifest["metadata_sha256"] = frozen["metadata_sha256"]
+        manifest["golden_queries_sha256"] = sha256_hex(frozen["golden_queries"])
+        await conn.execute(
+            """UPDATE releases SET manifest = %s, metadata_jsonld = %s, metadata_sha256 = %s, versions = %s,
+                      field_definitions = %s, golden_queries = %s
+               WHERE project_pk = %s AND seq = %s""",
+            [
+                Jsonb(manifest),
+                Jsonb(frozen["metadata_jsonld"]),
+                frozen["metadata_sha256"],
+                Jsonb(frozen["versions"]),
+                Jsonb(frozen["field_definitions"]),
+                Jsonb(frozen["golden_queries"]),
+                pk,
+                seq,
+            ],
+        )
 
 
 async def list_releases(index: str) -> list[dict]:
@@ -85,16 +125,74 @@ async def get_release(index: str, number: int) -> dict:
     return row
 
 
+async def get_release_frozen(index: str, number: int) -> dict:
+    """A release with its frozen metadata (metadata_jsonld, versions, field_definitions, golden_queries)"""
+    pk = await project_pk(index)
+    row = await fetch_one(
+        f"SELECT {_COLUMNS}, {_FROZEN} FROM releases WHERE project_pk = %s AND number = %s",  # type: ignore[arg-type]
+        [pk, number],
+    )
+    if row is None:
+        raise NotFoundError(f"Release {number} of project {index} does not exist")
+    return row
+
+
 async def release_seq(index: str, number: int) -> int:
     """The sequence number R of a release: what the search functions take (get_fieldset(release=R))"""
     return (await get_release(index, number))["seq"]
 
 
 async def set_release_doi(index: str, number: int, doi: str | None) -> dict:
+    return await update_release(index, number, doi=doi)
+
+
+_UNSET: Any = object()
+
+
+async def update_release(
+    index: str,
+    number: int,
+    *,
+    doi: str | None = _UNSET,
+    doi_status: str | None = None,
+    metadata_public: bool | None = None,
+    withdrawn: bool | None = None,
+    withdrawn_reason: str | None = None,
+) -> dict:
+    """
+    Change the live properties of a release (never its rows or its frozen metadata): the DOI and its status, whether
+    the metadata is public, and whether it is withdrawn. Withdrawing only marks the release: its rows stay and it can
+    still be queried. withdrawn=False takes the mark (and the reason) away.
+    """
     await get_release(index, number)
     pk = await project_pk(index)
-    async with connection() as conn:
-        await conn.execute("UPDATE releases SET doi = %s WHERE project_pk = %s AND number = %s", [doi, pk, number])
+    sets: list[sql.Composable] = []
+    params: list[Any] = []
+    if doi is not _UNSET:
+        sets.append(sql.SQL("doi = %s"))
+        params.append(doi)
+    if doi_status is not None:
+        if doi_status not in DOI_STATUSES:
+            raise ValueError(f"doi_status must be one of {', '.join(DOI_STATUSES)}")
+        sets.append(sql.SQL("doi_status = %s"))
+        params.append(doi_status)
+    if metadata_public is not None:
+        sets.append(sql.SQL("metadata_public = %s"))
+        params.append(metadata_public)
+    if withdrawn is True:
+        sets.append(sql.SQL("withdrawn_at = coalesce(withdrawn_at, now()), withdrawn_reason = %s"))
+        params.append(withdrawn_reason)
+    elif withdrawn is False:
+        sets.append(sql.SQL("withdrawn_at = NULL, withdrawn_reason = NULL"))
+    elif withdrawn_reason is not None:
+        sets.append(sql.SQL("withdrawn_reason = CASE WHEN withdrawn_at IS NULL THEN NULL ELSE %s END"))
+        params.append(withdrawn_reason)
+    if sets:
+        async with connection() as conn:
+            await conn.execute(
+                sql.SQL("UPDATE releases SET {} WHERE project_pk = %s AND number = %s").format(sql.SQL(", ").join(sets)),
+                [*params, pk, number],
+            )
     return await get_release(index, number)
 
 
@@ -211,11 +309,20 @@ async def verify_release(index: str, number: int) -> dict:
     Returns {"ok": bool, "differences": [keys that differ], "stored": manifest, "computed": manifest}.
     Field names are compared by pk, so renaming a field is not a difference; fields made after the release (with no
     values in it) are ignored.
+    For a release with frozen metadata (migration 0006) also: the SHA-256 of the stored JSON-LD must still be the one
+    stored (and in the manifest), and the golden queries are run again ("golden_queries": one entry per query, with
+    the stored and the new result). Differences are named "metadata_sha256", "golden_queries_sha256" and
+    "golden:<name>".
     """
-    release = await get_release(index, number)
+    release = await get_release_frozen(index, number)
     pk = await project_pk(index)
+    golden: list[dict] = []
+    metadata: dict | None = None
     async with connection() as conn:
         computed = await compute_manifest(conn, pk, release["seq"])
+        if release["metadata_jsonld"] is not None:
+            for spec in release["golden_queries"] or []:
+                golden.append(await rerun_golden_query(conn, index, pk, release["seq"], spec))
     stored = release["manifest"]
     differences = [key for key in ("documents", "fingerprint", "tags") if stored.get(key) != computed.get(key)]
 
@@ -224,7 +331,27 @@ async def verify_release(index: str, number: int) -> dict:
 
     if by_pk(stored) != by_pk(computed):
         differences.append("fields")
-    return {"ok": not differences, "differences": differences, "stored": stored, "computed": computed}
+    if release["metadata_jsonld"] is not None:
+        sha = sha256_hex(release["metadata_jsonld"])
+        golden_sha = sha256_hex(release["golden_queries"])
+        metadata = {
+            "stored_sha256": release["metadata_sha256"],
+            "computed_sha256": sha,
+            "ok": sha == release["metadata_sha256"] == stored.get("metadata_sha256"),
+        }
+        if not metadata["ok"]:
+            differences.append("metadata_sha256")
+        if golden_sha != stored.get("golden_queries_sha256"):
+            differences.append("golden_queries_sha256")  # (the stored queries or results were changed)
+        differences += [f"golden:{g['name']}" for g in golden if not g["ok"]]
+    return {
+        "ok": not differences,
+        "differences": differences,
+        "stored": stored,
+        "computed": computed,
+        "metadata": metadata,
+        "golden_queries": golden,
+    }
 
 
 ###################### PURGE ######################

@@ -489,6 +489,19 @@ class Settings(BaseSettings):
         ),
     ] = None
 
+    release_id_base: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Base of the identifier URL (@id) that is written into the frozen metadata of a new release: "
+                "{base}/index/{project}/releases/{number}. "
+                "Why: the identifier is frozen when the release is made, so it should be a URL that stays valid "
+                "(e.g. a stable public address of the server, or a resolver). "
+                "Unset = the host setting of this server (AMCAT4_RELEASE_ID_BASE)"
+            ),
+        ),
+    ] = None
+
     s3_host: Annotated[str | None, Field(description="S3-compatible object storage host")] = None
     s3_access_key: Annotated[str | None, Field(description="S3 access key")] = None
     s3_secret_key: Annotated[str | None, Field(description="S3 secret key")] = None
