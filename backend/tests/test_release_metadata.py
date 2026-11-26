@@ -79,7 +79,7 @@ async def test_creation_fills_all_columns(project):
     assert variables["tags"]["value"] == 30
     assert doc["conditionsOfAccess"].startswith("The documents are not public")
     v = row["versions"]
-    assert v["postgres"].startswith("18") and v["pg_search"] and v["amcat4"] and v["migration"] == "0006"
+    assert v["postgres"].startswith("18") and v["pg_search"] and v["amcat4"] and v["migration"] == "0007"
     defs = {f["name"]: f for f in row["field_definitions"]}
     assert set(defs) == set(FIELDS) and defs["kw"]["type"] == "keyword" and defs["kw"]["identifier"] is False
     assert all("client_settings" not in f and "access" in f["metareader"] for f in defs.values())
